@@ -1,0 +1,16 @@
+services:
+  telegram-bot:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: ${TELEGRAM_BOT_IMAGE:-guard-telegram-bot:local}
+    container_name: ${CONTAINER_NAME:-guard-telegram-bot}
+    env_file:
+      - .env
+    restart: unless-stopped
+    init: true
+    read_only: true
+    tmpfs:
+      - /tmp
+    security_opt:
+      - no-new-privileges:true

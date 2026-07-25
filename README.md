@@ -1,93 +1,102 @@
-# Telegram
+# Guard Telegram Bot
 
+Server-side Telegram bot for private chats, groups, supergroups, and forum topics. It is a TypeScript/ESM, strict-mode foundation for independently deployable bot modules. Settings and module state are isolated by `chat_id`; PostgreSQL is the source of truth.
 
+The project deliberately has no audit log. It does not persist message bodies, edited-message data, reactions, raw update JSON, files, or callback payloads. `core.processed_updates` contains only `(bot_id, update_id, timestamps)` for idempotency and is retained for seven days by default.
 
-## Getting started
+## What is included
 
-To make it easy for you to get started with GitLab, here's a list of recommended next steps.
+- grammY, one `Bot` instance, native commands, inline callbacks, and forum-topic-aware replies;
+- global and local modules with sparse per-chat state overrides;
+- PostgreSQL + Drizzle migrations, TLS database connections, and typed external IDs;
+- RU/EN localization, JSON logs with redaction, permissions, cooldowns, callback validation, and duplicate-update protection;
+- long polling through `@grammyjs/runner` or an HTTPS webhook adapter;
+- optional Redis, S3/MinIO, and AMQPS RabbitMQ with durable publishes, retry queue, and DLQ;
+- Vitest, ESLint, TypeScript strict checks, Docker, GitLab CI, ADRs, and operational runbooks.
 
-Already a pro? Just edit this README.md and make it your own. Want to make it easy? [Use the template at the bottom](#editing-this-readme)!
+## Prerequisites
 
-## Add your files
+- Node.js 22 or later;
+- a PostgreSQL instance reachable over TLS;
+- a Telegram Bot API token from the deployment secret store;
+- optional TLS endpoints for Redis, S3/MinIO, and RabbitMQ.
 
-- [ ] [Create](https://docs.gitlab.com/ee/user/project/repository/web_editor.html#create-a-file) or [upload](https://docs.gitlab.com/ee/user/project/repository/web_editor.html#upload-a-file) files
-- [ ] [Add files using the command line](https://docs.gitlab.com/topics/git/add_files/#add-files-to-a-git-repository) or push an existing Git repository with the following command:
+Never commit `.env`, tokens, database URLs, certificates, or webhook secrets.
 
+## Local start
+
+```bash
+cp .env.example .env
+# Fill TELEGRAM_BOT_TOKEN and a TLS-protected DATABASE_URL in .env
+npm install
+npm run db:migrate
+npm run dev
 ```
-cd existing_repo
-git remote add origin https://code.core-v.net/arizona/guard/bots/telegram.git
-git branch -M main
-git push -uf origin main
+
+`npm start` runs the compiled production output. The first migration must be generated through `npm run db:generate`; generated files in `src/db/migrations/` are not edited manually.
+
+## Environment and TLS
+
+`TELEGRAM_BOT_TOKEN` and `DATABASE_URL` are mandatory. PostgreSQL always receives an SSL configuration; `DATABASE_TLS_REJECT_UNAUTHORIZED` remains `true` outside tightly controlled development/test infrastructure. Client certificate and key must be supplied as a pair.
+
+Setting `REDIS_ENABLED=true` requires `REDIS_TLS=true`. `S3_ENDPOINT`, `S3_PUBLIC_URL`, and `TELEGRAM_WEBHOOK_URL` must be HTTPS. `RABBITMQ_ENABLED=true` accepts only `amqps://`. Invalid combinations stop the process before it accepts Telegram updates.
+
+See [.env.example](.env.example) for the complete list. Redis and S3 are optional: Redis failure degrades to database/in-memory paths, while a disabled storage feature returns a localized module-level response. RabbitMQ is different: a configured bridge must connect at startup or bootstrap fails.
+
+## Commands, callbacks, and module state
+
+The bootstrap includes:
+
+| Command | Module | Default |
+| --- | --- | --- |
+| `/help` | `help` | enabled globally |
+| `/modules` | `module-admin` | enabled globally, chat-admin only |
+| `/module_enable <id>` | `module-admin` | chat-admin only |
+| `/module_disable <id>` | `module-admin` | chat-admin only |
+| `/echo <text>` | `example-tools` | disabled local-module example |
+
+Telegram’s command menu is a union across modules and is registered in RU and EN. It is a hint, not an authorization system: the dispatcher always rechecks module state, permissions, cooldown, and a Zod schema. grammY handles `/command@bot_username` in groups. The only deep-link entry point is `/start <payload>`; a sensitive module must sign its payload or map it to a one-time database record.
+
+Callback data has the compact `v1:<command>:<base64url-arguments>` format and is capped to Telegram’s 64-byte limit. No secrets or personal data belong in it. Every callback query is answered, including invalid or rejected ones.
+
+`core.chat_module_states` is sparse. No row means the module’s `defaultEnabled`; an override is deleted when it becomes equal to that default. This avoids a chat-by-module backfill when a module is introduced.
+
+## Transport and forum topics
+
+`TELEGRAM_TRANSPORT=long_polling` is the default. It runs through `@grammyjs/runner`; `TELEGRAM_RUNNER_CONCURRENCY` bounds in-flight updates (default `25`). Set `TELEGRAM_TRANSPORT=webhook` only with an HTTPS `TELEGRAM_WEBHOOK_URL`, a 16+ character secret, and a public endpoint; in that mode polling is not started.
+
+Replies use the incoming `message_thread_id` so they stay within a forum topic. If Telegram reports `TOPIC_CLOSED` or `message thread not found`, no message is sent to the parent chat unless both the command explicitly opts in and `TELEGRAM_TOPIC_FALLBACK_TO_CHAT=true`.
+
+## Commands for development and CI
+
+```text
+npm run dev              # watch TypeScript source
+npm run build            # emit dist/
+npm start                # run dist/index.js
+npm run lint             # ESLint source checks
+npm run typecheck        # strict app and test type checks
+npm test                 # unit tests; DB integration is opt-in
+npm run test:coverage    # Vitest coverage report
+npm run db:generate      # generate Drizzle migration
+npm run db:migrate       # apply generated migrations
+npm run db:studio        # Drizzle Studio
+npm run check:locales    # ensure RU/EN keys agree
 ```
 
-## Integrate with your tools
+Set `TEST_DATABASE_URL` to a separate TLS PostgreSQL database to activate the migration integration suite. It must never point at production.
 
-- [ ] [Set up project integrations](https://code.core-v.net/arizona/guard/bots/telegram/-/settings/integrations)
+## Docker and deployment
 
-## Collaborate with your team
+`docker compose up --build` starts only the bot and reads local secrets from `.env`; PostgreSQL, Redis, S3/MinIO, and RabbitMQ are deliberately external protected services. The Dockerfile runs lint, typecheck, tests, and the build before the runtime image is produced.
 
-- [ ] [Invite team members and collaborators](https://docs.gitlab.com/ee/user/project/members/)
-- [ ] [Create a new merge request](https://docs.gitlab.com/ee/user/project/merge_requests/creating_merge_requests.html)
-- [ ] [Automatically close issues from merge requests](https://docs.gitlab.com/ee/user/project/issues/managing_issues.html#closing-issues-automatically)
-- [ ] [Enable merge request approvals](https://docs.gitlab.com/ee/user/project/merge_requests/approvals/)
-- [ ] [Set auto-merge](https://docs.gitlab.com/user/project/merge_requests/auto_merge/)
+GitLab CI follows `quality → build → deploy`. Stage and production deploy jobs are manual/protected and do not create, replace, or copy an environment file. Deployment and recovery steps are in [docs/infra/deploy.md](docs/infra/deploy.md) and [docs/infra/recovery-and-monitoring.md](docs/infra/recovery-and-monitoring.md).
 
-## Test and Deploy
+## Security and operations
 
-Use the built-in continuous integration in GitLab.
+- Logs are one JSON object per line; redaction removes secrets and URL userinfo. Do not add message text, raw callbacks, headers, or file bytes to fields.
+- Telegram IDs are stored as `text`, preserving every external ID exactly.
+- Any state-changing module operation must rely on the `processed_updates` idempotency gate and Drizzle transactions/services rather than event-bus delivery.
+- RabbitMQ uses a confirm channel and persistent messages. Failed actions retry through a TTL queue; exhausted or malformed items go to DLQ.
+- Health reports transport and optional dependency state without messages or payloads. A degraded Redis/S3 path does not make the process unhealthy; an enabled RabbitMQ bridge without a connection does.
 
-- [ ] [Get started with GitLab CI/CD](https://docs.gitlab.com/ee/ci/quick_start/)
-- [ ] [Analyze your code for known vulnerabilities with Static Application Security Testing (SAST)](https://docs.gitlab.com/ee/user/application_security/sast/)
-- [ ] [Deploy to Kubernetes, Amazon EC2, or Amazon ECS using Auto Deploy](https://docs.gitlab.com/ee/topics/autodevops/requirements.html)
-- [ ] [Use pull-based deployments for improved Kubernetes management](https://docs.gitlab.com/ee/user/clusters/agent/)
-- [ ] [Set up protected environments](https://docs.gitlab.com/ee/ci/environments/protected_environments.html)
-
-***
-
-# Editing this README
-
-When you're ready to make this README your own, just edit this file and use the handy template below (or feel free to structure it however you want - this is just a starting point!). Thanks to [makeareadme.com](https://www.makeareadme.com/) for this template.
-
-## Suggestions for a good README
-
-Every project is different, so consider which of these sections apply to yours. The sections used in the template are suggestions for most open source projects. Also keep in mind that while a README can be too long and detailed, too long is better than too short. If you think your README is too long, consider utilizing another form of documentation rather than cutting out information.
-
-## Name
-Choose a self-explaining name for your project.
-
-## Description
-Let people know what your project can do specifically. Provide context and add a link to any reference visitors might be unfamiliar with. A list of Features or a Background subsection can also be added here. If there are alternatives to your project, this is a good place to list differentiating factors.
-
-## Badges
-On some READMEs, you may see small images that convey metadata, such as whether or not all the tests are passing for the project. You can use Shields to add some to your README. Many services also have instructions for adding a badge.
-
-## Visuals
-Depending on what you are making, it can be a good idea to include screenshots or even a video (you'll frequently see GIFs rather than actual videos). Tools like ttygif can help, but check out Asciinema for a more sophisticated method.
-
-## Installation
-Within a particular ecosystem, there may be a common way of installing things, such as using Yarn, NuGet, or Homebrew. However, consider the possibility that whoever is reading your README is a novice and would like more guidance. Listing specific steps helps remove ambiguity and gets people to using your project as quickly as possible. If it only runs in a specific context like a particular programming language version or operating system or has dependencies that have to be installed manually, also add a Requirements subsection.
-
-## Usage
-Use examples liberally, and show the expected output if you can. It's helpful to have inline the smallest example of usage that you can demonstrate, while providing links to more sophisticated examples if they are too long to reasonably include in the README.
-
-## Support
-Tell people where they can go to for help. It can be any combination of an issue tracker, a chat room, an email address, etc.
-
-## Roadmap
-If you have ideas for releases in the future, it is a good idea to list them in the README.
-
-## Contributing
-State if you are open to contributions and what your requirements are for accepting them.
-
-For people who want to make changes to your project, it's helpful to have some documentation on how to get started. Perhaps there is a script that they should run or some environment variables that they need to set. Make these steps explicit. These instructions could also be useful to your future self.
-
-You can also document commands to lint the code or run tests. These steps help to ensure high code quality and reduce the likelihood that the changes inadvertently break something. Having instructions for running tests is especially helpful if it requires external setup, such as starting a Selenium server for testing in a browser.
-
-## Authors and acknowledgment
-Show your appreciation to those who have contributed to the project.
-
-## License
-For open source projects, say how it is licensed.
-
-## Project status
-If you have run out of energy or time for your project, put a note at the top of the README saying that development has slowed down or stopped completely. Someone may choose to fork your project or volunteer to step in as a maintainer or owner, allowing your project to keep going. You can also make an explicit request for maintainers.
+Detailed implementation contracts are in [docs/modules](docs/modules), design decisions in [docs/adr](docs/adr), and runbooks in [docs/infra](docs/infra).
