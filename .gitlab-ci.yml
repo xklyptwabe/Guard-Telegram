@@ -1,0 +1,127 @@
+stages:
+  - quality
+  - build
+  - deploy
+
+# ── Base ───────────────────────────────────────────────────────────────────────
+
+.quality-base:
+  stage: quality
+  image: node:22-alpine
+  tags:
+    - guard
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event" && $CI_MERGE_REQUEST_TARGET_BRANCH_NAME =~ /^(main|test)$/'
+  before_script:
+    - npm ci
+  cache:
+    key:
+      files:
+        - package-lock.json
+    paths:
+      - node_modules/
+    policy: pull-push
+
+# ── Quality jobs ───────────────────────────────────────────────────────────────
+
+lint:
+  extends: .quality-base
+  script:
+    - npm run lint
+    - npm run typecheck
+    - npm run check:locales
+
+test:
+  extends: .quality-base
+  variables:
+    CI_PG_CONTAINER: "ci-postgres-${CI_JOB_ID}"
+    NODE_ENV: test
+    DATABASE_URL: "postgresql://postgres:postgres@localhost:54321/guard_bot_test?sslmode=disable"
+    TEST_DATABASE_URL: "postgresql://postgres:postgres@localhost:54321/guard_bot_test?sslmode=disable"
+    TELEGRAM_BOT_TOKEN: fake-ci-token
+    LOG_LEVEL: error
+  before_script:
+    - npm ci
+    - docker run -d --name "$CI_PG_CONTAINER"
+      -p 54321:5432
+      -e POSTGRES_DB=guard_bot_test
+      -e POSTGRES_USER=postgres
+      -e POSTGRES_PASSWORD=postgres
+      postgres:16-alpine
+    - |
+      echo "Waiting for PostgreSQL..."
+      for i in $(seq 1 30); do
+        if docker exec "$CI_PG_CONTAINER" pg_isready -U postgres >/dev/null 2>&1; then
+          echo "PostgreSQL is ready"
+          break
+        fi
+        sleep 1
+      done
+  script:
+    - npm run db:migrate
+    - npm run test:coverage -- --reporter=default --reporter=junit --outputFile=junit.xml
+  after_script:
+    - docker rm -f "$CI_PG_CONTAINER" 2>/dev/null || true
+  artifacts:
+    expire_in: 1 day
+    reports:
+      junit: junit.xml
+      coverage_report:
+        coverage_format: cobertura
+        path: coverage/cobertura-coverage.xml
+    paths:
+      - coverage/
+      - junit.xml
+
+# ── Build jobs ─────────────────────────────────────────────────────────────────
+
+build:image:
+  stage: build
+  tags:
+    - guard
+  rules:
+    - if: $CI_COMMIT_BRANCH == "test" && $CI_PIPELINE_SOURCE == "push"
+    - if: $CI_COMMIT_BRANCH == "main" && $CI_PIPELINE_SOURCE == "push"
+  script:
+    - docker build -t "guard-telegram-bot:$CI_COMMIT_SHORT_SHA" .
+
+# ── Deploy base ────────────────────────────────────────────────────────────────
+
+.deploy-base:
+  stage: deploy
+  tags:
+    - guard
+  needs:
+    - job: build:image
+  script:
+    - mkdir -p "$DEPLOY_DIR"
+    - cp docker-compose.yml "$DEPLOY_DIR/docker-compose.yml"
+    - |
+      if [ ! -f "$DEPLOY_DIR/.env" ]; then
+        echo "WARNING: $DEPLOY_DIR/.env not found — create it before the bot can start"
+      fi
+    - cd "$DEPLOY_DIR"
+    - CONTAINER_NAME="$CONTAINER_NAME" docker compose ${EXTRA_COMPOSE_FILES} down
+    - TELEGRAM_BOT_IMAGE="guard-telegram-bot:$CI_COMMIT_SHORT_SHA" CONTAINER_NAME="$CONTAINER_NAME" docker compose ${EXTRA_COMPOSE_FILES} up -d
+    # Keep only the 2 most recent images for rollback; remove older ones.
+    - docker images "guard-telegram-bot" --format "{{.Tag}}" | tail -n +3 | xargs -r -I{} docker rmi "guard-telegram-bot:{}" 2>/dev/null || true
+
+# ── Deploy jobs ────────────────────────────────────────────────────────────────
+
+deploy:test:
+  extends: .deploy-base
+  rules:
+    - if: $CI_COMMIT_BRANCH == "test" && $CI_PIPELINE_SOURCE == "push"
+  variables:
+    DEPLOY_DIR: /opt/guard/bots/telegram/test
+    CONTAINER_NAME: guard-telegram-bot-test
+    EXTRA_COMPOSE_FILES: ""
+
+deploy:production:
+  extends: .deploy-base
+  rules:
+    - if: $CI_COMMIT_BRANCH == "main" && $CI_PIPELINE_SOURCE == "push"
+  variables:
+    DEPLOY_DIR: /opt/guard/bots/telegram/production
+    CONTAINER_NAME: guard-telegram-bot-production
+    EXTRA_COMPOSE_FILES: ""
