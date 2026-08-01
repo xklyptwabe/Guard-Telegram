@@ -1,5 +1,7 @@
 import 'dotenv/config';
 
+import path from 'node:path';
+
 import { migrate } from 'drizzle-orm/node-postgres/migrator';
 
 import { validateConfig } from '../config.js';
@@ -17,7 +19,7 @@ export async function runMigrations(config = validateConfig()): Promise<void> {
   }
 }
 
-if (process.argv[1]?.endsWith('/migrate.ts') || process.argv[1]?.endsWith('/migrate.js')) {
+if (process.argv[1] != null && /^migrate\.(ts|js)$/.test(path.basename(process.argv[1]))) {
   void runMigrations().catch((error: unknown) => {
     const logger = new Logger({ nodeEnv: 'development', logLevel: 'error' });
     logger.error({ event: 'database.migrations.failed', error: { name: 'MigrationError', message: error instanceof Error ? error.message : String(error) } });
