@@ -2,7 +2,7 @@ import { and, eq } from 'drizzle-orm';
 
 import { getUpdateContext } from './context.js';
 import type { DrizzleDatabase } from '../db/client.js';
-import { entitySnapshots, eventPolicies, events } from '../db/schema/audit.js';
+import { entitySnapshots, eventPolicies, events, outbox } from '../db/schema/audit.js';
 
 export interface AuditIdentity {
   readonly tenantId: string;
@@ -116,6 +116,25 @@ export class AuditService {
         .returning({ id: events.id, subjectSequence: events.subjectSequence });
 
       if (!eventRow) throw new Error('Audit event insert returned no rows');
+
+      await tx.insert(outbox).values({
+        eventId: eventRow.id,
+        destination: input.eventType,
+        payload: {
+          eventId: eventRow.id,
+          eventType: input.eventType,
+          eventVersion: input.eventVersion,
+          category: input.category,
+          tenantId: input.tenantId,
+          subjectType: input.subjectType,
+          subjectId: input.subjectId,
+          subjectSequence: eventRow.subjectSequence,
+          before: mutation.before,
+          after: mutation.after,
+          changes: mutation.changes,
+          metadata: input.metadata,
+        },
+      });
 
       await tx
         .update(entitySnapshots)

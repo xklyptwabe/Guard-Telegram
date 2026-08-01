@@ -6,7 +6,7 @@ import { validateConfig } from '../../src/config.js';
 import { createDatabase, type DatabaseClient } from '../../src/db/client.js';
 import { chatModuleStates, telegramChats } from '../../src/db/schema/core.js';
 import { AuditService } from '../../src/lib/auditService.js';
-import { events, entitySnapshots, eventPolicies } from '../../src/db/schema/audit.js';
+import { events, entitySnapshots, eventPolicies, outbox } from '../../src/db/schema/audit.js';
 
 const testDatabaseUrl = process.env.TEST_DATABASE_URL;
 let database: DatabaseClient | undefined;
@@ -28,6 +28,7 @@ describe.skipIf(!testDatabaseUrl)('Audit transaction integration', () => {
   beforeEach(async () => {
     await database!.db.delete(telegramChats);
     await database!.db.delete(chatModuleStates);
+    await database!.db.delete(outbox);
     await database!.db.delete(events);
     await database!.db.delete(entitySnapshots);
   });
@@ -67,10 +68,12 @@ describe.skipIf(!testDatabaseUrl)('Audit transaction integration', () => {
     const stateRows = await database!.db.select().from(chatModuleStates);
     const eventRows = await database!.db.select().from(events);
     const snapshotRows = await database!.db.select().from(entitySnapshots);
+    const outboxRows = await database!.db.select().from(outbox);
 
     expect(stateRows).toHaveLength(1);
     expect(eventRows).toHaveLength(1);
     expect(snapshotRows).toHaveLength(1);
+    expect(outboxRows).toHaveLength(1);
   });
 
   it('does not create a duplicate event for the same idempotency key', async () => {
@@ -129,10 +132,12 @@ describe.skipIf(!testDatabaseUrl)('Audit transaction integration', () => {
     const stateRows = await database!.db.select().from(chatModuleStates);
     const eventRows = await database!.db.select().from(events);
     const snapshotRows = await database!.db.select().from(entitySnapshots);
+    const outboxRows = await database!.db.select().from(outbox);
 
     expect(stateRows).toHaveLength(0);
     expect(eventRows).toHaveLength(0);
     expect(snapshotRows).toHaveLength(0);
+    expect(outboxRows).toHaveLength(0);
   });
 
   it('fails closed when the audit policy is disabled', async () => {
@@ -165,10 +170,12 @@ describe.skipIf(!testDatabaseUrl)('Audit transaction integration', () => {
       const stateRows = await database!.db.select().from(chatModuleStates);
       const eventRows = await database!.db.select().from(events);
       const snapshotRows = await database!.db.select().from(entitySnapshots);
+      const outboxRows = await database!.db.select().from(outbox);
 
       expect(stateRows).toHaveLength(0);
       expect(eventRows).toHaveLength(0);
       expect(snapshotRows).toHaveLength(0);
+      expect(outboxRows).toHaveLength(0);
     } finally {
       await database!.db.update(eventPolicies).set({ enabled: true }).where(and(eq(eventPolicies.eventType, 'module.state.changed'), eq(eventPolicies.eventVersion, 'v1')));
     }
