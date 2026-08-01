@@ -2,7 +2,10 @@ import { drizzle } from 'drizzle-orm/node-postgres';
 import { Pool } from 'pg';
 
 import type { AppConfig } from '../config.js';
-import * as schema from './schema/core.js';
+import * as coreSchema from './schema/core.js';
+import * as auditSchema from './schema/audit.js';
+
+const schema = { ...coreSchema, ...auditSchema };
 
 export type DrizzleDatabase = ReturnType<typeof drizzle<typeof schema>>;
 

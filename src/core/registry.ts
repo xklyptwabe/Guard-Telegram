@@ -3,6 +3,7 @@ import { and, eq } from 'drizzle-orm';
 import type { TelegramBotModule } from './contracts.js';
 import type { DrizzleDatabase } from '../db/client.js';
 import { chatModuleStates, telegramChats } from '../db/schema/core.js';
+import type { AuditService } from '../lib/auditService.js';
 import type { EventBus } from '../lib/eventBus.js';
 import type { Logger } from '../lib/logger.js';
 
@@ -21,6 +22,7 @@ export class ModuleRegistry {
   public constructor(
     modules: readonly TelegramBotModule[],
     private readonly db: DrizzleDatabase,
+    private readonly audit: AuditService,
     private readonly events: EventBus,
     private readonly logger: Logger,
   ) {
@@ -62,18 +64,46 @@ export class ModuleRegistry {
 
   public async setEnabled(chatId: string, moduleId: string, enabled: boolean): Promise<void> {
     const module = this.requireModule(moduleId);
-    const now = new Date();
-    if (enabled === module.defaultEnabled) {
-      await this.db.delete(chatModuleStates).where(and(eq(chatModuleStates.chatId, chatId), eq(chatModuleStates.moduleId, moduleId)));
-    } else {
-      await this.db
-        .insert(chatModuleStates)
-        .values({ chatId, moduleId, enabled, updatedAt: now })
-        .onConflictDoUpdate({
-          target: [chatModuleStates.chatId, chatModuleStates.moduleId],
-          set: { enabled, updatedAt: now },
-        });
-    }
+    await this.audit.recordEntityChange(
+      {
+        tenantId: chatId,
+        subjectType: 'chat_module_state',
+        subjectId: `${chatId}:${moduleId}`,
+        eventType: 'module.state.changed',
+        eventVersion: 'v1',
+        category: 'module',
+        source: 'telegram.command',
+        idempotencyKey: `module.state.changed:${chatId}:${moduleId}:${enabled}`,
+        actorType: 'telegram_user',
+      },
+      async (tx) => {
+        const current = await tx
+          .select({ enabled: chatModuleStates.enabled })
+          .from(chatModuleStates)
+          .where(and(eq(chatModuleStates.chatId, chatId), eq(chatModuleStates.moduleId, moduleId)))
+          .limit(1)
+          .for('update');
+        const beforeEnabled = resolveModuleEnabled(module.defaultEnabled, current[0]?.enabled);
+        const now = new Date();
+        if (enabled === module.defaultEnabled) {
+          await tx.delete(chatModuleStates).where(and(eq(chatModuleStates.chatId, chatId), eq(chatModuleStates.moduleId, moduleId)));
+        } else {
+          await tx
+            .insert(chatModuleStates)
+            .values({ chatId, moduleId, enabled, updatedAt: now })
+            .onConflictDoUpdate({
+              target: [chatModuleStates.chatId, chatModuleStates.moduleId],
+              set: { enabled, updatedAt: now },
+            });
+        }
+        return {
+          before: { enabled: beforeEnabled },
+          after: { enabled },
+          ...(beforeEnabled === enabled ? {} : { changes: { enabled: { before: beforeEnabled, after: enabled } } }),
+          snapshotData: { chatId, moduleId, enabled, defaultEnabled: module.defaultEnabled },
+        };
+      },
+    );
     if (enabled) await module.onEnable?.(chatId);
     else await module.onDisable?.(chatId);
     this.logger.info({ event: enabled ? 'module.enabled' : 'module.disabled', module: moduleId, chatId });
