@@ -104,4 +104,33 @@ describe.skipIf(!testDatabaseUrl)('Audit transaction integration', () => {
     const eventRows = await database!.db.select().from(events);
     expect(eventRows).toHaveLength(1);
   });
+
+  it('rolls back the business change and audit rows when the transaction fails', async () => {
+    const input = {
+      tenantId: '1003',
+      subjectType: 'chat_module_state',
+      subjectId: '1003:module-admin',
+      eventType: 'module.state.changed',
+      eventVersion: 'v1',
+      category: 'module',
+      source: 'telegram.command',
+      idempotencyKey: 'audit:test:1003:module-admin:true',
+    } as const;
+
+    await expect(
+      audit!.recordEntityChange(input, async (tx) => {
+        await tx.insert(telegramChats).values({ chatId: '1003', type: 'group', title: 'audit-test' });
+        await tx.insert(chatModuleStates).values({ chatId: '1003', moduleId: 'module-admin', enabled: true });
+        throw new Error('forced failure');
+      }),
+    ).rejects.toThrow('forced failure');
+
+    const stateRows = await database!.db.select().from(chatModuleStates);
+    const eventRows = await database!.db.select().from(events);
+    const snapshotRows = await database!.db.select().from(entitySnapshots);
+
+    expect(stateRows).toHaveLength(0);
+    expect(eventRows).toHaveLength(0);
+    expect(snapshotRows).toHaveLength(0);
+  });
 });
