@@ -2,7 +2,7 @@ import { and, eq } from 'drizzle-orm';
 
 import { getUpdateContext } from './context.js';
 import type { DrizzleDatabase } from '../db/client.js';
-import { entitySnapshots, events } from '../db/schema/audit.js';
+import { entitySnapshots, eventPolicies, events } from '../db/schema/audit.js';
 
 export interface AuditIdentity {
   readonly tenantId: string;
@@ -50,6 +50,16 @@ export class AuditService {
         .limit(1);
       if (existing[0]) {
         return { eventId: existing[0].id, subjectSequence: existing[0].subjectSequence, duplicate: true };
+      }
+
+      const policyRows = await tx
+        .select({ required: eventPolicies.required, enabled: eventPolicies.enabled })
+        .from(eventPolicies)
+        .where(and(eq(eventPolicies.eventType, input.eventType), eq(eventPolicies.eventVersion, input.eventVersion)))
+        .limit(1);
+      const policy = policyRows[0];
+      if (!policy || !policy.enabled) {
+        throw new Error(`Audit policy is unavailable for ${input.eventType}@${input.eventVersion}`);
       }
 
       const snapshotWhere = and(

@@ -1,11 +1,12 @@
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import { migrate } from 'drizzle-orm/node-postgres/migrator';
+import { and, eq } from 'drizzle-orm';
 
 import { validateConfig } from '../../src/config.js';
 import { createDatabase, type DatabaseClient } from '../../src/db/client.js';
-import { chatModuleStates, telegramChats } from '../../src/db/schema/core.js'
+import { chatModuleStates, telegramChats } from '../../src/db/schema/core.js';
 import { AuditService } from '../../src/lib/auditService.js';
-import { events, entitySnapshots } from '../../src/db/schema/audit.js';
+import { events, entitySnapshots, eventPolicies } from '../../src/db/schema/audit.js';
 
 const testDatabaseUrl = process.env.TEST_DATABASE_URL;
 let database: DatabaseClient | undefined;
@@ -132,5 +133,44 @@ describe.skipIf(!testDatabaseUrl)('Audit transaction integration', () => {
     expect(stateRows).toHaveLength(0);
     expect(eventRows).toHaveLength(0);
     expect(snapshotRows).toHaveLength(0);
+  });
+
+  it('fails closed when the audit policy is disabled', async () => {
+    const input = {
+      tenantId: '1004',
+      subjectType: 'chat_module_state',
+      subjectId: '1004:module-admin',
+      eventType: 'module.state.changed',
+      eventVersion: 'v1',
+      category: 'module',
+      source: 'telegram.command',
+      idempotencyKey: 'audit:test:1004:module-admin:true',
+    } as const;
+
+    await database!.db.update(eventPolicies).set({ enabled: false }).where(and(eq(eventPolicies.eventType, 'module.state.changed'), eq(eventPolicies.eventVersion, 'v1')));
+
+    try {
+      await expect(
+        audit!.recordEntityChange(input, async (tx) => {
+          await tx.insert(telegramChats).values({ chatId: '1004', type: 'group', title: 'audit-test' });
+          await tx.insert(chatModuleStates).values({ chatId: '1004', moduleId: 'module-admin', enabled: true });
+          return {
+            before: undefined,
+            after: { enabled: true },
+            snapshotData: { chatId: '1004', moduleId: 'module-admin', enabled: true },
+          };
+        }),
+      ).rejects.toThrow('Audit policy is unavailable for module.state.changed@v1');
+
+      const stateRows = await database!.db.select().from(chatModuleStates);
+      const eventRows = await database!.db.select().from(events);
+      const snapshotRows = await database!.db.select().from(entitySnapshots);
+
+      expect(stateRows).toHaveLength(0);
+      expect(eventRows).toHaveLength(0);
+      expect(snapshotRows).toHaveLength(0);
+    } finally {
+      await database!.db.update(eventPolicies).set({ enabled: true }).where(and(eq(eventPolicies.eventType, 'module.state.changed'), eq(eventPolicies.eventVersion, 'v1')));
+    }
   });
 });
