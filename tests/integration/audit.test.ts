@@ -3,7 +3,7 @@ import { migrate } from 'drizzle-orm/node-postgres/migrator';
 
 import { validateConfig } from '../../src/config.js';
 import { createDatabase, type DatabaseClient } from '../../src/db/client.js';
-import { chatModuleStates } from '../../src/db/schema/core.js';
+import { chatModuleStates, telegramChats } from '../../src/db/schema/core.js'
 import { AuditService } from '../../src/lib/auditService.js';
 import { events, entitySnapshots } from '../../src/db/schema/audit.js';
 
@@ -25,6 +25,7 @@ describe.skipIf(!testDatabaseUrl)('Audit transaction integration', () => {
   });
 
   beforeEach(async () => {
+    await database!.db.delete(telegramChats);
     await database!.db.delete(chatModuleStates);
     await database!.db.delete(events);
     await database!.db.delete(entitySnapshots);
@@ -47,6 +48,7 @@ describe.skipIf(!testDatabaseUrl)('Audit transaction integration', () => {
         idempotencyKey: 'audit:test:1001:module-admin:true',
       },
       async (tx) => {
+        await tx.insert(telegramChats).values({ chatId: '1001', type: 'group', title: 'audit-test' });
         await tx
           .insert(chatModuleStates)
           .values({ chatId: '1001', moduleId: 'module-admin', enabled: true });
@@ -83,6 +85,7 @@ describe.skipIf(!testDatabaseUrl)('Audit transaction integration', () => {
     } as const;
 
     const first = await audit!.recordEntityChange(input, async (tx) => {
+      await tx.insert(telegramChats).values({ chatId: '1002', type: 'group', title: 'audit-test' });
       await tx.insert(chatModuleStates).values({ chatId: '1002', moduleId: 'module-admin', enabled: true });
       return {
         before: undefined,
