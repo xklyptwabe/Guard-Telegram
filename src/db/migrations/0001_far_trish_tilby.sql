@@ -1,12 +1,14 @@
 CREATE SCHEMA "audit";
 --> statement-breakpoint
+CREATE SEQUENCE "audit"."subject_sequence";
+--> statement-breakpoint
 CREATE TABLE "audit"."entity_snapshots" (
 	"tenant_id" text NOT NULL,
 	"entity_type" text NOT NULL,
 	"entity_id" text NOT NULL,
 	"snapshot_status" text DEFAULT 'current' NOT NULL,
 	"snapshot_data" jsonb NOT NULL,
-	"last_subject_sequence" timestamp NOT NULL,
+	"last_subject_sequence" bigint NOT NULL,
 	"last_event_id" uuid,
 	"created_at" timestamp with time zone DEFAULT now() NOT NULL,
 	"updated_at" timestamp with time zone DEFAULT now() NOT NULL,
@@ -17,7 +19,7 @@ CREATE TABLE "audit"."event_policies" (
 	"event_type" text NOT NULL,
 	"event_version" text NOT NULL,
 	"required" boolean DEFAULT true NOT NULL,
-	"retention_days" timestamp with time zone,
+	"retention_days" integer,
 	"enabled" boolean DEFAULT true NOT NULL,
 	"created_at" timestamp with time zone DEFAULT now() NOT NULL,
 	"updated_at" timestamp with time zone DEFAULT now() NOT NULL,
@@ -48,7 +50,7 @@ CREATE TABLE "audit"."events" (
 	"actor_type" text,
 	"subject_type" text NOT NULL,
 	"subject_id" text NOT NULL,
-	"subject_sequence" timestamp NOT NULL,
+	"subject_sequence" bigint DEFAULT nextval('audit.subject_sequence') NOT NULL,
 	"correlation_id" text,
 	"telegram_context" jsonb,
 	"idempotency_key" text NOT NULL,

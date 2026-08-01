@@ -1,4 +1,5 @@
-import { boolean, index, integer, pgSchema, primaryKey, text, timestamp, uuid, jsonb } from 'drizzle-orm/pg-core';
+import { bigint, boolean, index, integer, pgSchema, primaryKey, text, timestamp, uuid, jsonb } from 'drizzle-orm/pg-core';
+import { sql } from 'drizzle-orm';
 
 const createdAt = () => timestamp('created_at', { withTimezone: true }).defaultNow().notNull();
 const updatedAt = () => timestamp('updated_at', { withTimezone: true }).defaultNow().notNull();
@@ -24,7 +25,7 @@ export const eventPolicies = auditSchema.table(
     eventType: text('event_type').notNull(),
     eventVersion: text('event_version').notNull(),
     required: boolean('required').notNull().default(true),
-    retentionDays: timestamp('retention_days', { withTimezone: true }),
+    retentionDays: integer('retention_days'),
     enabled: boolean('enabled').notNull().default(true),
     createdAt: createdAt(),
     updatedAt: updatedAt(),
@@ -48,7 +49,7 @@ export const events = auditSchema.table(
     actorType: text('actor_type'),
     subjectType: text('subject_type').notNull(),
     subjectId: text('subject_id').notNull(),
-    subjectSequence: timestamp('subject_sequence').notNull(),
+    subjectSequence: bigint('subject_sequence', { mode: 'number' }).default(sql`nextval('audit.subject_sequence')`).notNull(),
     correlationId: text('correlation_id'),
     telegramContext: jsonb('telegram_context'),
     idempotencyKey: text('idempotency_key').notNull().unique(),
@@ -73,7 +74,7 @@ export const entitySnapshots = auditSchema.table(
     entityId: text('entity_id').notNull(),
     snapshotStatus: text('snapshot_status', { enum: ['current', 'archived'] }).notNull().default('current'),
     snapshotData: jsonb('snapshot_data').notNull(),
-    lastSubjectSequence: timestamp('last_subject_sequence').notNull(),
+    lastSubjectSequence: bigint('last_subject_sequence', { mode: 'number' }).notNull(),
     lastEventId: uuid('last_event_id'),
     createdAt: createdAt(),
     updatedAt: updatedAt(),
