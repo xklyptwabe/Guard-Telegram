@@ -13,6 +13,7 @@ import { createDatabase } from './db/client.js';
 import { purgeExpiredProcessedUpdates } from './db/retention.js';
 import { createRedis } from './db/redis.js';
 import { initializeI18n } from './i18n/index.js';
+import { AuditService } from './lib/auditService.js';
 import { Cooldowns } from './lib/cooldowns.js';
 import { EventBus } from './lib/eventBus.js';
 import { healthSnapshot } from './lib/health.js';
@@ -59,8 +60,9 @@ async function bootstrap(): Promise<void> {
     storage = createStorage(config, logger);
     rabbitMq = await createRabbitMq(config, logger);
     validateModules(modules);
+    const audit = new AuditService(database.db);
     const events = new EventBus(logger);
-    const registry = new ModuleRegistry(modules, database.db, events, logger);
+    const registry = new ModuleRegistry(modules, database.db, audit, events, logger);
     const reply = new ReplyService(config, logger);
     const dispatcher = new CommandDispatcher(collectCommands(modules), registry, new Cooldowns(), reply, events, i18n, logger);
     const bot = createTelegramBot(config, logger);
