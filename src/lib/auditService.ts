@@ -30,7 +30,7 @@ export interface AuditChange<TSnapshot extends Record<string, unknown>> {
   readonly snapshotData: TSnapshot;
 }
 
-export interface AuditMutationResult<TSnapshot extends Record<string, unknown>> extends AuditChange<TSnapshot> {}
+export type AuditMutationResult<TSnapshot extends Record<string, unknown>> = AuditChange<TSnapshot>;
 
 type AuditTransaction = Pick<DrizzleDatabase, 'select' | 'insert' | 'update' | 'delete'>;
 
