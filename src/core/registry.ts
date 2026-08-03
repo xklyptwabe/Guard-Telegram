@@ -72,7 +72,7 @@ export class ModuleRegistry {
 
   public async setEnabled(chatId: string, moduleId: string, enabled: boolean, actorId?: string): Promise<void> {
     const module = this.requireModule(moduleId);
-    await this.audit.recordEntityChange(
+    const result = await this.audit.recordEntityChange(
       {
         tenantId: chatId,
         subjectType: 'chat_module_state',
@@ -126,10 +126,19 @@ export class ModuleRegistry {
         // forbidden keys, before anything reaches the audit event row.
         // Previously this callback built before/after by hand and none of
         // that pipeline ever ran.
+        // A genuine noop requires both the effective value *and* its
+        // source to be unchanged. Value-only comparison misses a real
+        // case: if an admin redundantly overrides a module to its own
+        // default (creating an unnecessary row) and later sets it to the
+        // same value again, the override row above gets deleted as
+        // cleanup — the boolean doesn't change, but the row does, and
+        // source flips override → default. That's a real state change,
+        // not a noop, even though `enabled` alone looks unchanged.
+        const operation = beforeEnabled === enabled && beforeSource === afterSource ? 'noop' : 'update';
         const record = this.auditProcessor.process({
           name: 'module.state.changed',
           version: 1,
-          operation: beforeEnabled === enabled ? 'noop' : 'update',
+          operation,
           chatId,
           ...(actorId !== undefined ? { actorId } : {}),
           before: observed({ chatId, moduleId, enabled: beforeEnabled, source: beforeSource }),
@@ -148,6 +157,19 @@ export class ModuleRegistry {
         };
       },
     );
+    // A duplicate means `mutate` above never ran at all — the row was
+    // never touched, `beforeEnabled`/`afterSource`/etc were never even
+    // computed. Firing onEnable/onDisable, the event bus publish, or the
+    // log line here would replay side effects for a state change that, as
+    // far as the DB is concerned, never happened on this call. This is
+    // exactly the case BOTS-9's "idempotent replayed Update" requirement
+    // is about — previously this return value was silently discarded and
+    // every one of these ran unconditionally, defeating the point of
+    // idempotencyKey for anything downstream of the audit write itself.
+    if (result.duplicate) {
+      this.logger.debug({ event: 'module.state.changed.duplicate_skipped', module: moduleId, chatId });
+      return;
+    }
     if (enabled) await module.onEnable?.(chatId);
     else await module.onDisable?.(chatId);
     this.logger.info({ event: enabled ? 'module.enabled' : 'module.disabled', module: moduleId, chatId });

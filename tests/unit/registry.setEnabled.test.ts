@@ -49,7 +49,26 @@ function fakeRegistry(module: TelegramBotModule, existingEnabled: boolean | unde
   const logger = { info: vi.fn(), debug: vi.fn(), warn: vi.fn(), error: vi.fn() } as unknown as Logger;
   const db = {} as unknown as DrizzleDatabase;
   const registry = new ModuleRegistry([module], db, audit, events, logger);
-  return { registry, calls };
+  return { registry, calls, events, logger };
+}
+
+/**
+ * Fake matching the real `recordEntityChange`'s behavior on a genuine
+ * idempotencyKey collision: `mutate` is never invoked at all (the real
+ * implementation returns before calling it — see auditService.ts's early
+ * `if (existing[0]) return { ..., duplicate: true }`), and the result
+ * reports `duplicate: true`.
+ */
+function fakeRegistryDuplicate(module: TelegramBotModule) {
+  const mutate = vi.fn();
+  const audit = {
+    recordEntityChange: vi.fn(async () => ({ eventId: 'evt-existing', subjectSequence: 1, duplicate: true })),
+  } as unknown as AuditService;
+  const events = { publish: vi.fn() } as unknown as EventBus;
+  const logger = { info: vi.fn(), debug: vi.fn(), warn: vi.fn(), error: vi.fn() } as unknown as Logger;
+  const db = {} as unknown as DrizzleDatabase;
+  const registry = new ModuleRegistry([module], db, audit, events, logger);
+  return { registry, events, logger, mutate };
 }
 
 describe('ModuleRegistry.setEnabled — BOTS-7/BOTS-6 wiring', () => {
@@ -132,5 +151,56 @@ describe('ModuleRegistry.setEnabled — BOTS-7/BOTS-6 wiring', () => {
     await registry.setEnabled('chat-1', 'welcome', true, 'user-1');
 
     expect(onEnable).toHaveBeenCalledWith('chat-1');
+  });
+
+  it('classifies a redundant-override cleanup as update, not noop — the boolean is unchanged but the row/source actually changes', async () => {
+    // defaultEnabled=true, but there's an existing *redundant* override
+    // row already set to true (e.g. an admin ran /module_enable when it
+    // was already true by default). Calling setEnabled(true) again looks
+    // like a value-noop, but it actually deletes that stray row and flips
+    // source override → default — a real state change.
+    const module = fakeModule('welcome', true);
+    const { registry, calls } = fakeRegistry(module, true); // existing override row: enabled=true
+
+    await registry.setEnabled('chat-1', 'welcome', true, 'user-1');
+
+    const call = calls[0] as { result: { before: Record<string, unknown>; after: Record<string, unknown>; changes: { status: string; fields: Record<string, unknown> } } };
+    expect(call.result.before).toMatchObject({ enabled: true, source: 'override' });
+    expect(call.result.after).toMatchObject({ enabled: true, source: 'default' });
+    // Because operation is 'update' (not 'noop'), changes must reflect the
+    // source flip even though `enabled` itself didn't change.
+    expect(call.result.changes.fields).toHaveProperty('source');
+  });
+
+  it('on a genuine duplicate (idempotencyKey collision), skips onEnable/onDisable, the event bus publish, and the info log — mutate never ran, nothing actually changed', async () => {
+    const onEnable = vi.fn();
+    const module: TelegramBotModule = { ...fakeModule('welcome', true), onEnable };
+    const { registry, events, logger } = fakeRegistryDuplicate(module);
+
+    await registry.setEnabled('chat-1', 'welcome', false, 'user-1');
+
+    // Regression test: recordEntityChange's return value used to be
+    // discarded entirely, so a replayed Telegram Update (the exact case
+    // idempotencyKey exists to protect against) would still fire these
+    // side effects a second time, even though the DB write itself was
+    // correctly deduped.
+    expect(onEnable).not.toHaveBeenCalled();
+    expect(events.publish).not.toHaveBeenCalled();
+    expect(logger.info).not.toHaveBeenCalled();
+    expect(logger.debug).toHaveBeenCalledWith(
+      expect.objectContaining({ event: 'module.state.changed.duplicate_skipped' }),
+    );
+  });
+
+  it('on a normal (non-duplicate) call, does fire onEnable/publish/info log', async () => {
+    const onDisable = vi.fn();
+    const module: TelegramBotModule = { ...fakeModule('welcome', true), onDisable };
+    const { registry, events, logger } = fakeRegistry(module, true);
+
+    await registry.setEnabled('chat-1', 'welcome', false, 'user-1');
+
+    expect(onDisable).toHaveBeenCalledWith('chat-1');
+    expect(events.publish).toHaveBeenCalledWith('module.state.changed', { chatId: 'chat-1', moduleId: 'welcome', enabled: false });
+    expect(logger.info).toHaveBeenCalled();
   });
 });
