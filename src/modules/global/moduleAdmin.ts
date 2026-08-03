@@ -45,7 +45,7 @@ export const moduleAdminModule: TelegramBotModule = {
           await context.reply.send(context.ctx, context.t('modules.unknown', { moduleId }));
           return;
         }
-        await context.registry.setEnabled(context.chatId, moduleId, true);
+        await context.registry.setEnabled(context.chatId, moduleId, true, context.userId);
         await context.reply.send(context.ctx, context.t('modules.changed', { moduleId, state: moduleStateLabel(context, true) }));
       },
     },
@@ -63,7 +63,7 @@ export const moduleAdminModule: TelegramBotModule = {
           await context.reply.send(context.ctx, context.t('modules.unknown', { moduleId }));
           return;
         }
-        await context.registry.setEnabled(context.chatId, moduleId, false);
+        await context.registry.setEnabled(context.chatId, moduleId, false, context.userId);
         await context.reply.send(context.ctx, context.t('modules.changed', { moduleId, state: moduleStateLabel(context, false) }));
       },
     },

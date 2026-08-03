@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 
 import { AuditSnapshotValidationError, UnregisteredAuditEventError, UnsupportedAuditEventVersionError } from '../../src/lib/audit/errors.js';
-import { AuditEventProcessor } from '../../src/lib/audit/service.js';
+import { AuditEventProcessor } from '../../src/lib/audit/eventProcessor.js';
 import { notApplicable, observed } from '../../src/lib/audit/snapshot.js';
 
 const processor = new AuditEventProcessor();

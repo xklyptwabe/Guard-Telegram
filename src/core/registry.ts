@@ -6,6 +6,9 @@ import { chatModuleStates, telegramChats } from '../db/schema/core.js';
 import type { AuditService } from '../lib/auditService.js';
 import type { EventBus } from '../lib/eventBus.js';
 import type { Logger } from '../lib/logger.js';
+import { AuditEventProcessor } from '../lib/audit/eventProcessor.js';
+import { observed } from '../lib/audit/snapshot.js';
+import { toDownstreamMutationResult } from '../lib/audit/serviceAdapter.js';
 
 export interface ModuleState {
   readonly id: string;
@@ -18,6 +21,11 @@ export function resolveModuleEnabled(defaultEnabled: boolean, override: boolean 
 
 export class ModuleRegistry {
   private readonly modulesById: ReadonlyMap<string, TelegramBotModule>;
+  // BOTS-7's registry: runs schema validation, allowlist, and forbidden-key
+  // masking on before/after before anything reaches BOTS-6's AuditService.
+  // Previously setEnabled() built before/after by hand and this pipeline
+  // was never invoked at all.
+  private readonly auditProcessor = new AuditEventProcessor();
 
   public constructor(
     modules: readonly TelegramBotModule[],
@@ -62,7 +70,7 @@ export class ModuleRegistry {
     return Promise.all(this.modules.map(async (module) => ({ id: module.id, enabled: await this.isEnabled(chatId, module.id) })));
   }
 
-  public async setEnabled(chatId: string, moduleId: string, enabled: boolean): Promise<void> {
+  public async setEnabled(chatId: string, moduleId: string, enabled: boolean, actorId?: string): Promise<void> {
     const module = this.requireModule(moduleId);
     await this.audit.recordEntityChange(
       {
@@ -74,7 +82,17 @@ export class ModuleRegistry {
         category: 'module',
         source: 'telegram.command',
         idempotencyKey: `module.state.changed:${chatId}:${moduleId}:${enabled}`,
-        actorType: 'telegram_user',
+        ...(actorId !== undefined ? { actorId, actorType: 'telegram_user' } : { actorType: 'telegram_user' }),
+        // No `metadata` here: severity/siteVisible/canBeDisabled are now
+        // static per-event-type columns on audit.event_types (seeded from
+        // the registry via scripts/seedAuditEventTypes.ts), not
+        // per-occurrence data — no need to repeat them on every row.
+        // `operation` (which Maxim does want in metadata.operation, for
+        // filtering/analytics) isn't knowable yet at this point for an
+        // entity-like event like this one — it's only computed once the
+        // row is read below, inside `mutate`, after this input object has
+        // already shipped. Per Maxim: not critical right now, revisit once
+        // `AuditMutationResult` supports returning metadata too.
       },
       async (tx) => {
         const current = await tx
@@ -84,6 +102,12 @@ export class ModuleRegistry {
           .limit(1)
           .for('update');
         const beforeEnabled = resolveModuleEnabled(module.defaultEnabled, current[0]?.enabled);
+        // Sparse override tracking (BOTS-7 spec: "хранить эффективное
+        // значение и источник default/override") — a row present means an
+        // explicit override; its absence means the module is inheriting
+        // its default. Previously not tracked anywhere at all.
+        const beforeSource = current[0] ? 'override' : 'default';
+        const afterSource = enabled === module.defaultEnabled ? 'default' : 'override';
         const now = new Date();
         if (enabled === module.defaultEnabled) {
           await tx.delete(chatModuleStates).where(and(eq(chatModuleStates.chatId, chatId), eq(chatModuleStates.moduleId, moduleId)));
@@ -96,11 +120,31 @@ export class ModuleRegistry {
               set: { enabled, updatedAt: now },
             });
         }
+
+        // Route through BOTS-7's registry: validates against the
+        // module.state.changed schema, applies the allowlist, and strips
+        // forbidden keys, before anything reaches the audit event row.
+        // Previously this callback built before/after by hand and none of
+        // that pipeline ever ran.
+        const record = this.auditProcessor.process({
+          name: 'module.state.changed',
+          version: 1,
+          operation: beforeEnabled === enabled ? 'noop' : 'update',
+          chatId,
+          ...(actorId !== undefined ? { actorId } : {}),
+          before: observed({ chatId, moduleId, enabled: beforeEnabled, source: beforeSource }),
+          after: observed({ chatId, moduleId, enabled, source: afterSource }),
+        });
+        const mutationResult = toDownstreamMutationResult(record);
+
         return {
-          before: { enabled: beforeEnabled },
-          after: { enabled },
-          ...(beforeEnabled === enabled ? {} : { changes: { enabled: { before: beforeEnabled, after: enabled } } }),
-          snapshotData: { chatId, moduleId, enabled, defaultEnabled: module.defaultEnabled },
+          ...mutationResult,
+          // snapshotData carries `defaultEnabled` too, beyond what this
+          // one event's `after` needs — BOTS-6's own concept for the
+          // queryable "current state" row, not something the generic
+          // registry knows about, so it's merged in here rather than in
+          // the adapter.
+          snapshotData: { ...mutationResult.snapshotData, defaultEnabled: module.defaultEnabled },
         };
       },
     );

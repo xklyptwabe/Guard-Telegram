@@ -13,6 +13,18 @@ export const eventTypes = auditSchema.table(
     eventVersion: text('event_version').notNull(),
     category: text('category').notNull(),
     description: text('description'),
+    // Static, per-event-type metadata projected from the BOTS-7 registry
+    // (definitions.ts) — not per-occurrence data. Seeded once from the
+    // registry, not written on every event row (see
+    // scripts/seedAuditEventTypes.ts). Previously this lived nowhere in
+    // the DB at all and was smuggled into events.metadata.bots7 per row.
+    severity: text('severity', { enum: ['debug', 'info', 'notice', 'warning', 'critical'] }).notNull().default('info'),
+    siteVisible: boolean('site_visible').notNull().default(true),
+    // Whether an operator is *allowed* to turn this event type off via
+    // event_policies.enabled. This column doesn't itself gate anything at
+    // write time — it's a UI/ops-facing constraint on what's a legal value
+    // for event_policies.enabled for this type, enforced administratively.
+    canBeDisabled: boolean('can_be_disabled').notNull().default(true),
     createdAt: createdAt(),
     updatedAt: updatedAt(),
   },
