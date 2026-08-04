@@ -57,6 +57,7 @@ export interface AuditRecord<T extends Record<string, unknown> = Record<string, 
   readonly siteVisible: boolean;
   readonly operation: AuditOperation;
   readonly occurredAt: string;
+  readonly idempotencyKey?: string;
   readonly actorId: string | undefined;
   readonly chatId: string | undefined;
   /** Masked, allowlisted "before" snapshot — never raw domain data. */

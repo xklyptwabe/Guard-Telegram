@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 
 import { AUDIT_EVENT_NAMES } from '../../src/lib/audit/eventMap.js';
 import {
+  MissingAuditIdempotencyKeyError,
   PLATFORM_TENANT_SENTINEL,
   buildMetadataBridge,
   tenantIdFor,
@@ -71,12 +72,43 @@ describe('toDownstreamInput', () => {
       chatId: 'chat-1',
       before: notApplicable(),
     };
-    const first = processor.process({ ...base, after: observed({ chatId: 'chat-1', userId: 'u1', moduleId: 'mod', commandId: 'ban', argsRedacted: true, durationMs: 5, success: true }) });
-    const second = processor.process({ ...base, after: observed({ chatId: 'chat-1', userId: 'u1', moduleId: 'mod', commandId: 'ban', argsRedacted: true, durationMs: 7, success: true }) });
+    const first = processor.process({ ...base, idempotencyKey: 'command:1', after: observed({ chatId: 'chat-1', userId: 'u1', moduleId: 'mod', commandId: 'ban', argsRedacted: true, durationMs: 5, success: true }) });
+    const second = processor.process({ ...base, idempotencyKey: 'command:2', after: observed({ chatId: 'chat-1', userId: 'u1', moduleId: 'mod', commandId: 'ban', argsRedacted: true, durationMs: 7, success: true }) });
 
     const firstInput = toDownstreamInput(first);
     const secondInput = toDownstreamInput(second);
     expect(firstInput.subjectId).not.toBe(secondInput.subjectId);
+  });
+
+  it('uses an explicit idempotencyKey for command.executed instead of the random subjectId', () => {
+    const base = {
+      name: 'command.executed' as const,
+      version: 1 as const,
+      operation: 'noop' as const,
+      chatId: 'chat-1',
+      idempotencyKey: 'telegram-update:123:command:ban',
+      before: notApplicable(),
+      after: observed({ chatId: 'chat-1', userId: 'u1', moduleId: 'mod', commandId: 'ban', argsRedacted: true, durationMs: 5, success: true }),
+    };
+    const firstInput = toDownstreamInput(processor.process(base));
+    const replayInput = toDownstreamInput(processor.process(base));
+
+    expect(firstInput.subjectId).not.toBe(replayInput.subjectId);
+    expect(firstInput.idempotencyKey).toBe('telegram-update:123:command:ban');
+    expect(replayInput.idempotencyKey).toBe(firstInput.idempotencyKey);
+  });
+
+  it('rejects command.executed without an explicit idempotencyKey', () => {
+    const record = processor.process({
+      name: 'command.executed',
+      version: 1,
+      operation: 'noop',
+      chatId: 'chat-1',
+      before: notApplicable(),
+      after: observed({ chatId: 'chat-1', userId: 'u1', moduleId: 'mod', commandId: 'ban', argsRedacted: true, durationMs: 5, success: true }),
+    });
+
+    expect(() => toDownstreamInput(record)).toThrow(MissingAuditIdempotencyKeyError);
   });
 
   it('bridges only `operation` into metadata — severity/siteVisible/canBeDisabled now live on seeded audit.event_types, not metadata', () => {
@@ -103,6 +135,7 @@ describe('toDownstreamInput', () => {
           name,
           version: 1,
           operation: 'unknown',
+          idempotencyKey: `${name}:fixture`,
           before: notApplicable(),
           after: notApplicable(),
         });

@@ -298,6 +298,19 @@ function stableStringify(value: unknown): string {
   return `{${entries.join(',')}}`;
 }
 
+export class MissingAuditIdempotencyKeyError extends Error {
+  public constructor(eventName: string) {
+    super(`serviceAdapter: "${eventName}" requires an explicit idempotencyKey.`);
+    this.name = 'MissingAuditIdempotencyKeyError';
+  }
+}
+
+function idempotencyKeyFor(record: AuditRecord, subject: SubjectMapping, afterFields: Record<string, unknown>): string {
+  if (record.idempotencyKey !== undefined && record.idempotencyKey.length > 0) return record.idempotencyKey;
+  if (record.eventName === 'command.executed') throw new MissingAuditIdempotencyKeyError(record.eventName);
+  return `${record.eventName}:${subject.subjectId}:${stableStringify(afterFields)}`;
+}
+
 export function toDownstreamInput(record: AuditRecord, registry: AuditEventRegistry = auditEventRegistry): DownstreamAuditEventInput {
   const definition = registry.requireByName(record.eventName);
   const subject = subjectMappingFor(record);
@@ -313,13 +326,7 @@ export function toDownstreamInput(record: AuditRecord, registry: AuditEventRegis
     eventVersion: `v${record.eventVersion}`,
     category: definition.category,
     source: 'bots7-registry',
-    // Keyed on the actual target state, not a timestamp — a timestamp-based
-    // key would be unique on every call and never dedupe anything, defeating
-    // the point of idempotencyKey. This mirrors (not byte-for-byte, but in
-    // effect) BOTS-6's own `...:${enabled}` convention for
-    // module.state.changed: same intent → same key → correctly treated as a
-    // duplicate; different intent → different key.
-    idempotencyKey: `${record.eventName}:${subject.subjectId}:${stableStringify(afterFields)}`,
+    idempotencyKey: idempotencyKeyFor(record, subject, afterFields),
     // `exactOptionalPropertyTypes` in the real repo's tsconfig forbids
     // assigning `undefined` to an optional field directly — these must be
     // omitted entirely, not set to undefined, when there's no value.

@@ -12,6 +12,7 @@ export interface RaiseAuditEventInput<Name extends AuditEventName> {
   readonly version: number;
   readonly operation: AuditOperation;
   readonly occurredAt?: string;
+  readonly idempotencyKey?: string;
   readonly actorId?: string;
   readonly chatId?: string;
   /**
@@ -67,6 +68,7 @@ export class AuditEventProcessor {
       siteVisible: definition.siteVisible,
       operation: input.operation,
       occurredAt: input.occurredAt ?? new Date().toISOString(),
+      ...(input.idempotencyKey !== undefined ? { idempotencyKey: input.idempotencyKey } : {}),
       actorId: input.actorId,
       chatId: input.chatId,
       before: maskedBefore,
