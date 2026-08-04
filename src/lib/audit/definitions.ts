@@ -13,6 +13,7 @@ import {
   messageEditedSchema,
   moderationActionSchema,
   moduleStateChangedSchema,
+  moduleStateChangedSparseSchema,
 } from './shapes.js';
 
 function defineAuditEvent<Name extends AuditEventName>(
@@ -46,7 +47,7 @@ export const AUDIT_EVENT_DEFINITIONS: AuditEventDefinitions = {
     // Only the toggled flag (+ its source) is ever observed, not the full
     // resolved module config for the chat — see
     // AuditEventDefinition.sparseSnapshotSchema.
-    sparseSnapshotSchema: moduleStateChangedSchema.partial(),
+    sparseSnapshotSchema: moduleStateChangedSparseSchema,
   }),
 
   'chat.settings.changed': defineAuditEvent('chat.settings.changed', {

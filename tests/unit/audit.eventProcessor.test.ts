@@ -45,21 +45,39 @@ describe('AuditEventProcessor.process', () => {
     ).toThrow(AuditSnapshotValidationError);
   });
 
-  it('accepts a partial snapshot for module.state.changed via its sparse schema', () => {
+  it('accepts a sparse module.state.changed snapshot when effective value and source are present', () => {
     const record = processor.process({
       name: 'module.state.changed',
       operation: 'update',
       version: 1,
       chatId: 'chat-1',
       actorId: 'admin-1',
-      // Only `enabled` was observed — no full module config is known here.
-      before: observed({ enabled: false }),
-      after: observed({ enabled: true }),
+      before: observed({ enabled: false, source: 'default' }),
+      after: observed({ enabled: true, source: 'override' }),
     });
 
-    expect(record.before).toEqual({ status: 'observed', data: { enabled: false } });
-    expect(record.after).toEqual({ status: 'observed', data: { enabled: true } });
-    expect(record.changes).toEqual({ status: 'computed', fields: { enabled: { before: false, after: true } } });
+    expect(record.before).toEqual({ status: 'observed', data: { enabled: false, source: 'default' } });
+    expect(record.after).toEqual({ status: 'observed', data: { enabled: true, source: 'override' } });
+    expect(record.changes).toEqual({
+      status: 'computed',
+      fields: {
+        enabled: { before: false, after: true },
+        source: { before: 'default', after: 'override' },
+      },
+    });
+  });
+
+  it('rejects a sparse module.state.changed snapshot without source', () => {
+    expect(() =>
+      processor.process({
+        name: 'module.state.changed',
+        operation: 'update',
+        version: 1,
+        chatId: 'chat-1',
+        before: observed({ enabled: false }),
+        after: observed({ enabled: true }),
+      }),
+    ).toThrow(AuditSnapshotValidationError);
   });
 
   it('never lets forbidden fields reach the resulting record, even if smuggled into a valid snapshot', () => {
