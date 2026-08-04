@@ -58,6 +58,7 @@ export const OPERATION_ABSENCE_RULES: Readonly<Record<AuditOperation, OperationA
 
 function deepEqual(a: unknown, b: unknown): boolean {
   if (a === b) return true;
+  if (typeof a === 'number' && typeof b === 'number' && Number.isNaN(a) && Number.isNaN(b)) return true; // NaN !== NaN in JS
   if (a === undefined || b === undefined) return false;
   if (typeof a !== 'object' || typeof b !== 'object' || a === null || b === null) return false;
   const aEntries = Object.entries(a as Record<string, unknown>);

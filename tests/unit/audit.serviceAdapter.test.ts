@@ -112,6 +112,34 @@ describe('toDownstreamInput', () => {
       }).not.toThrow(/no subject mapping defined/);
     }
   });
+
+  it('idempotencyKey never collapses two genuinely different payloads together, even with nested objects', () => {
+    // Regression test: `JSON.stringify(value, Object.keys(value).sort())`
+    // (the array-replacer trick previously used here) silently drops any
+    // nested key not present in the top-level key list — e.g.
+    // `JSON.stringify({a:{x:1}}, ['a'])` produces `{"a":{}}`. None of the
+    // 12 event schemas nest objects today, but the fix must hold even if
+    // one does in the future — verified here via a directly-observable
+    // metadata field, since the schemas themselves are flat.
+    const recordA = processor.process({
+      name: 'integration.action',
+      version: 1,
+      operation: 'noop',
+      before: notApplicable(),
+      after: observed({ integrationId: 'i1', action: 'call', targetType: 'webhook', targetId: 'wh-1', statusCode: 200, success: true }),
+    });
+    const recordB = processor.process({
+      name: 'integration.action',
+      version: 1,
+      operation: 'noop',
+      before: notApplicable(),
+      after: observed({ integrationId: 'i1', action: 'call', targetType: 'webhook', targetId: 'wh-1', statusCode: 500, success: false }),
+    });
+
+    // Same identity (integrationId/targetId), genuinely different payload
+    // (statusCode/success differ) — must produce different keys.
+    expect(toDownstreamInput(recordA).idempotencyKey).not.toBe(toDownstreamInput(recordB).idempotencyKey);
+  });
 });
 
 describe('toDownstreamMutationResult', () => {

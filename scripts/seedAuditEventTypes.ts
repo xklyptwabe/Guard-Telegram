@@ -67,16 +67,28 @@ async function main(): Promise<void> {
     // event_policies gates writes at record time (AuditService.recordEntityChange
     // throws if no enabled policy row exists) — every registered event type
     // needs one, or it can never actually be persisted.
-    await database.db
-      .insert(eventPolicies)
-      .values({
-        eventType: definition.name,
-        eventVersion,
-        required: true,
-        enabled: true,
-        updatedAt: new Date(),
-      })
-      .onConflictDoNothing({ target: [eventPolicies.eventType, eventPolicies.eventVersion] });
+    if (definition.canBeDisabled) {
+      // Operator-configurable: the row may already exist with `enabled`
+      // set to whatever an operator chose — only ensure it exists at all,
+      // never touch `enabled` on a re-run.
+      await database.db
+        .insert(eventPolicies)
+        .values({ eventType: definition.name, eventVersion, required: true, enabled: true, updatedAt: new Date() })
+        .onConflictDoNothing({ target: [eventPolicies.eventType, eventPolicies.eventVersion] });
+    } else {
+      // Not allowed to be disabled per the registry — (re-)assert
+      // enabled:true on every run, even overriding a prior manual/stale
+      // disable. `onConflictDoNothing` here would silently let a
+      // must-always-run event type stay disabled forever after a mistaken
+      // manual edit; that's exactly the enforcement this seed exists for.
+      await database.db
+        .insert(eventPolicies)
+        .values({ eventType: definition.name, eventVersion, required: true, enabled: true, updatedAt: new Date() })
+        .onConflictDoUpdate({
+          target: [eventPolicies.eventType, eventPolicies.eventVersion],
+          set: { enabled: true, updatedAt: new Date() },
+        });
+    }
 
     if (existingType[0]) updated += 1;
     else created += 1;

@@ -272,9 +272,28 @@ export function buildMetadataBridge(record: AuditRecord): Record<string, unknown
  * in the accompanying notes about reused keys silently no-op'ing genuine
  * repeat actions.
  */
-/** Deterministic JSON stringify (sorted keys) — used so idempotencyKey reflects *what* changed, not *when*. */
-function stableStringify(value: Record<string, unknown>): string {
-  return JSON.stringify(value, Object.keys(value).sort());
+/**
+ * Deterministic, recursively key-sorted JSON serialization for
+ * idempotencyKey construction. NOT the same as
+ * `JSON.stringify(value, Object.keys(value).sort())` — that array-replacer
+ * trick only whitelists/reorders keys, and it does so *uniformly at every
+ * nesting level*, which silently drops any nested key not present in the
+ * top-level list: `JSON.stringify({a:{x:1}}, ['a'])` → `{"a":{}}`, the
+ * nested `x` vanishes entirely. None of the 12 BOTS-7 event schemas
+ * currently nest objects, so that failure mode isn't live today, but it's
+ * a real landmine — two different nested payloads could silently collapse
+ * to the same idempotencyKey, causing a genuinely new event to be
+ * mistaken for a duplicate and dropped. This recurses properly instead.
+ */
+function stableStringify(value: unknown): string {
+  if (value === undefined) return 'null'; // JSON has no `undefined`; matches JSON.stringify's array-element behavior
+  if (value === null || typeof value !== 'object') return JSON.stringify(value);
+  if (Array.isArray(value)) return `[${value.map((item) => stableStringify(item)).join(',')}]`;
+  const entries = Object.keys(value as Record<string, unknown>)
+    .sort()
+    .filter((key) => (value as Record<string, unknown>)[key] !== undefined) // match JSON.stringify: omit undefined-valued object properties
+    .map((key) => `${JSON.stringify(key)}:${stableStringify((value as Record<string, unknown>)[key])}`);
+  return `{${entries.join(',')}}`;
 }
 
 export function toDownstreamInput(record: AuditRecord, registry: AuditEventRegistry = auditEventRegistry): DownstreamAuditEventInput {
