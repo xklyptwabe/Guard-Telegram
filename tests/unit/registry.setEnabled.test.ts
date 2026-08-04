@@ -1,11 +1,12 @@
 import { describe, expect, it, vi } from 'vitest';
 
 import type { TelegramBotModule } from '../../src/core/contracts.js';
-import { ModuleRegistry } from '../../src/core/registry.js';
+import { MissingModuleAuditIdempotencyKeyError, ModuleRegistry } from '../../src/core/registry.js';
 import type { AuditService } from '../../src/lib/auditService.js';
 import type { DrizzleDatabase } from '../../src/db/client.js';
 import type { EventBus } from '../../src/lib/eventBus.js';
 import type { Logger } from '../../src/lib/logger.js';
+import { runWithUpdateContext } from '../../src/lib/context.js';
 
 function fakeModule(id: string, defaultEnabled: boolean): TelegramBotModule {
   return { id, name: id, description: id, global: false, defaultEnabled };
@@ -52,6 +53,22 @@ function fakeRegistry(module: TelegramBotModule, existingEnabled: boolean | unde
   return { registry, calls, events, logger };
 }
 
+let updateCounter = 0;
+
+async function setEnabledInUpdate(
+  registry: ModuleRegistry,
+  chatId: string,
+  moduleId: string,
+  enabled: boolean,
+  actorId?: string,
+): Promise<void> {
+  updateCounter += 1;
+  await runWithUpdateContext(
+    { updateId: `test-update-${updateCounter}`, chatId, ...(actorId !== undefined ? { userId: actorId } : {}) },
+    () => registry.setEnabled(chatId, moduleId, enabled, actorId),
+  );
+}
+
 /**
  * Fake matching the real `recordEntityChange`'s behavior on a genuine
  * idempotencyKey collision: `mutate` is never invoked at all (the real
@@ -76,7 +93,7 @@ describe('ModuleRegistry.setEnabled — BOTS-7/BOTS-6 wiring', () => {
     const module = fakeModule('welcome', true);
     const { registry, calls } = fakeRegistry(module, undefined); // no row yet — inheriting the default
 
-    await registry.setEnabled('chat-1', 'welcome', false, 'user-1');
+    await setEnabledInUpdate(registry, 'chat-1', 'welcome', false, 'user-1');
 
     const call = calls[0] as { result: { before: Record<string, unknown>; after: Record<string, unknown> } };
     expect(call.result.before).toMatchObject({ enabled: true, source: 'default' });
@@ -87,7 +104,7 @@ describe('ModuleRegistry.setEnabled — BOTS-7/BOTS-6 wiring', () => {
     const module = fakeModule('welcome', true);
     const { registry, calls } = fakeRegistry(module, false); // an override row exists: enabled=false
 
-    await registry.setEnabled('chat-1', 'welcome', true, 'user-1'); // setting back to the default
+    await setEnabledInUpdate(registry, 'chat-1', 'welcome', true, 'user-1'); 
 
     const call = calls[0] as { result: { before: Record<string, unknown>; after: Record<string, unknown> } };
     expect(call.result.before).toMatchObject({ enabled: false, source: 'override' });
@@ -98,7 +115,7 @@ describe('ModuleRegistry.setEnabled — BOTS-7/BOTS-6 wiring', () => {
     const module = fakeModule('welcome', true);
     const { registry, calls } = fakeRegistry(module, undefined);
 
-    await registry.setEnabled('chat-1', 'welcome', true, 'user-1'); // already true by default — a noop
+    await setEnabledInUpdate(registry, 'chat-1', 'welcome', true, 'user-1'); 
 
     const call = calls[0] as { result: { changes: { status: string; fields: Record<string, unknown> } } };
     // Per Maxim: store the full ChangeSet, not just fields — 'computed with
@@ -111,7 +128,7 @@ describe('ModuleRegistry.setEnabled — BOTS-7/BOTS-6 wiring', () => {
     const module = fakeModule('welcome', true);
     const { registry, calls } = fakeRegistry(module, undefined);
 
-    await registry.setEnabled('chat-1', 'welcome', false, 'user-42');
+    await setEnabledInUpdate(registry, 'chat-1', 'welcome', false, 'user-42');
 
     const call = calls[0] as { input: { actorId?: string; actorType?: string } };
     expect(call.input.actorId).toBe('user-42');
@@ -122,7 +139,7 @@ describe('ModuleRegistry.setEnabled — BOTS-7/BOTS-6 wiring', () => {
     const module = fakeModule('welcome', true);
     const { registry, calls } = fakeRegistry(module, undefined);
 
-    await registry.setEnabled('chat-1', 'welcome', false);
+    await setEnabledInUpdate(registry, 'chat-1', 'welcome', false);
 
     const call = calls[0] as { input: Record<string, unknown> };
     expect('actorId' in call.input).toBe(false);
@@ -132,7 +149,7 @@ describe('ModuleRegistry.setEnabled — BOTS-7/BOTS-6 wiring', () => {
     const module = fakeModule('welcome', true);
     const { registry, calls } = fakeRegistry(module, undefined);
 
-    await registry.setEnabled('chat-1', 'welcome', false, 'user-1');
+    await setEnabledInUpdate(registry, 'chat-1', 'welcome', false, 'user-1');
 
     const call = calls[0] as { input: { metadata?: Record<string, unknown> } };
     // No metadata field at all for this entity-like event: severity/
@@ -148,7 +165,7 @@ describe('ModuleRegistry.setEnabled — BOTS-7/BOTS-6 wiring', () => {
     const module: TelegramBotModule = { ...fakeModule('welcome', true), onEnable };
     const { registry } = fakeRegistry(module, false);
 
-    await registry.setEnabled('chat-1', 'welcome', true, 'user-1');
+    await setEnabledInUpdate(registry, 'chat-1', 'welcome', true, 'user-1');
 
     expect(onEnable).toHaveBeenCalledWith('chat-1');
   });
@@ -162,7 +179,7 @@ describe('ModuleRegistry.setEnabled — BOTS-7/BOTS-6 wiring', () => {
     const module = fakeModule('welcome', true);
     const { registry, calls } = fakeRegistry(module, true); // existing override row: enabled=true
 
-    await registry.setEnabled('chat-1', 'welcome', true, 'user-1');
+    await setEnabledInUpdate(registry, 'chat-1', 'welcome', true, 'user-1');
 
     const call = calls[0] as { result: { before: Record<string, unknown>; after: Record<string, unknown>; changes: { status: string; fields: Record<string, unknown> } } };
     expect(call.result.before).toMatchObject({ enabled: true, source: 'override' });
@@ -172,14 +189,39 @@ describe('ModuleRegistry.setEnabled — BOTS-7/BOTS-6 wiring', () => {
     expect(call.result.changes.fields).toHaveProperty('source');
   });
 
-  it('includes source in the idempotency key so a real source flip does not collide with a noop', async () => {
+  it('uses the Telegram update as the module.state.changed idempotency key scope', async () => {
     const module = fakeModule('welcome', true);
     const { registry, calls } = fakeRegistry(module, true);
 
-    await registry.setEnabled('chat-1', 'welcome', true, 'user-1');
+    await runWithUpdateContext({ updateId: 'update-42', chatId: 'chat-1', userId: 'user-1' }, () =>
+      registry.setEnabled('chat-1', 'welcome', true, 'user-1'),
+    );
 
     const call = calls[0] as { input: { idempotencyKey: string } };
-    expect(call.input.idempotencyKey).toBe('module.state.changed:chat-1:welcome:true:default');
+    expect(call.input.idempotencyKey).toBe('module.state.changed:telegram-update:update-42:chat-1:welcome');
+  });
+
+  it('uses an explicit idempotency key when setEnabled is called outside a Telegram update context', async () => {
+    const module = fakeModule('welcome', true);
+    const { registry, calls } = fakeRegistry(module, true);
+
+    await registry.setEnabled('chat-1', 'welcome', true, {
+      actorId: 'user-1',
+      idempotencyKey: 'manual-operation:42',
+    });
+
+    const call = calls[0] as { input: { actorId?: string; idempotencyKey: string } };
+    expect(call.input.actorId).toBe('user-1');
+    expect(call.input.idempotencyKey).toBe('manual-operation:42');
+  });
+
+  it('rejects a non-context setEnabled call without an explicit idempotency key', async () => {
+    const module = fakeModule('welcome', true);
+    const { registry } = fakeRegistry(module, true);
+
+    await expect(registry.setEnabled('chat-1', 'welcome', true, 'user-1')).rejects.toThrow(
+      MissingModuleAuditIdempotencyKeyError,
+    );
   });
 
   it('on a genuine duplicate (idempotencyKey collision), skips onEnable/onDisable, the event bus publish, and the info log — mutate never ran, nothing actually changed', async () => {
@@ -187,7 +229,7 @@ describe('ModuleRegistry.setEnabled — BOTS-7/BOTS-6 wiring', () => {
     const module: TelegramBotModule = { ...fakeModule('welcome', true), onEnable };
     const { registry, events, logger } = fakeRegistryDuplicate(module);
 
-    await registry.setEnabled('chat-1', 'welcome', false, 'user-1');
+    await setEnabledInUpdate(registry, 'chat-1', 'welcome', false, 'user-1');
 
     // Regression test: recordEntityChange's return value used to be
     // discarded entirely, so a replayed Telegram Update (the exact case
@@ -207,7 +249,7 @@ describe('ModuleRegistry.setEnabled — BOTS-7/BOTS-6 wiring', () => {
     const module: TelegramBotModule = { ...fakeModule('welcome', true), onDisable };
     const { registry, events, logger } = fakeRegistry(module, true);
 
-    await registry.setEnabled('chat-1', 'welcome', false, 'user-1');
+    await setEnabledInUpdate(registry, 'chat-1', 'welcome', false, 'user-1');
 
     expect(onDisable).toHaveBeenCalledWith('chat-1');
     expect(events.publish).toHaveBeenCalledWith('module.state.changed', { chatId: 'chat-1', moduleId: 'welcome', enabled: false });

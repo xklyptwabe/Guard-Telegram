@@ -3,6 +3,7 @@ import { and, eq } from 'drizzle-orm';
 import type { TelegramBotModule } from './contracts.js';
 import type { DrizzleDatabase } from '../db/client.js';
 import { chatModuleStates, telegramChats } from '../db/schema/core.js';
+import { getUpdateContext } from '../lib/context.js';
 import type { AuditService } from '../lib/auditService.js';
 import type { EventBus } from '../lib/eventBus.js';
 import type { Logger } from '../lib/logger.js';
@@ -15,8 +16,26 @@ export interface ModuleState {
   readonly enabled: boolean;
 }
 
+export interface SetModuleEnabledOptions {
+  readonly actorId?: string;
+  readonly idempotencyKey?: string;
+}
+
 export function resolveModuleEnabled(defaultEnabled: boolean, override: boolean | undefined): boolean {
   return override ?? defaultEnabled;
+}
+
+export class MissingModuleAuditIdempotencyKeyError extends Error {
+  public constructor() {
+    super('ModuleRegistry.setEnabled requires an update context or explicit audit idempotency key.');
+    this.name = 'MissingModuleAuditIdempotencyKeyError';
+  }
+}
+
+function moduleStateAuditIdempotencyKey(chatId: string, moduleId: string): string {
+  const context = getUpdateContext();
+  if (!context) throw new MissingModuleAuditIdempotencyKeyError();
+  return `module.state.changed:telegram-update:${context.updateId}:${chatId}:${moduleId}`;
 }
 
 export class ModuleRegistry {
@@ -70,8 +89,16 @@ export class ModuleRegistry {
     return Promise.all(this.modules.map(async (module) => ({ id: module.id, enabled: await this.isEnabled(chatId, module.id) })));
   }
 
-  public async setEnabled(chatId: string, moduleId: string, enabled: boolean, actorId?: string): Promise<void> {
+  public async setEnabled(
+    chatId: string,
+    moduleId: string,
+    enabled: boolean,
+    actorIdOrOptions?: string | SetModuleEnabledOptions,
+  ): Promise<void> {
     const module = this.requireModule(moduleId);
+    const options = typeof actorIdOrOptions === 'string' ? { actorId: actorIdOrOptions } : actorIdOrOptions;
+    const actorId = options?.actorId;
+    const idempotencyKey = options?.idempotencyKey ?? moduleStateAuditIdempotencyKey(chatId, moduleId);
     const afterSource = enabled === module.defaultEnabled ? 'default' : 'override';
     const result = await this.audit.recordEntityChange(
       {
@@ -82,7 +109,7 @@ export class ModuleRegistry {
         eventVersion: 'v1',
         category: 'module',
         source: 'telegram.command',
-        idempotencyKey: `module.state.changed:${chatId}:${moduleId}:${enabled}:${afterSource}`,
+        idempotencyKey,
         ...(actorId !== undefined ? { actorId, actorType: 'telegram_user' } : { actorType: 'telegram_user' }),
         // No `metadata` here: severity/siteVisible/canBeDisabled are now
         // static per-event-type columns on audit.event_types (seeded from
