@@ -172,6 +172,16 @@ describe('ModuleRegistry.setEnabled — BOTS-7/BOTS-6 wiring', () => {
     expect(call.result.changes.fields).toHaveProperty('source');
   });
 
+  it('includes source in the idempotency key so a real source flip does not collide with a noop', async () => {
+    const module = fakeModule('welcome', true);
+    const { registry, calls } = fakeRegistry(module, true);
+
+    await registry.setEnabled('chat-1', 'welcome', true, 'user-1');
+
+    const call = calls[0] as { input: { idempotencyKey: string } };
+    expect(call.input.idempotencyKey).toBe('module.state.changed:chat-1:welcome:true:default');
+  });
+
   it('on a genuine duplicate (idempotencyKey collision), skips onEnable/onDisable, the event bus publish, and the info log — mutate never ran, nothing actually changed', async () => {
     const onEnable = vi.fn();
     const module: TelegramBotModule = { ...fakeModule('welcome', true), onEnable };

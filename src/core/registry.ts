@@ -72,6 +72,7 @@ export class ModuleRegistry {
 
   public async setEnabled(chatId: string, moduleId: string, enabled: boolean, actorId?: string): Promise<void> {
     const module = this.requireModule(moduleId);
+    const afterSource = enabled === module.defaultEnabled ? 'default' : 'override';
     const result = await this.audit.recordEntityChange(
       {
         tenantId: chatId,
@@ -81,7 +82,7 @@ export class ModuleRegistry {
         eventVersion: 'v1',
         category: 'module',
         source: 'telegram.command',
-        idempotencyKey: `module.state.changed:${chatId}:${moduleId}:${enabled}`,
+        idempotencyKey: `module.state.changed:${chatId}:${moduleId}:${enabled}:${afterSource}`,
         ...(actorId !== undefined ? { actorId, actorType: 'telegram_user' } : { actorType: 'telegram_user' }),
         // No `metadata` here: severity/siteVisible/canBeDisabled are now
         // static per-event-type columns on audit.event_types (seeded from
@@ -107,7 +108,6 @@ export class ModuleRegistry {
         // explicit override; its absence means the module is inheriting
         // its default. Previously not tracked anywhere at all.
         const beforeSource = current[0] ? 'override' : 'default';
-        const afterSource = enabled === module.defaultEnabled ? 'default' : 'override';
         const now = new Date();
         if (enabled === module.defaultEnabled) {
           await tx.delete(chatModuleStates).where(and(eq(chatModuleStates.chatId, chatId), eq(chatModuleStates.moduleId, moduleId)));
