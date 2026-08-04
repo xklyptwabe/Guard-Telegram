@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 
 import { AUDIT_EVENT_NAMES } from '../../src/lib/audit/eventMap.js';
 import {
+  MissingAuditChatIdError,
   MissingAuditIdempotencyKeyError,
   PLATFORM_TENANT_SENTINEL,
   buildMetadataBridge,
@@ -13,6 +14,16 @@ import { AuditEventProcessor } from '../../src/lib/audit/eventProcessor.js';
 import { notApplicable, notObserved, observed } from '../../src/lib/audit/snapshot.js';
 
 const processor = new AuditEventProcessor();
+const CHAT_SCOPED_FIXTURE_EVENTS = new Set([
+  'module.state.changed',
+  'chat.settings.changed',
+  'member.status.changed',
+  'bot.membership.changed',
+  'moderation.action',
+  'message.edited',
+  'message.deleted',
+  'command.executed',
+]);
 
 describe('toDownstreamInput', () => {
   it('uses the confirmed module.state.changed mapping: subjectType chat_module_state, subjectId chatId:moduleId', () => {
@@ -62,6 +73,33 @@ describe('toDownstreamInput', () => {
 
     expect(tenantIdFor(record)).toBe('chat-42');
     expect(toDownstreamInput(record).tenantId).toBe('chat-42');
+  });
+
+  it('uses chatId from an observed chat-scoped snapshot when record.chatId is absent', () => {
+    const record = processor.process({
+      name: 'chat.settings.changed',
+      version: 1,
+      operation: 'update',
+      before: observed({ chatId: 'chat-1', locale: 'en' }),
+      after: observed({ chatId: 'chat-1', locale: 'ru' }),
+    });
+
+    const input = toDownstreamInput(record);
+    expect(input.tenantId).toBe('chat-1');
+    expect(input.subjectType).toBe('chat_settings');
+    expect(input.subjectId).toBe('chat-1');
+  });
+
+  it('rejects a chat-scoped event when chatId is absent from both record and snapshots', () => {
+    const record = processor.process({
+      name: 'chat.settings.changed',
+      version: 1,
+      operation: 'unknown',
+      before: notApplicable(),
+      after: notApplicable(),
+    });
+
+    expect(() => toDownstreamInput(record)).toThrow(MissingAuditChatIdError);
   });
 
   it('assigns a fresh subjectId per command.executed occurrence (log-like, not entity-like)', () => {
@@ -136,6 +174,7 @@ describe('toDownstreamInput', () => {
           version: 1,
           operation: 'unknown',
           idempotencyKey: `${name}:fixture`,
+          ...(CHAT_SCOPED_FIXTURE_EVENTS.has(name) ? { chatId: 'chat-1' } : {}),
           before: notApplicable(),
           after: notApplicable(),
         });

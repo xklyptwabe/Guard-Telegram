@@ -159,6 +159,33 @@ function requireString(value: unknown, fallback: () => string): string {
   return typeof value === 'string' && value.length > 0 ? value : fallback();
 }
 
+export class MissingAuditChatIdError extends Error {
+  public constructor(eventName: string) {
+    super(`serviceAdapter: "${eventName}" requires a chatId.`);
+    this.name = 'MissingAuditChatIdError';
+  }
+}
+
+function isChatScopedEvent(eventName: AuditEventName): boolean {
+  return (
+    eventName === 'module.state.changed' ||
+    eventName === 'chat.settings.changed' ||
+    eventName === 'member.status.changed' ||
+    eventName === 'bot.membership.changed' ||
+    eventName === 'moderation.action' ||
+    eventName === 'message.edited' ||
+    eventName === 'message.deleted' ||
+    eventName === 'command.executed'
+  );
+}
+
+function chatIdFor(record: AuditRecord): string {
+  if (record.chatId !== undefined && record.chatId.length > 0) return record.chatId;
+  const observedChatId = readObservedField(record, 'chatId');
+  if (typeof observedChatId === 'string' && observedChatId.length > 0) return observedChatId;
+  throw new MissingAuditChatIdError(record.eventName);
+}
+
 /**
  * Per-event subject mapping. Only `module.state.changed` is `confirmed:
  * true` — everything else is a reasoned proposal, not a fact. Re-check the
@@ -166,7 +193,7 @@ function requireString(value: unknown, fallback: () => string): string {
  */
 function subjectMappingFor(record: AuditRecord): SubjectMapping {
   const eventName = record.eventName as AuditEventName;
-  const chatId = record.chatId ?? '';
+  const chatId = () => chatIdFor(record);
 
   switch (eventName) {
     case 'module.state.changed': {
@@ -174,30 +201,30 @@ function subjectMappingFor(record: AuditRecord): SubjectMapping {
       // commit 7e9174b: subjectType 'chat_module_state', subjectId
       // `${chatId}:${moduleId}`.
       const moduleId = requireString(readObservedField(record, 'moduleId'), () => 'unknown-module');
-      return { subjectType: 'chat_module_state', subjectId: `${chatId}:${moduleId}`, confirmed: true, sequenceFit: 'entity' };
+      return { subjectType: 'chat_module_state', subjectId: `${chatId()}:${moduleId}`, confirmed: true, sequenceFit: 'entity' };
     }
     case 'chat.settings.changed':
-      return { subjectType: 'chat_settings', subjectId: chatId, confirmed: false, sequenceFit: 'entity' };
+      return { subjectType: 'chat_settings', subjectId: chatId(), confirmed: false, sequenceFit: 'entity' };
     case 'member.status.changed': {
       const userId = requireString(readObservedField(record, 'userId'), () => 'unknown-user');
-      return { subjectType: 'chat_member', subjectId: `${chatId}:${userId}`, confirmed: false, sequenceFit: 'entity' };
+      return { subjectType: 'chat_member', subjectId: `${chatId()}:${userId}`, confirmed: false, sequenceFit: 'entity' };
     }
     case 'bot.membership.changed':
-      return { subjectType: 'bot_membership', subjectId: chatId, confirmed: false, sequenceFit: 'entity' };
+      return { subjectType: 'bot_membership', subjectId: chatId(), confirmed: false, sequenceFit: 'entity' };
     case 'moderation.action': {
       // Proposed as an entity (the target's moderation state within the
       // chat) rather than a one-off log line, so a moderation history per
       // member is queryable via subjectSequence. Confirm this framing with
       // BOTS-6 before relying on it.
       const targetUserId = requireString(readObservedField(record, 'targetUserId'), () => 'unknown-target');
-      return { subjectType: 'chat_member_moderation', subjectId: `${chatId}:${targetUserId}`, confirmed: false, sequenceFit: 'entity' };
+      return { subjectType: 'chat_member_moderation', subjectId: `${chatId()}:${targetUserId}`, confirmed: false, sequenceFit: 'entity' };
     }
     case 'message.edited':
     case 'message.deleted': {
       // Both map to the same subject (the message itself) so an edit
       // followed by a delete forms one sequence for that message.
       const messageId = requireString(readObservedField(record, 'messageId'), () => 'unknown-message');
-      return { subjectType: 'message', subjectId: `${chatId}:${messageId}`, confirmed: false, sequenceFit: 'entity' };
+      return { subjectType: 'message', subjectId: `${chatId()}:${messageId}`, confirmed: false, sequenceFit: 'entity' };
     }
     case 'audit.policy.changed': {
       // No chatId on this event at all — see TENANT GAP above. subjectId
@@ -240,7 +267,8 @@ function subjectMappingFor(record: AuditRecord): SubjectMapping {
  * `scope === 'global'` convention this assumes.
  */
 export function tenantIdFor(record: AuditRecord): string {
-  if (record.chatId !== undefined) return record.chatId;
+  const eventName = record.eventName as AuditEventName;
+  if (isChatScopedEvent(eventName)) return chatIdFor(record);
   if (record.eventName === 'audit.policy.changed') {
     const scope = readObservedField(record, 'scope');
     if (typeof scope === 'string' && scope.length > 0 && scope !== 'global') return scope;
