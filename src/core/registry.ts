@@ -111,16 +111,6 @@ export class ModuleRegistry {
         source: 'telegram.command',
         idempotencyKey,
         ...(actorId !== undefined ? { actorId, actorType: 'telegram_user' } : { actorType: 'telegram_user' }),
-        // No `metadata` here: severity/siteVisible/canBeDisabled are now
-        // static per-event-type columns on audit.event_types (seeded from
-        // the registry via scripts/seedAuditEventTypes.ts), not
-        // per-occurrence data — no need to repeat them on every row.
-        // `operation` (which Maxim does want in metadata.operation, for
-        // filtering/analytics) isn't knowable yet at this point for an
-        // entity-like event like this one — it's only computed once the
-        // row is read below, inside `mutate`, after this input object has
-        // already shipped. Per Maxim: not critical right now, revisit once
-        // `AuditMutationResult` supports returning metadata too.
       },
       async (tx) => {
         const current = await tx
@@ -180,6 +170,7 @@ export class ModuleRegistry {
           // queryable "current state" row, not something the generic
           // registry knows about, so it's merged in here rather than in
           // the adapter.
+          metadata: { operation },
           snapshotStatus: mutationResult.snapshotStatus,
           snapshotData: { ...mutationResult.snapshotData, defaultEnabled: module.defaultEnabled },
         };

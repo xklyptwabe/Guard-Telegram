@@ -155,19 +155,17 @@ describe('ModuleRegistry.setEnabled — BOTS-7/BOTS-6 wiring', () => {
     expect('actorId' in call.input).toBe(false);
   });
 
-  it('does not bridge severity/siteVisible/canBeDisabled into metadata any more — they now live on seeded audit.event_types', async () => {
+  it('returns operation metadata from mutate without static event-type metadata', async () => {
     const module = fakeModule('welcome', true);
     const { registry, calls } = fakeRegistry(module, undefined);
 
     await setEnabledInUpdate(registry, 'chat-1', 'welcome', false, 'user-1');
 
-    const call = calls[0] as { input: { metadata?: Record<string, unknown> } };
-    // No metadata field at all for this entity-like event: severity/
-    // siteVisible/canBeDisabled moved to audit.event_types (seeded via
-    // scripts/seedAuditEventTypes.ts), and `operation` isn't knowable yet
-    // at input-construction time for events wired through `mutate` — see
-    // serviceAdapter.ts's "operation" note.
-    expect(call.input.metadata).toBeUndefined();
+    const call = calls[0] as { result: { metadata?: Record<string, unknown> } };
+    expect(call.result.metadata).toEqual({ operation: 'update' });
+    expect(call.result.metadata).not.toHaveProperty('severity');
+    expect(call.result.metadata).not.toHaveProperty('siteVisible');
+    expect(call.result.metadata).not.toHaveProperty('canBeDisabled');
   });
 
   it('still performs the real DB write and fires module lifecycle hooks/events as before', async () => {

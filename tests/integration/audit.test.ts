@@ -214,4 +214,39 @@ describe.skipIf(!testDatabaseUrl)('Audit transaction integration', () => {
     expect(snapshotRows).toHaveLength(1);
     expect(snapshotRows[0]?.snapshotStatus).toBe('archived');
   });
+
+  it('merges mutation metadata into the persisted event and outbox payload', async () => {
+    await audit!.recordEntityChange(
+      {
+        tenantId: '1006',
+        subjectType: 'chat_module_state',
+        subjectId: '1006:module-admin',
+        eventType: 'module.state.changed',
+        eventVersion: 'v1',
+        category: 'module',
+        source: 'telegram.command',
+        idempotencyKey: 'audit:test:1006:module-admin:metadata',
+        metadata: { source: 'test' },
+      },
+      async (tx) => {
+        await tx.insert(telegramChats).values({ chatId: '1006', type: 'group', title: 'audit-test' });
+        await tx.insert(chatModuleStates).values({ chatId: '1006', moduleId: 'module-admin', enabled: true });
+        return {
+          before: undefined,
+          after: { enabled: true, source: 'override' },
+          metadata: { operation: 'update' },
+          snapshotData: { chatId: '1006', moduleId: 'module-admin', enabled: true },
+        };
+      },
+    );
+
+    const eventRows = await database!.db.select().from(events);
+    const outboxRows = await database!.db.select().from(outbox);
+
+    expect(eventRows[0]?.metadata).toEqual({ source: 'test', operation: 'update' });
+    expect((outboxRows[0]?.payload as { metadata?: unknown } | undefined)?.metadata).toEqual({
+      source: 'test',
+      operation: 'update',
+    });
+  });
 });

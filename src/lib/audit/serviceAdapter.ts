@@ -129,6 +129,7 @@ export interface DownstreamAuditMutationResult {
   readonly beforeSnapshotStatus: SnapshotStatus;
   readonly afterSnapshotStatus: SnapshotStatus;
   readonly changes?: Record<string, unknown>;
+  readonly metadata?: Record<string, unknown>;
   readonly snapshotStatus: 'current' | 'archived';
   readonly snapshotData: Record<string, unknown>;
 }

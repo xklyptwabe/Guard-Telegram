@@ -36,6 +36,7 @@ export interface AuditChange<TSnapshot extends Record<string, unknown>> {
   readonly beforeSnapshotStatus?: AuditSnapshotStatus;
   readonly afterSnapshotStatus?: AuditSnapshotStatus;
   readonly changes?: Record<string, unknown>;
+  readonly metadata?: Record<string, unknown>;
   readonly snapshotStatus?: AuditEntitySnapshotStatus;
   readonly snapshotData: TSnapshot;
 }
@@ -102,6 +103,7 @@ export class AuditService {
       const nextSubjectSequence = snapshotRow.lastSubjectSequence + 1;
       const mutation = await mutate(tx, nextSubjectSequence);
       const normalizedMutation = normalizeAuditMutationForPersistence(input, mutation, auditDefinition);
+      const metadata = mergeAuditMetadata(input.metadata, mutation.metadata);
       const telegramContext = input.telegramContext ?? buildTelegramContext(context);
       const [eventRow] = await tx
         .insert(events)
@@ -125,7 +127,7 @@ export class AuditService {
           beforeSnapshotStatus: normalizedMutation.beforeSnapshotStatus,
           afterSnapshotStatus: normalizedMutation.afterSnapshotStatus,
           changes: normalizedMutation.changes,
-          metadata: input.metadata,
+          metadata,
         })
         .returning({ id: events.id, subjectSequence: events.subjectSequence });
 
@@ -148,7 +150,7 @@ export class AuditService {
           beforeSnapshotStatus: normalizedMutation.beforeSnapshotStatus,
           afterSnapshotStatus: normalizedMutation.afterSnapshotStatus,
           changes: normalizedMutation.changes,
-          metadata: input.metadata,
+          metadata,
         },
       });
 
@@ -176,4 +178,13 @@ function buildTelegramContext(context: ReturnType<typeof getUpdateContext>): Rec
     ...(context.chatId ? { chatId: context.chatId } : {}),
     ...(context.userId ? { userId: context.userId } : {}),
   };
+}
+
+function mergeAuditMetadata(
+  inputMetadata: Record<string, unknown> | undefined,
+  mutationMetadata: Record<string, unknown> | undefined,
+): Record<string, unknown> | undefined {
+  if (inputMetadata === undefined) return mutationMetadata;
+  if (mutationMetadata === undefined) return inputMetadata;
+  return { ...inputMetadata, ...mutationMetadata };
 }
