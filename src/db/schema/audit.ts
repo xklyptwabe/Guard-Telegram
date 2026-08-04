@@ -1,4 +1,4 @@
-import { bigint, boolean, index, integer, pgSchema, primaryKey, text, timestamp, uuid, jsonb } from 'drizzle-orm/pg-core';
+import { bigint, boolean, foreignKey, index, integer, pgSchema, primaryKey, text, timestamp, uuid, jsonb } from 'drizzle-orm/pg-core';
 import { sql } from 'drizzle-orm';
 
 const createdAt = () => timestamp('created_at', { withTimezone: true }).defaultNow().notNull();
@@ -42,7 +42,16 @@ export const eventPolicies = auditSchema.table(
     createdAt: createdAt(),
     updatedAt: updatedAt(),
   },
-  (table) => [primaryKey({ columns: [table.eventType, table.eventVersion] })],
+  (table) => [
+    primaryKey({ columns: [table.eventType, table.eventVersion] }),
+    foreignKey({
+      name: 'event_policies_event_type_version_event_types_fk',
+      columns: [table.eventType, table.eventVersion],
+      foreignColumns: [eventTypes.eventType, eventTypes.eventVersion],
+    })
+      .onUpdate('cascade')
+      .onDelete('restrict'),
+  ],
 );
 
 export const events = auditSchema.table(
