@@ -10,6 +10,8 @@ export interface AuditIdentity {
   readonly subjectId: string;
 }
 
+export type AuditSnapshotStatus = 'observed' | 'not_observed' | 'redacted' | 'unknown' | 'not_applicable';
+
 export interface AuditEventInput extends AuditIdentity {
   readonly eventType: string;
   readonly eventVersion: string;
@@ -25,7 +27,9 @@ export interface AuditEventInput extends AuditIdentity {
 
 export interface AuditChange<TSnapshot extends Record<string, unknown>> {
   readonly before: Record<string, unknown> | undefined;
-  readonly after: Record<string, unknown>;
+  readonly after: Record<string, unknown> | undefined;
+  readonly beforeSnapshotStatus?: AuditSnapshotStatus;
+  readonly afterSnapshotStatus?: AuditSnapshotStatus;
   readonly changes?: Record<string, unknown>;
   readonly snapshotData: TSnapshot;
 }
@@ -90,6 +94,8 @@ export class AuditService {
 
       const nextSubjectSequence = snapshotRow.lastSubjectSequence + 1;
       const mutation = await mutate(tx, nextSubjectSequence);
+      const beforeSnapshotStatus = mutation.beforeSnapshotStatus ?? (mutation.before === undefined ? 'not_observed' : 'observed');
+      const afterSnapshotStatus = mutation.afterSnapshotStatus ?? (mutation.after === undefined ? 'not_observed' : 'observed');
       const telegramContext = input.telegramContext ?? buildTelegramContext(context);
       const [eventRow] = await tx
         .insert(events)
@@ -110,6 +116,8 @@ export class AuditService {
           idempotencyKey: input.idempotencyKey,
           before: mutation.before,
           after: mutation.after,
+          beforeSnapshotStatus,
+          afterSnapshotStatus,
           changes: mutation.changes,
           metadata: input.metadata,
         })
@@ -131,6 +139,8 @@ export class AuditService {
           subjectSequence: eventRow.subjectSequence,
           before: mutation.before,
           after: mutation.after,
+          beforeSnapshotStatus,
+          afterSnapshotStatus,
           changes: mutation.changes,
           metadata: input.metadata,
         },

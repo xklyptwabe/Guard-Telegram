@@ -67,6 +67,16 @@ export const events = auditSchema.table(
     idempotencyKey: text('idempotency_key').notNull().unique(),
     before: jsonb('before'),
     after: jsonb('after'),
+    beforeSnapshotStatus: text('before_snapshot_status', {
+      enum: ['observed', 'not_observed', 'redacted', 'unknown', 'not_applicable'],
+    })
+      .notNull()
+      .default('not_observed'),
+    afterSnapshotStatus: text('after_snapshot_status', {
+      enum: ['observed', 'not_observed', 'redacted', 'unknown', 'not_applicable'],
+    })
+      .notNull()
+      .default('observed'),
     changes: jsonb('changes'),
     metadata: jsonb('metadata'),
   },

@@ -72,6 +72,8 @@ describe.skipIf(!testDatabaseUrl)('Audit transaction integration', () => {
 
     expect(stateRows).toHaveLength(1);
     expect(eventRows).toHaveLength(1);
+    expect(eventRows[0]?.beforeSnapshotStatus).toBe('not_observed');
+    expect(eventRows[0]?.afterSnapshotStatus).toBe('observed');
     expect(snapshotRows).toHaveLength(1);
     expect(outboxRows).toHaveLength(1);
   });

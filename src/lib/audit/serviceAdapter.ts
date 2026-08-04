@@ -1,5 +1,6 @@
 import { randomUUID } from 'node:crypto';
 
+import type { SnapshotStatus } from './enums.js';
 import type { AuditEventName } from './eventMap.js';
 import { auditEventRegistry, type AuditEventRegistry } from './registry.js';
 import type { AuditRecord } from './types.js';
@@ -126,8 +127,9 @@ export interface DownstreamAuditEventInput extends DownstreamAuditIdentity {
 /** Mirror of the `mutate` callback's return shape (`AuditMutationResult`) in BOTS-6. */
 export interface DownstreamAuditMutationResult {
   readonly before: Record<string, unknown> | undefined;
-  /** Required downstream — cannot be omitted, unlike BOTS-7's `not_applicable`. */
-  readonly after: Record<string, unknown>;
+  readonly after: Record<string, unknown> | undefined;
+  readonly beforeSnapshotStatus: SnapshotStatus;
+  readonly afterSnapshotStatus: SnapshotStatus;
   readonly changes?: Record<string, unknown>;
   readonly snapshotData: Record<string, unknown>;
 }
@@ -327,24 +329,6 @@ export function toDownstreamInput(record: AuditRecord, registry: AuditEventRegis
   };
 }
 
-/** Marker written into `after` in place of an omitted BOTS-7 snapshot — see toDownstreamMutationResult. */
-export const DOWNSTREAM_TOMBSTONE = { __bots7Tombstone: true } as const;
-
-/**
- * Thrown when a record's `after` snapshot is `not_observed` / `redacted` /
- * `unknown` — i.e. genuinely missing data, as opposed to `not_applicable`
- * (a legitimate, structural absence, e.g. after a hard delete). BOTS-6
- * requires `after` to always be a concrete object; inventing one for a real
- * data gap would violate BOTS-7's own "never fabricate" rule, so this
- * fails loudly instead.
- */
-export class UnresolvableAfterSnapshotError extends Error {
-  public constructor(eventName: string, status: string) {
-    super(`serviceAdapter: cannot translate "${eventName}" — after snapshot status is "${status}", not observed/not_applicable.`);
-    this.name = 'UnresolvableAfterSnapshotError';
-  }
-}
-
 /**
  * Converts BOTS-7's `before`/`after`/`changes` into the shape a
  * `recordEntityChange` `mutate` callback must return.
@@ -356,28 +340,19 @@ export class UnresolvableAfterSnapshotError extends Error {
  */
 export function toDownstreamMutationResult(record: AuditRecord): DownstreamAuditMutationResult {
   const before = record.before.status === 'observed' ? record.before.data : undefined;
-
-  let after: Record<string, unknown>;
-  if (record.after.status === 'observed') {
-    after = record.after.data;
-  } else if (record.after.status === 'not_applicable') {
-    // Legitimate structural absence (e.g. after a hard delete) — BOTS-6
-    // requires a concrete object, so we write an explicit, greppable
-    // tombstone rather than fabricating plausible-looking data.
-    after = DOWNSTREAM_TOMBSTONE;
-  } else {
-    throw new UnresolvableAfterSnapshotError(record.eventName, record.after.status);
-  }
+  const after = record.after.status === 'observed' ? record.after.data : undefined;
 
   return {
     before,
     after,
+    beforeSnapshotStatus: record.before.status,
+    afterSnapshotStatus: record.after.status,
     // Per Maxim: store the *full* ChangeSet (status + fields, or status +
     // reason when unavailable) — not just a flattened fields object. The
     // previous version dropped the 'unavailable'/reason case entirely,
     // which quietly lost exactly the kind of "we don't know" signal
     // BOTS-7's whole snapshot-status design exists to preserve.
     changes: record.changes,
-    snapshotData: after,
+    snapshotData: after ?? before ?? {},
   };
 }

@@ -2,9 +2,7 @@ import { describe, expect, it } from 'vitest';
 
 import { AUDIT_EVENT_NAMES } from '../../src/lib/audit/eventMap.js';
 import {
-  DOWNSTREAM_TOMBSTONE,
   PLATFORM_TENANT_SENTINEL,
-  UnresolvableAfterSnapshotError,
   buildMetadataBridge,
   tenantIdFor,
   toDownstreamInput,
@@ -162,7 +160,7 @@ describe('toDownstreamMutationResult', () => {
     expect(result.changes).toEqual({ status: 'computed', fields: { locale: { before: 'en', after: 'ru' } } });
   });
 
-  it('writes an explicit tombstone (not a fabricated object) when after is not_applicable — e.g. a hard delete', () => {
+  it('preserves not_applicable after as a status without fabricating JSON', () => {
     const record = processor.process({
       name: 'chat.settings.changed',
       version: 1,
@@ -173,11 +171,12 @@ describe('toDownstreamMutationResult', () => {
     });
 
     const result = toDownstreamMutationResult(record);
-    expect(result.after).toEqual(DOWNSTREAM_TOMBSTONE);
-    expect(result.snapshotData).toEqual(DOWNSTREAM_TOMBSTONE);
+    expect(result.after).toBeUndefined();
+    expect(result.afterSnapshotStatus).toBe('not_applicable');
+    expect(result.snapshotData).toEqual({ chatId: 'chat-1', locale: 'en' });
   });
 
-  it('fails loudly rather than fabricating data when after is a genuine gap (not_observed)', () => {
+  it('preserves a genuine after gap as a status without fabricating JSON', () => {
     const record = processor.process({
       name: 'chat.settings.changed',
       version: 1,
@@ -187,7 +186,10 @@ describe('toDownstreamMutationResult', () => {
       after: notObserved(),
     });
 
-    expect(() => toDownstreamMutationResult(record)).toThrow(UnresolvableAfterSnapshotError);
+    const result = toDownstreamMutationResult(record);
+    expect(result.after).toBeUndefined();
+    expect(result.afterSnapshotStatus).toBe('not_observed');
+    expect(result.snapshotData).toEqual({ chatId: 'chat-1', locale: 'en' });
   });
 
   it('reports a computed-but-empty ChangeSet (not omitted) when nothing actually changed', () => {
