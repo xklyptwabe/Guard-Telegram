@@ -56,7 +56,7 @@ describe.skipIf(!testDatabaseUrl)('Audit transaction integration', () => {
           .values({ chatId: '1001', moduleId: 'module-admin', enabled: true });
         return {
           before: undefined,
-          after: { enabled: true },
+          after: { enabled: true, source: 'override' },
           changes: { enabled: { after: true } },
           snapshotData: { chatId: '1001', moduleId: 'module-admin', enabled: true },
         };
@@ -95,7 +95,7 @@ describe.skipIf(!testDatabaseUrl)('Audit transaction integration', () => {
       await tx.insert(chatModuleStates).values({ chatId: '1002', moduleId: 'module-admin', enabled: true });
       return {
         before: undefined,
-        after: { enabled: true },
+        after: { enabled: true, source: 'override' },
         snapshotData: { chatId: '1002', moduleId: 'module-admin', enabled: true },
       };
     });
@@ -163,7 +163,7 @@ describe.skipIf(!testDatabaseUrl)('Audit transaction integration', () => {
           await tx.insert(chatModuleStates).values({ chatId: '1004', moduleId: 'module-admin', enabled: true });
           return {
             before: undefined,
-            after: { enabled: true },
+            after: { enabled: true, source: 'override' },
             snapshotData: { chatId: '1004', moduleId: 'module-admin', enabled: true },
           };
         }),
