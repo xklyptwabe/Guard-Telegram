@@ -4,6 +4,7 @@ import { AUDIT_EVENT_NAMES } from '../../src/lib/audit/eventMap.js';
 import {
   MissingAuditChatIdError,
   MissingAuditIdempotencyKeyError,
+  MissingAuditSubjectIdentityError,
   PLATFORM_TENANT_SENTINEL,
   buildMetadataBridge,
   tenantIdFor,
@@ -102,7 +103,7 @@ describe('toDownstreamInput', () => {
     expect(() => toDownstreamInput(record)).toThrow(MissingAuditChatIdError);
   });
 
-  it('assigns a fresh subjectId per command.executed occurrence (log-like, not entity-like)', () => {
+  it('uses explicit idempotencyKey as the command.executed occurrence subjectId', () => {
     const base = {
       name: 'command.executed' as const,
       version: 1 as const,
@@ -115,10 +116,12 @@ describe('toDownstreamInput', () => {
 
     const firstInput = toDownstreamInput(first);
     const secondInput = toDownstreamInput(second);
+    expect(firstInput.subjectId).toBe('command:1');
+    expect(secondInput.subjectId).toBe('command:2');
     expect(firstInput.subjectId).not.toBe(secondInput.subjectId);
   });
 
-  it('uses an explicit idempotencyKey for command.executed instead of the random subjectId', () => {
+  it('uses the same subjectId and idempotencyKey for a replayed command.executed occurrence', () => {
     const base = {
       name: 'command.executed' as const,
       version: 1 as const,
@@ -131,7 +134,8 @@ describe('toDownstreamInput', () => {
     const firstInput = toDownstreamInput(processor.process(base));
     const replayInput = toDownstreamInput(processor.process(base));
 
-    expect(firstInput.subjectId).not.toBe(replayInput.subjectId);
+    expect(firstInput.subjectId).toBe('telegram-update:123:command:ban');
+    expect(replayInput.subjectId).toBe(firstInput.subjectId);
     expect(firstInput.idempotencyKey).toBe('telegram-update:123:command:ban');
     expect(replayInput.idempotencyKey).toBe(firstInput.idempotencyKey);
   });
@@ -147,6 +151,19 @@ describe('toDownstreamInput', () => {
     });
 
     expect(() => toDownstreamInput(record)).toThrow(MissingAuditIdempotencyKeyError);
+  });
+
+  it('rejects a subject mapping when the required observed identity field is absent', () => {
+    const record = processor.process({
+      name: 'member.status.changed',
+      version: 1,
+      operation: 'unknown',
+      chatId: 'chat-1',
+      before: notApplicable(),
+      after: notApplicable(),
+    });
+
+    expect(() => toDownstreamInput(record)).toThrow(MissingAuditSubjectIdentityError);
   });
 
   it('bridges only `operation` into metadata — severity/siteVisible/canBeDisabled now live on seeded audit.event_types, not metadata', () => {
@@ -176,7 +193,7 @@ describe('toDownstreamInput', () => {
           idempotencyKey: `${name}:fixture`,
           ...(CHAT_SCOPED_FIXTURE_EVENTS.has(name) ? { chatId: 'chat-1' } : {}),
           before: notApplicable(),
-          after: notApplicable(),
+          after: observed(fixtureAfterFor(name)),
         });
         toDownstreamInput(record);
       }).not.toThrow(/no subject mapping defined/);
@@ -211,6 +228,35 @@ describe('toDownstreamInput', () => {
     expect(toDownstreamInput(recordA).idempotencyKey).not.toBe(toDownstreamInput(recordB).idempotencyKey);
   });
 });
+
+function fixtureAfterFor(name: (typeof AUDIT_EVENT_NAMES)[number]): Record<string, unknown> {
+  switch (name) {
+    case 'module.state.changed':
+      return { chatId: 'chat-1', moduleId: 'welcome', enabled: true, source: 'override' };
+    case 'chat.settings.changed':
+      return { chatId: 'chat-1', locale: 'ru' };
+    case 'audit.policy.changed':
+      return { policyId: 'policy-1', scope: 'global', textLoggingEnabled: false, retentionDays: 90 };
+    case 'member.status.changed':
+      return { chatId: 'chat-1', userId: 'user-1', status: 'member' };
+    case 'bot.membership.changed':
+      return { chatId: 'chat-1', status: 'member' };
+    case 'moderation.action':
+      return { chatId: 'chat-1', targetUserId: 'user-1', actorUserId: 'admin-1', action: 'warn' };
+    case 'message.edited':
+      return { chatId: 'chat-1', messageId: 'message-1', userId: 'user-1', editedAt: '2026-08-04T00:00:00.000Z', textLength: 0 };
+    case 'message.deleted':
+      return { chatId: 'chat-1', messageId: 'message-1', userId: 'user-1' };
+    case 'command.executed':
+      return { chatId: 'chat-1', userId: 'user-1', moduleId: 'module-admin', commandId: 'modules.enable', argsRedacted: true, durationMs: 1, success: true };
+    case 'integration.action':
+      return { integrationId: 'integration-1', action: 'sync', targetType: 'webhook', targetId: 'target-1', success: true };
+    case 'audit.exported':
+      return { exportId: 'export-1', requestedBy: 'admin-1', format: 'json', rangeFrom: '2026-08-01T00:00:00.000Z', rangeTo: '2026-08-04T00:00:00.000Z', rowCount: 1 };
+    case 'audit.retention.completed':
+      return { jobId: 'job-1', deletedCount: 1, retentionDays: 90, startedAt: '2026-08-04T00:00:00.000Z', finishedAt: '2026-08-04T00:01:00.000Z' };
+  }
+}
 
 describe('toDownstreamMutationResult', () => {
   it('passes an observed after straight through, with the full ChangeSet (not flattened) as changes', () => {

@@ -1,5 +1,3 @@
-import { randomUUID } from 'node:crypto';
-
 import type { SnapshotStatus } from './enums.js';
 import type { AuditEventName } from './eventMap.js';
 import { auditEventRegistry, type AuditEventRegistry } from './registry.js';
@@ -155,15 +153,31 @@ function readObservedField(record: AuditRecord, key: string): unknown {
   return undefined;
 }
 
-function requireString(value: unknown, fallback: () => string): string {
-  return typeof value === 'string' && value.length > 0 ? value : fallback();
-}
-
 export class MissingAuditChatIdError extends Error {
   public constructor(eventName: string) {
     super(`serviceAdapter: "${eventName}" requires a chatId.`);
     this.name = 'MissingAuditChatIdError';
   }
+}
+
+export class MissingAuditSubjectIdentityError extends Error {
+  public constructor(eventName: string, fieldName: string) {
+    super(`serviceAdapter: "${eventName}" requires observed subject identity field "${fieldName}".`);
+    this.name = 'MissingAuditSubjectIdentityError';
+  }
+}
+
+export class MissingAuditIdempotencyKeyError extends Error {
+  public constructor(eventName: string) {
+    super(`serviceAdapter: "${eventName}" requires an explicit idempotencyKey.`);
+    this.name = 'MissingAuditIdempotencyKeyError';
+  }
+}
+
+function requireObservedString(record: AuditRecord, fieldName: string): string {
+  const value = readObservedField(record, fieldName);
+  if (typeof value === 'string' && value.length > 0) return value;
+  throw new MissingAuditSubjectIdentityError(record.eventName, fieldName);
 }
 
 function isChatScopedEvent(eventName: AuditEventName): boolean {
@@ -200,13 +214,13 @@ function subjectMappingFor(record: AuditRecord): SubjectMapping {
       // CONFIRMED — copied from ModuleRegistry.setEnabled() in BOTS-6
       // commit 7e9174b: subjectType 'chat_module_state', subjectId
       // `${chatId}:${moduleId}`.
-      const moduleId = requireString(readObservedField(record, 'moduleId'), () => 'unknown-module');
+      const moduleId = requireObservedString(record, 'moduleId');
       return { subjectType: 'chat_module_state', subjectId: `${chatId()}:${moduleId}`, confirmed: true, sequenceFit: 'entity' };
     }
     case 'chat.settings.changed':
       return { subjectType: 'chat_settings', subjectId: chatId(), confirmed: false, sequenceFit: 'entity' };
     case 'member.status.changed': {
-      const userId = requireString(readObservedField(record, 'userId'), () => 'unknown-user');
+      const userId = requireObservedString(record, 'userId');
       return { subjectType: 'chat_member', subjectId: `${chatId()}:${userId}`, confirmed: false, sequenceFit: 'entity' };
     }
     case 'bot.membership.changed':
@@ -216,38 +230,40 @@ function subjectMappingFor(record: AuditRecord): SubjectMapping {
       // chat) rather than a one-off log line, so a moderation history per
       // member is queryable via subjectSequence. Confirm this framing with
       // BOTS-6 before relying on it.
-      const targetUserId = requireString(readObservedField(record, 'targetUserId'), () => 'unknown-target');
+      const targetUserId = requireObservedString(record, 'targetUserId');
       return { subjectType: 'chat_member_moderation', subjectId: `${chatId()}:${targetUserId}`, confirmed: false, sequenceFit: 'entity' };
     }
     case 'message.edited':
     case 'message.deleted': {
       // Both map to the same subject (the message itself) so an edit
       // followed by a delete forms one sequence for that message.
-      const messageId = requireString(readObservedField(record, 'messageId'), () => 'unknown-message');
+      const messageId = requireObservedString(record, 'messageId');
       return { subjectType: 'message', subjectId: `${chatId()}:${messageId}`, confirmed: false, sequenceFit: 'entity' };
     }
     case 'audit.policy.changed': {
       // No chatId on this event at all — see TENANT GAP above. subjectId
       // uses policyId since that's the actual entity being changed.
-      const policyId = requireString(readObservedField(record, 'policyId'), () => 'unknown-policy');
+      const policyId = requireObservedString(record, 'policyId');
       return { subjectType: 'audit_policy', subjectId: policyId, confirmed: false, sequenceFit: 'entity' };
     }
-    case 'command.executed':
+    case 'command.executed': {
       // Log-like: every invocation is independent, there is no ongoing
-      // "command" entity to sequence. Fresh id per event on purpose, so
-      // unrelated invocations are never falsely chained together.
-      return { subjectType: 'command_execution', subjectId: randomUUID(), confirmed: false, sequenceFit: 'log-like' };
+      if (record.idempotencyKey === undefined || record.idempotencyKey.length === 0) {
+        throw new MissingAuditIdempotencyKeyError(record.eventName);
+      }
+      return { subjectType: 'command_execution', subjectId: record.idempotencyKey, confirmed: false, sequenceFit: 'log-like' };
+    }
     case 'integration.action': {
-      const targetType = requireString(readObservedField(record, 'targetType'), () => 'unknown');
-      const targetId = requireString(readObservedField(record, 'targetId'), () => randomUUID());
+      const targetType = requireObservedString(record, 'targetType');
+      const targetId = requireObservedString(record, 'targetId');
       return { subjectType: `integration_${targetType}`, subjectId: targetId, confirmed: false, sequenceFit: 'log-like' };
     }
     case 'audit.exported': {
-      const exportId = requireString(readObservedField(record, 'exportId'), () => randomUUID());
+      const exportId = requireObservedString(record, 'exportId');
       return { subjectType: 'audit_export', subjectId: exportId, confirmed: false, sequenceFit: 'log-like' };
     }
     case 'audit.retention.completed': {
-      const jobId = requireString(readObservedField(record, 'jobId'), () => randomUUID());
+      const jobId = requireObservedString(record, 'jobId');
       return { subjectType: 'audit_retention_job', subjectId: jobId, confirmed: false, sequenceFit: 'log-like' };
     }
     default: {
@@ -326,16 +342,8 @@ function stableStringify(value: unknown): string {
   return `{${entries.join(',')}}`;
 }
 
-export class MissingAuditIdempotencyKeyError extends Error {
-  public constructor(eventName: string) {
-    super(`serviceAdapter: "${eventName}" requires an explicit idempotencyKey.`);
-    this.name = 'MissingAuditIdempotencyKeyError';
-  }
-}
-
 function idempotencyKeyFor(record: AuditRecord, subject: SubjectMapping, afterFields: Record<string, unknown>): string {
   if (record.idempotencyKey !== undefined && record.idempotencyKey.length > 0) return record.idempotencyKey;
-  if (record.eventName === 'command.executed') throw new MissingAuditIdempotencyKeyError(record.eventName);
   return `${record.eventName}:${subject.subjectId}:${stableStringify(afterFields)}`;
 }
 
