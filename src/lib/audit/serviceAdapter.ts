@@ -129,6 +129,7 @@ export interface DownstreamAuditMutationResult {
   readonly beforeSnapshotStatus: SnapshotStatus;
   readonly afterSnapshotStatus: SnapshotStatus;
   readonly changes?: Record<string, unknown>;
+  readonly snapshotStatus: 'current' | 'archived';
   readonly snapshotData: Record<string, unknown>;
 }
 
@@ -171,6 +172,13 @@ export class MissingAuditIdempotencyKeyError extends Error {
   public constructor(eventName: string) {
     super(`serviceAdapter: "${eventName}" requires an explicit idempotencyKey.`);
     this.name = 'MissingAuditIdempotencyKeyError';
+  }
+}
+
+export class MissingAuditSnapshotDataError extends Error {
+  public constructor(eventName: string, afterStatus: SnapshotStatus) {
+    super(`serviceAdapter: "${eventName}" cannot build entity snapshot data from after status "${afterStatus}".`);
+    this.name = 'MissingAuditSnapshotDataError';
   }
 }
 
@@ -384,6 +392,7 @@ export function toDownstreamInput(record: AuditRecord, registry: AuditEventRegis
 export function toDownstreamMutationResult(record: AuditRecord): DownstreamAuditMutationResult {
   const before = record.before.status === 'observed' ? record.before.data : undefined;
   const after = record.after.status === 'observed' ? record.after.data : undefined;
+  const entitySnapshot = entitySnapshotFor(record, before, after);
 
   return {
     before,
@@ -396,6 +405,17 @@ export function toDownstreamMutationResult(record: AuditRecord): DownstreamAudit
     // which quietly lost exactly the kind of "we don't know" signal
     // BOTS-7's whole snapshot-status design exists to preserve.
     changes: record.changes,
-    snapshotData: after ?? before ?? {},
+    snapshotStatus: entitySnapshot.status,
+    snapshotData: entitySnapshot.data,
   };
+}
+
+function entitySnapshotFor(
+  record: AuditRecord,
+  before: Record<string, unknown> | undefined,
+  after: Record<string, unknown> | undefined,
+): { readonly status: 'current' | 'archived'; readonly data: Record<string, unknown> } {
+  if (after !== undefined) return { status: 'current', data: after };
+  if (record.after.status === 'not_applicable' && before !== undefined) return { status: 'archived', data: before };
+  throw new MissingAuditSnapshotDataError(record.eventName, record.after.status);
 }

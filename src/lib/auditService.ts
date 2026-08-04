@@ -14,6 +14,7 @@ export interface AuditIdentity {
 }
 
 export type AuditSnapshotStatus = SnapshotStatus;
+export type AuditEntitySnapshotStatus = 'current' | 'archived';
 
 export interface AuditEventInput extends AuditIdentity {
   readonly eventType: string;
@@ -35,6 +36,7 @@ export interface AuditChange<TSnapshot extends Record<string, unknown>> {
   readonly beforeSnapshotStatus?: AuditSnapshotStatus;
   readonly afterSnapshotStatus?: AuditSnapshotStatus;
   readonly changes?: Record<string, unknown>;
+  readonly snapshotStatus?: AuditEntitySnapshotStatus;
   readonly snapshotData: TSnapshot;
 }
 
@@ -153,7 +155,7 @@ export class AuditService {
       await tx
         .update(entitySnapshots)
         .set({
-          snapshotStatus: 'current',
+          snapshotStatus: mutation.snapshotStatus ?? 'current',
           snapshotData: mutation.snapshotData,
           lastSubjectSequence: nextSubjectSequence,
           lastEventId: eventRow.id,

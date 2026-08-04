@@ -4,6 +4,7 @@ import { AUDIT_EVENT_NAMES } from '../../src/lib/audit/eventMap.js';
 import {
   MissingAuditChatIdError,
   MissingAuditIdempotencyKeyError,
+  MissingAuditSnapshotDataError,
   MissingAuditSubjectIdentityError,
   PLATFORM_TENANT_SENTINEL,
   buildMetadataBridge,
@@ -291,10 +292,11 @@ describe('toDownstreamMutationResult', () => {
     const result = toDownstreamMutationResult(record);
     expect(result.after).toBeUndefined();
     expect(result.afterSnapshotStatus).toBe('not_applicable');
+    expect(result.snapshotStatus).toBe('archived');
     expect(result.snapshotData).toEqual({ chatId: 'chat-1', locale: 'en' });
   });
 
-  it('preserves a genuine after gap as a status without fabricating JSON', () => {
+  it('rejects a genuine after gap instead of fabricating current snapshotData from before', () => {
     const record = processor.process({
       name: 'chat.settings.changed',
       version: 1,
@@ -304,10 +306,7 @@ describe('toDownstreamMutationResult', () => {
       after: notObserved(),
     });
 
-    const result = toDownstreamMutationResult(record);
-    expect(result.after).toBeUndefined();
-    expect(result.afterSnapshotStatus).toBe('not_observed');
-    expect(result.snapshotData).toEqual({ chatId: 'chat-1', locale: 'en' });
+    expect(() => toDownstreamMutationResult(record)).toThrow(MissingAuditSnapshotDataError);
   });
 
   it('reports a computed-but-empty ChangeSet (not omitted) when nothing actually changed', () => {

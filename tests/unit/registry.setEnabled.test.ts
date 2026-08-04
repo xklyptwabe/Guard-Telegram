@@ -124,6 +124,16 @@ describe('ModuleRegistry.setEnabled — BOTS-7/BOTS-6 wiring', () => {
     expect(call.result.changes).toEqual({ status: 'computed', fields: {} });
   });
 
+  it('returns a current entity snapshot status for observed module state after snapshots', async () => {
+    const module = fakeModule('welcome', true);
+    const { registry, calls } = fakeRegistry(module, undefined);
+
+    await setEnabledInUpdate(registry, 'chat-1', 'welcome', false, 'user-1');
+
+    const call = calls[0] as { result: { snapshotStatus?: string } };
+    expect(call.result.snapshotStatus).toBe('current');
+  });
+
   it('passes actorId through to the AuditEventInput when the caller provides one', async () => {
     const module = fakeModule('welcome', true);
     const { registry, calls } = fakeRegistry(module, undefined);

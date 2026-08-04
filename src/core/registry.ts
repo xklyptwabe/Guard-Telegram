@@ -180,6 +180,7 @@ export class ModuleRegistry {
           // queryable "current state" row, not something the generic
           // registry knows about, so it's merged in here rather than in
           // the adapter.
+          snapshotStatus: mutationResult.snapshotStatus,
           snapshotData: { ...mutationResult.snapshotData, defaultEnabled: module.defaultEnabled },
         };
       },

@@ -182,4 +182,36 @@ describe.skipIf(!testDatabaseUrl)('Audit transaction integration', () => {
       await database!.db.update(eventPolicies).set({ enabled: true }).where(and(eq(eventPolicies.eventType, 'module.state.changed'), eq(eventPolicies.eventVersion, 'v1')));
     }
   });
+
+  it('persists the entity snapshot status returned by the audit mutation', async () => {
+    const first = await audit!.recordEntityChange(
+      {
+        tenantId: '1005',
+        subjectType: 'chat_settings',
+        subjectId: '1005',
+        eventType: 'chat.settings.changed',
+        eventVersion: 'v1',
+        category: 'chat',
+        source: 'telegram.command',
+        idempotencyKey: 'audit:test:1005:chat-settings:delete',
+      },
+      async (tx) => {
+        await tx.insert(telegramChats).values({ chatId: '1005', type: 'group', title: 'audit-test' });
+        return {
+          before: { chatId: '1005', locale: 'ru' },
+          after: undefined,
+          afterSnapshotStatus: 'not_applicable',
+          changes: { status: 'computed', fields: { locale: { before: 'ru', after: undefined } } },
+          snapshotStatus: 'archived',
+          snapshotData: { chatId: '1005', locale: 'ru' },
+        };
+      },
+    );
+
+    expect(first.duplicate).toBe(false);
+
+    const snapshotRows = await database!.db.select().from(entitySnapshots);
+    expect(snapshotRows).toHaveLength(1);
+    expect(snapshotRows[0]?.snapshotStatus).toBe('archived');
+  });
 });
