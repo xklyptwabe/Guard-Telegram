@@ -36,6 +36,13 @@
       "when": 1785851000000,
       "tag": "0004_seed_audit_event_registry",
       "breakpoints": true
+    },
+    {
+      "idx": 5,
+      "version": "7",
+      "when": 1785852000000,
+      "tag": "0005_enforce_audit_policy_disable_rules",
+      "breakpoints": true
     }
   ]
 }
