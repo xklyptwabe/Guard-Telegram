@@ -20,6 +20,7 @@ export interface AuditPersistenceMutation {
   readonly beforeSnapshotStatus?: SnapshotStatus;
   readonly afterSnapshotStatus?: SnapshotStatus;
   readonly changes?: Record<string, unknown>;
+  readonly snapshotData: Record<string, unknown>;
 }
 
 export interface NormalizedAuditPersistenceMutation {
@@ -28,6 +29,7 @@ export interface NormalizedAuditPersistenceMutation {
   readonly beforeSnapshotStatus: SnapshotStatus;
   readonly afterSnapshotStatus: SnapshotStatus;
   readonly changes?: Record<string, unknown>;
+  readonly snapshotData: Record<string, unknown>;
 }
 
 export function requireAuditPersistenceDefinition(
@@ -59,6 +61,7 @@ export function normalizeAuditMutationForPersistence(
     beforeSnapshotStatus,
     afterSnapshotStatus,
     ...(mutation.changes === undefined ? {} : { changes: normalizeChanges(definition, policy, mutation.changes) }),
+    snapshotData: normalizeSnapshotData(definition, policy, mutation.snapshotData),
   };
 }
 
@@ -84,6 +87,19 @@ function normalizeSnapshotSide(
   const result = schema.safeParse(data);
   if (!result.success) {
     throw new AuditSnapshotValidationError(definition.name, side, result.error.message);
+  }
+  return applyAllowlist(result.data as Record<string, unknown>, definition.allowlist, policy);
+}
+
+function normalizeSnapshotData(
+  definition: AuditEventDefinition<Record<string, unknown>>,
+  policy: AuditPolicyContext,
+  data: Record<string, unknown>,
+): Record<string, unknown> {
+  const schema = definition.sparseSnapshotSchema ?? definition.snapshotSchema;
+  const result = schema.safeParse(data);
+  if (!result.success) {
+    throw new AuditSnapshotValidationError(definition.name, 'snapshotData', result.error.message);
   }
   return applyAllowlist(result.data as Record<string, unknown>, definition.allowlist, policy);
 }

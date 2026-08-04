@@ -158,7 +158,7 @@ export class AuditService {
         .update(entitySnapshots)
         .set({
           snapshotStatus: mutation.snapshotStatus ?? 'current',
-          snapshotData: mutation.snapshotData,
+          snapshotData: normalizedMutation.snapshotData,
           lastSubjectSequence: nextSubjectSequence,
           lastEventId: eventRow.id,
           updatedAt: new Date(),

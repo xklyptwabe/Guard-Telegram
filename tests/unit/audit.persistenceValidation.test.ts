@@ -28,6 +28,7 @@ describe('audit persistence validation', () => {
         {
           before: undefined,
           after: { enabled: true },
+          snapshotData: { enabled: true, source: 'override' },
         },
         definition,
       ),
@@ -65,6 +66,15 @@ describe('audit persistence validation', () => {
             unlistedField: { before: 'old', after: 'new' },
           },
         },
+        snapshotData: {
+          chatId: 'chat-1',
+          userId: 'user-1',
+          moduleId: 'module-admin',
+          commandId: 'modules.enable',
+          argsRedacted: true,
+          durationMs: 15,
+          success: true,
+        },
       },
       definition,
     );
@@ -86,6 +96,39 @@ describe('audit persistence validation', () => {
     });
   });
 
+  it('normalizes entity snapshot data through the event schema and allowlist before persistence', () => {
+    const input = {
+      eventType: 'module.state.changed',
+      eventVersion: 'v1',
+      category: 'module',
+    };
+    const definition = requireAuditPersistenceDefinition(input);
+
+    const mutation = normalizeAuditMutationForPersistence(
+      input,
+      {
+        before: undefined,
+        after: { chatId: 'chat-1', moduleId: 'module-admin', enabled: true, source: 'override' },
+        snapshotData: {
+          chatId: 'chat-1',
+          moduleId: 'module-admin',
+          enabled: true,
+          source: 'override',
+          defaultEnabled: false,
+          token: 'must-not-persist',
+        } as never,
+      },
+      definition,
+    );
+
+    expect(mutation.snapshotData).toEqual({
+      chatId: 'chat-1',
+      moduleId: 'module-admin',
+      enabled: true,
+      source: 'override',
+    });
+  });
+
   it('preserves unavailable ChangeSet status and reason while stripping forbidden nested values', () => {
     const input = {
       eventType: 'chat.settings.changed',
@@ -99,6 +142,7 @@ describe('audit persistence validation', () => {
       {
         before: undefined,
         after: { chatId: 'chat-1', locale: 'ru' },
+        snapshotData: { chatId: 'chat-1', locale: 'ru' },
         changes: {
           status: 'unavailable',
           reason: 'before_not_observed',
