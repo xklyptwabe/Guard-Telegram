@@ -1,4 +1,4 @@
-import { bigint, boolean, index, integer, pgSchema, primaryKey, text, timestamp, uuid, jsonb } from 'drizzle-orm/pg-core';
+import { bigint, boolean, foreignKey, index, integer, pgSchema, primaryKey, text, timestamp, uuid, jsonb } from 'drizzle-orm/pg-core';
 import { sql } from 'drizzle-orm';
 
 const createdAt = () => timestamp('created_at', { withTimezone: true }).defaultNow().notNull();
@@ -13,6 +13,18 @@ export const eventTypes = auditSchema.table(
     eventVersion: text('event_version').notNull(),
     category: text('category').notNull(),
     description: text('description'),
+    // Static, per-event-type metadata projected from the BOTS-7 registry
+    // (definitions.ts) — not per-occurrence data. Seeded once from the
+    // registry, not written on every event row (see
+    // scripts/seedAuditEventTypes.ts). Previously this lived nowhere in
+    // the DB at all and was smuggled into events.metadata.bots7 per row.
+    severity: text('severity', { enum: ['debug', 'info', 'notice', 'warning', 'critical'] }).notNull().default('info'),
+    siteVisible: boolean('site_visible').notNull().default(true),
+    // Whether an operator is *allowed* to turn this event type off via
+    // event_policies.enabled. This column doesn't itself gate anything at
+    // write time — it's a UI/ops-facing constraint on what's a legal value
+    // for event_policies.enabled for this type, enforced administratively.
+    canBeDisabled: boolean('can_be_disabled').notNull().default(true),
     createdAt: createdAt(),
     updatedAt: updatedAt(),
   },
@@ -30,7 +42,16 @@ export const eventPolicies = auditSchema.table(
     createdAt: createdAt(),
     updatedAt: updatedAt(),
   },
-  (table) => [primaryKey({ columns: [table.eventType, table.eventVersion] })],
+  (table) => [
+    primaryKey({ columns: [table.eventType, table.eventVersion] }),
+    foreignKey({
+      name: 'event_policies_event_type_version_event_types_fk',
+      columns: [table.eventType, table.eventVersion],
+      foreignColumns: [eventTypes.eventType, eventTypes.eventVersion],
+    })
+      .onUpdate('cascade')
+      .onDelete('restrict'),
+  ],
 );
 
 export const events = auditSchema.table(
@@ -55,6 +76,16 @@ export const events = auditSchema.table(
     idempotencyKey: text('idempotency_key').notNull().unique(),
     before: jsonb('before'),
     after: jsonb('after'),
+    beforeSnapshotStatus: text('before_snapshot_status', {
+      enum: ['observed', 'not_observed', 'redacted', 'unknown', 'not_applicable'],
+    })
+      .notNull()
+      .default('not_observed'),
+    afterSnapshotStatus: text('after_snapshot_status', {
+      enum: ['observed', 'not_observed', 'redacted', 'unknown', 'not_applicable'],
+    })
+      .notNull()
+      .default('observed'),
     changes: jsonb('changes'),
     metadata: jsonb('metadata'),
   },

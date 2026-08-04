@@ -1,6 +1,9 @@
 import { and, eq } from 'drizzle-orm';
 
 import { getUpdateContext } from './context.js';
+import type { SnapshotStatus } from './audit/enums.js';
+import type { AuditPolicyContext } from './audit/masking.js';
+import { normalizeAuditMutationForPersistence, requireAuditPersistenceDefinition } from './audit/persistenceValidation.js';
 import type { DrizzleDatabase } from '../db/client.js';
 import { entitySnapshots, eventPolicies, events, outbox } from '../db/schema/audit.js';
 
@@ -9,6 +12,9 @@ export interface AuditIdentity {
   readonly subjectType: string;
   readonly subjectId: string;
 }
+
+export type AuditSnapshotStatus = SnapshotStatus;
+export type AuditEntitySnapshotStatus = 'current' | 'archived';
 
 export interface AuditEventInput extends AuditIdentity {
   readonly eventType: string;
@@ -21,12 +27,17 @@ export interface AuditEventInput extends AuditIdentity {
   readonly correlationId?: string;
   readonly telegramContext?: Record<string, unknown>;
   readonly metadata?: Record<string, unknown>;
+  readonly auditPolicy?: AuditPolicyContext;
 }
 
 export interface AuditChange<TSnapshot extends Record<string, unknown>> {
   readonly before: Record<string, unknown> | undefined;
-  readonly after: Record<string, unknown>;
+  readonly after: Record<string, unknown> | undefined;
+  readonly beforeSnapshotStatus?: AuditSnapshotStatus;
+  readonly afterSnapshotStatus?: AuditSnapshotStatus;
   readonly changes?: Record<string, unknown>;
+  readonly metadata?: Record<string, unknown>;
+  readonly snapshotStatus?: AuditEntitySnapshotStatus;
   readonly snapshotData: TSnapshot;
 }
 
@@ -42,6 +53,7 @@ export class AuditService {
     mutate: (tx: AuditTransaction, nextSubjectSequence: number) => Promise<AuditMutationResult<TSnapshot>>,
   ): Promise<{ readonly eventId: string; readonly subjectSequence: number; readonly duplicate: boolean }> {
     const context = getUpdateContext();
+    const auditDefinition = requireAuditPersistenceDefinition(input);
     return this.db.transaction(async (tx) => {
       const existing = await tx
         .select({ id: events.id, subjectSequence: events.subjectSequence })
@@ -90,6 +102,8 @@ export class AuditService {
 
       const nextSubjectSequence = snapshotRow.lastSubjectSequence + 1;
       const mutation = await mutate(tx, nextSubjectSequence);
+      const normalizedMutation = normalizeAuditMutationForPersistence(input, mutation, auditDefinition);
+      const metadata = mergeAuditMetadata(input.metadata, mutation.metadata);
       const telegramContext = input.telegramContext ?? buildTelegramContext(context);
       const [eventRow] = await tx
         .insert(events)
@@ -108,10 +122,12 @@ export class AuditService {
           correlationId: input.correlationId ?? context?.correlationId,
           telegramContext,
           idempotencyKey: input.idempotencyKey,
-          before: mutation.before,
-          after: mutation.after,
-          changes: mutation.changes,
-          metadata: input.metadata,
+          before: normalizedMutation.before,
+          after: normalizedMutation.after,
+          beforeSnapshotStatus: normalizedMutation.beforeSnapshotStatus,
+          afterSnapshotStatus: normalizedMutation.afterSnapshotStatus,
+          changes: normalizedMutation.changes,
+          metadata,
         })
         .returning({ id: events.id, subjectSequence: events.subjectSequence });
 
@@ -129,17 +145,19 @@ export class AuditService {
           subjectType: input.subjectType,
           subjectId: input.subjectId,
           subjectSequence: eventRow.subjectSequence,
-          before: mutation.before,
-          after: mutation.after,
-          changes: mutation.changes,
-          metadata: input.metadata,
+          before: normalizedMutation.before,
+          after: normalizedMutation.after,
+          beforeSnapshotStatus: normalizedMutation.beforeSnapshotStatus,
+          afterSnapshotStatus: normalizedMutation.afterSnapshotStatus,
+          changes: normalizedMutation.changes,
+          metadata,
         },
       });
 
       await tx
         .update(entitySnapshots)
         .set({
-          snapshotStatus: 'current',
+          snapshotStatus: mutation.snapshotStatus ?? 'current',
           snapshotData: mutation.snapshotData,
           lastSubjectSequence: nextSubjectSequence,
           lastEventId: eventRow.id,
@@ -160,4 +178,13 @@ function buildTelegramContext(context: ReturnType<typeof getUpdateContext>): Rec
     ...(context.chatId ? { chatId: context.chatId } : {}),
     ...(context.userId ? { userId: context.userId } : {}),
   };
+}
+
+function mergeAuditMetadata(
+  inputMetadata: Record<string, unknown> | undefined,
+  mutationMetadata: Record<string, unknown> | undefined,
+): Record<string, unknown> | undefined {
+  if (inputMetadata === undefined) return mutationMetadata;
+  if (mutationMetadata === undefined) return inputMetadata;
+  return { ...inputMetadata, ...mutationMetadata };
 }
