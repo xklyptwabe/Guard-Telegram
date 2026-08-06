@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
+import { PgDialect } from 'drizzle-orm/pg-core';
 
-import { purgeExpiredAuditEventsBatch, runAuditRetentionJob } from '../../src/db/retention.js';
+import { expiredAuditEventsDeleteQuery, purgeExpiredAuditEventsBatch, runAuditRetentionJob } from '../../src/db/retention.js';
 import type { AuditService } from '../../src/lib/auditService.js';
 
 describe('audit retention batch job', () => {
@@ -21,6 +22,17 @@ describe('audit retention batch job', () => {
     await expect(purgeExpiredAuditEventsBatch({ execute: async () => ({ rows: [] }) } as never, { batchSize: 0 })).rejects.toThrow(
       'Audit retention batchSize must be a positive integer.',
     );
+  });
+
+  it('uses bounded row-level cleanup SQL without table-level history locks', () => {
+    const dialect = new PgDialect();
+    const query = dialect.sqlToQuery(expiredAuditEventsDeleteQuery(new Date('2026-08-06T10:00:00.000Z'), 100)).sql;
+
+    expect(query).toContain('LIMIT $2');
+    expect(query).toContain('FOR UPDATE SKIP LOCKED');
+    expect(query).toContain('DELETE FROM "audit"."events" AS event');
+    expect(query).not.toMatch(/\bLOCK\s+TABLE\b/i);
+    expect(query).not.toMatch(/\bTRUNCATE\b/i);
   });
 
   it('records audit.retention.completed after the batch cleanup', async () => {

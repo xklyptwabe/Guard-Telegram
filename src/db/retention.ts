@@ -48,7 +48,18 @@ export async function purgeExpiredAuditEventsBatch(
   }
 
   const now = options.now ?? new Date();
-  const result = await database.execute<{ id: string; retention_days: number }>(sql`
+  const result = await database.execute<{ id: string; retention_days: number }>(expiredAuditEventsDeleteQuery(now, batchSize));
+  const deletedEventIds = result.rows.map((row) => row.id);
+  const retentionDays = result.rows.length === 0 ? 0 : Math.min(...result.rows.map((row) => row.retention_days));
+  return {
+    deletedCount: deletedEventIds.length,
+    deletedEventIds,
+    retentionDays,
+  };
+}
+
+export function expiredAuditEventsDeleteQuery(now: Date, batchSize: number) {
+  return sql`
     WITH expired AS (
       SELECT
         event."id",
@@ -65,14 +76,7 @@ export async function purgeExpiredAuditEventsBatch(
     USING expired
     WHERE event."id" = expired."id"
     RETURNING event."id", expired."retention_days"
-  `);
-  const deletedEventIds = result.rows.map((row) => row.id);
-  const retentionDays = result.rows.length === 0 ? 0 : Math.min(...result.rows.map((row) => row.retention_days));
-  return {
-    deletedCount: deletedEventIds.length,
-    deletedEventIds,
-    retentionDays,
-  };
+  `;
 }
 
 export async function runAuditRetentionJob(

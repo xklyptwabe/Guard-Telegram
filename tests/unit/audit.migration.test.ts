@@ -52,4 +52,12 @@ describe('audit migrations', () => {
     expect(sql).toContain('REVOKE UPDATE ON audit.events FROM audit_retention');
     expect(sql).toContain('REVOKE INSERT, UPDATE, DELETE ON audit.event_policies FROM audit_retention');
   });
+
+  it('indexes audit retention candidates for short batch scans', () => {
+    const sql = readFileSync('src/db/migrations/0010_index_audit_retention_candidates.sql', 'utf8');
+
+    expect(sql).toContain('CREATE INDEX IF NOT EXISTS "events_retention_candidates_idx"');
+    expect(sql).toContain('ON "audit"."events" ("occurred_at" ASC, "id" ASC)');
+    expect(sql).toContain('WHERE "metadata" #>> \'{auditPolicy,values,retentionDays}\' ~ \'^[0-9]+$\'');
+  });
 });

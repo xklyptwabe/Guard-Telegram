@@ -71,6 +71,13 @@
       "when": 1786022000000,
       "tag": "0009_grant_audit_retention_role",
       "breakpoints": true
+    },
+    {
+      "idx": 10,
+      "version": "7",
+      "when": 1786023000000,
+      "tag": "0010_index_audit_retention_candidates",
+      "breakpoints": true
     }
   ]
 }
