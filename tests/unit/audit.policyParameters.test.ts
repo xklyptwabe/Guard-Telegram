@@ -26,6 +26,7 @@ describe('audit policy parameters', () => {
         retentionDays: 90,
         severity: 'warning',
         exportAllowed: false,
+        lockVersion: 2,
       }),
     });
 
@@ -45,6 +46,7 @@ describe('audit policy parameters', () => {
         retentionDays: 90,
         severity: 'warning',
         exportAllowed: false,
+        lockVersion: 2,
       },
     });
   });

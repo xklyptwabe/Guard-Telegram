@@ -68,6 +68,7 @@ describe('toDownstreamInput', () => {
         retentionDays: 90,
         severity: 'warning',
         exportAllowed: false,
+        lockVersion: 2,
       }),
     });
 
@@ -97,6 +98,7 @@ describe('toDownstreamInput', () => {
         retentionDays: 30,
         severity: 'info',
         exportAllowed: true,
+        lockVersion: 3,
       }),
     });
 
@@ -278,6 +280,7 @@ function fixtureAfterFor(name: (typeof AUDIT_EVENT_NAMES)[number]): Record<strin
         retentionDays: 90,
         severity: 'warning',
         exportAllowed: false,
+        lockVersion: 2,
       };
     case 'member.status.changed':
       return { chatId: 'chat-1', userId: 'user-1', status: 'member' };

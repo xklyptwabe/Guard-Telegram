@@ -87,6 +87,7 @@ export const AUDIT_EVENT_DEFINITIONS: AuditEventDefinitions = {
       'retentionDays',
       'severity',
       'exportAllowed',
+      'lockVersion',
     ],
   }),
 

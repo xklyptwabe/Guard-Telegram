@@ -3,9 +3,10 @@ import { describe, expect, it } from 'vitest';
 import {
   AuditPolicyOptimisticLockError,
   ProtectedAuditPolicyDisableError,
+  updateAuditPolicyWithAudit,
   updateAuditPolicyWithLock,
-  type UpdatedAuditPolicy,
 } from '../../src/lib/audit/policyStore.js';
+import type { AuditService } from '../../src/lib/auditService.js';
 
 describe('audit policy store optimistic locking', () => {
   it('increments lockVersion when the expected version matches', async () => {
@@ -59,11 +60,82 @@ describe('audit policy store optimistic locking', () => {
 
     expect(db.calls.set).toBeUndefined();
   });
+
+  it('records successful policy updates through audit.policy.changed', async () => {
+    const updatedAt = new Date('2026-08-06T10:00:00.000Z');
+    const tx = fakePolicyDb({
+      selectedPolicy: {
+        policyId: 'global:event:message.deleted:v1',
+        chatId: null,
+        eventType: 'message.deleted',
+        eventVersion: 'v1',
+        moduleId: null,
+        enabled: true,
+        siteVisible: null,
+        snapshotMode: null,
+        allowlist: null,
+        masking: null,
+        retentionDays: null,
+        severity: null,
+        exportAllowed: null,
+        lockVersion: 2,
+        updatedAt,
+      },
+      updatedRows: [
+        {
+          policyId: 'global:event:message.deleted:v1',
+          chatId: null,
+          eventType: 'message.deleted',
+          eventVersion: 'v1',
+          moduleId: null,
+          enabled: false,
+          siteVisible: null,
+          snapshotMode: null,
+          allowlist: null,
+          masking: null,
+          retentionDays: 90,
+          severity: null,
+          exportAllowed: null,
+          lockVersion: 3,
+          updatedAt,
+        },
+      ],
+    });
+    const audit = fakeAuditService(tx);
+
+    await expect(
+      updateAuditPolicyWithAudit(audit as unknown as AuditService, {
+        policyId: 'global:event:message.deleted:v1',
+        expectedLockVersion: 2,
+        patch: { enabled: false, retentionDays: 90 },
+        idempotencyKey: 'audit-policy-change-1',
+      }),
+    ).resolves.toEqual({
+      policyId: 'global:event:message.deleted:v1',
+      lockVersion: 3,
+      updatedAt,
+      auditEventId: 'event-1',
+      duplicate: false,
+    });
+
+    expect(audit.calls.input).toMatchObject({
+      eventType: 'audit.policy.changed',
+      eventVersion: 'v1',
+      subjectType: 'audit_policy',
+      subjectId: 'global:event:message.deleted:v1',
+      idempotencyKey: 'audit-policy-change-1',
+    });
+    expect(audit.calls.mutation).toMatchObject({
+      before: { enabled: true, retentionDays: null, lockVersion: 2 },
+      after: { enabled: false, retentionDays: 90, lockVersion: 3 },
+      snapshotData: { enabled: false, retentionDays: 90, lockVersion: 3 },
+    });
+  });
 });
 
 function fakePolicyDb(options: {
-  readonly selectedPolicy?: { readonly eventType: string | null; readonly eventVersion: string | null };
-  readonly updatedRows: readonly UpdatedAuditPolicy[];
+  readonly selectedPolicy?: Record<string, unknown>;
+  readonly updatedRows: readonly Record<string, unknown>[];
 }) {
   const calls: { select?: unknown; set?: unknown; where?: unknown; returning?: unknown } = {};
   return {
@@ -73,7 +145,7 @@ function fakePolicyDb(options: {
       return {
         from: () => ({
           where: () => ({
-            limit: () => Promise.resolve(options.selectedPolicy === undefined ? [] : [options.selectedPolicy]),
+            limit: () => oneRowResult(options.selectedPolicy === undefined ? [] : [options.selectedPolicy]),
           }),
         }),
       };
@@ -94,5 +166,23 @@ function fakePolicyDb(options: {
         };
       },
     }),
+  };
+}
+
+function oneRowResult(rows: readonly Record<string, unknown>[]) {
+  return Object.assign(Promise.resolve(rows), {
+    for: (_lock: 'update') => Promise.resolve(rows),
+  });
+}
+
+function fakeAuditService(tx: ReturnType<typeof fakePolicyDb>) {
+  const calls: { input?: unknown; mutation?: unknown } = {};
+  return {
+    calls,
+    recordEntityChange: async (input: unknown, mutate: (transaction: unknown, nextSubjectSequence: number) => Promise<unknown>) => {
+      calls.input = input;
+      calls.mutation = await mutate(tx, 1);
+      return { eventId: 'event-1', subjectSequence: 1, duplicate: false };
+    },
   };
 }

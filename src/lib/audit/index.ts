@@ -52,9 +52,12 @@ export {
 export {
   AuditPolicyOptimisticLockError,
   ProtectedAuditPolicyDisableError,
+  updateAuditPolicyWithAudit,
   updateAuditPolicyWithLock,
+  type AuditedPolicyUpdateResult,
   type AuditPolicyPatch,
   type UpdatedAuditPolicy,
+  type UpdateAuditPolicyWithAuditInput,
   type UpdateAuditPolicyWithLockInput,
 } from './policyStore.js';
 export * from './shapes.js';

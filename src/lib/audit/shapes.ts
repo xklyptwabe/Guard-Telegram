@@ -55,6 +55,7 @@ export const auditPolicyChangedSchema = z.object({
   retentionDays: z.number().int().nonnegative().nullable(),
   severity: z.enum(['debug', 'info', 'notice', 'warning', 'critical']).nullable(),
   exportAllowed: z.boolean().nullable(),
+  lockVersion: z.number().int().positive(),
 });
 
 export const memberStatusSchema = z.enum(['member', 'administrator', 'creator', 'restricted', 'left', 'kicked']);
