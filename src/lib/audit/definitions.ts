@@ -71,7 +71,23 @@ export const AUDIT_EVENT_DEFINITIONS: AuditEventDefinitions = {
     // audit-of-audit would defeat the point of the system.
     canBeDisabled: false,
     snapshotSchema: auditPolicyChangedSchema,
-    allowlist: ['policyId', 'scope', 'textLoggingEnabled', 'retentionDays'],
+    allowlist: [
+      'policyId',
+      'scope',
+      'targetType',
+      'chatId',
+      'eventType',
+      'eventVersion',
+      'moduleId',
+      'enabled',
+      'siteVisible',
+      'snapshotMode',
+      'allowlist',
+      'masking',
+      'retentionDays',
+      'severity',
+      'exportAllowed',
+    ],
   }),
 
   'member.status.changed': defineAuditEvent('member.status.changed', {

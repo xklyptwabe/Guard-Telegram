@@ -54,7 +54,21 @@ describe('toDownstreamInput', () => {
       version: 1,
       operation: 'update',
       before: notApplicable(),
-      after: observed({ policyId: 'p1', scope: 'global', textLoggingEnabled: false, retentionDays: 90 }),
+      after: observed({
+        policyId: 'p1',
+        scope: 'global',
+        targetType: 'event_type',
+        eventType: 'message.deleted',
+        eventVersion: 'v1',
+        enabled: false,
+        siteVisible: false,
+        snapshotMode: 'metadata',
+        allowlist: ['chatId', 'messageId'],
+        masking: ['reason'],
+        retentionDays: 90,
+        severity: 'warning',
+        exportAllowed: false,
+      }),
     });
 
     const input = toDownstreamInput(record);
@@ -70,7 +84,20 @@ describe('toDownstreamInput', () => {
       version: 1,
       operation: 'update',
       before: notApplicable(),
-      after: observed({ policyId: 'p2', scope: 'chat-42', textLoggingEnabled: true, retentionDays: 30 }),
+      after: observed({
+        policyId: 'p2',
+        scope: 'chat-42',
+        targetType: 'chat',
+        chatId: 'chat-42',
+        enabled: true,
+        siteVisible: true,
+        snapshotMode: 'snapshot',
+        allowlist: ['chatId'],
+        masking: [],
+        retentionDays: 30,
+        severity: 'info',
+        exportAllowed: true,
+      }),
     });
 
     expect(tenantIdFor(record)).toBe('chat-42');
@@ -237,7 +264,21 @@ function fixtureAfterFor(name: (typeof AUDIT_EVENT_NAMES)[number]): Record<strin
     case 'chat.settings.changed':
       return { chatId: 'chat-1', locale: 'ru' };
     case 'audit.policy.changed':
-      return { policyId: 'policy-1', scope: 'global', textLoggingEnabled: false, retentionDays: 90 };
+      return {
+        policyId: 'policy-1',
+        scope: 'global',
+        targetType: 'event_type',
+        eventType: 'message.deleted',
+        eventVersion: 'v1',
+        enabled: false,
+        siteVisible: false,
+        snapshotMode: 'metadata',
+        allowlist: ['chatId', 'messageId'],
+        masking: ['text'],
+        retentionDays: 90,
+        severity: 'warning',
+        exportAllowed: false,
+      };
     case 'member.status.changed':
       return { chatId: 'chat-1', userId: 'user-1', status: 'member' };
     case 'bot.membership.changed':

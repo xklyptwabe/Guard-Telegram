@@ -1,4 +1,4 @@
-import { bigint, boolean, foreignKey, index, integer, pgSchema, primaryKey, text, timestamp, uuid, jsonb } from 'drizzle-orm/pg-core';
+import { bigint, boolean, foreignKey, index, integer, pgSchema, primaryKey, text, timestamp, uniqueIndex, uuid, jsonb } from 'drizzle-orm/pg-core';
 import { sql } from 'drizzle-orm';
 
 const createdAt = () => timestamp('created_at', { withTimezone: true }).defaultNow().notNull();
@@ -34,16 +34,33 @@ export const eventTypes = auditSchema.table(
 export const eventPolicies = auditSchema.table(
   'event_policies',
   {
-    eventType: text('event_type').notNull(),
-    eventVersion: text('event_version').notNull(),
+    policyId: text('policy_id').primaryKey(),
+    chatId: text('chat_id'),
+    eventType: text('event_type'),
+    eventVersion: text('event_version'),
+    moduleId: text('module_id'),
     required: boolean('required').notNull().default(true),
     retentionDays: integer('retention_days'),
-    enabled: boolean('enabled').notNull().default(true),
+    enabled: boolean('enabled'),
+    siteVisible: boolean('site_visible'),
+    snapshotMode: text('snapshot_mode', { enum: ['metadata', 'snapshot'] }),
+    allowlist: jsonb('allowlist'),
+    masking: jsonb('masking'),
+    severity: text('severity', { enum: ['debug', 'info', 'notice', 'warning', 'critical'] }),
+    exportAllowed: boolean('export_allowed'),
     createdAt: createdAt(),
     updatedAt: updatedAt(),
   },
   (table) => [
-    primaryKey({ columns: [table.eventType, table.eventVersion] }),
+    uniqueIndex('event_policies_selector_unique_idx').on(
+      table.chatId,
+      table.eventType,
+      table.eventVersion,
+      table.moduleId,
+    ),
+    index('event_policies_chat_idx').on(table.chatId),
+    index('event_policies_event_type_idx').on(table.eventType, table.eventVersion),
+    index('event_policies_module_idx').on(table.moduleId),
     foreignKey({
       name: 'event_policies_event_type_version_event_types_fk',
       columns: [table.eventType, table.eventVersion],

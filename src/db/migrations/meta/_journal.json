@@ -50,6 +50,13 @@
       "when": 1785853000000,
       "tag": "0006_enforce_audit_policy_event_type_fk",
       "breakpoints": true
+    },
+    {
+      "idx": 7,
+      "version": "7",
+      "when": 1786020000000,
+      "tag": "0007_extend_audit_event_policies",
+      "breakpoints": true
     }
   ]
 }
