@@ -93,6 +93,7 @@ export async function updateAuditPolicyWithAudit(
   input: UpdateAuditPolicyWithAuditInput,
 ): Promise<AuditedPolicyUpdateResult> {
   let updatedPolicy: UpdatedAuditPolicy | undefined;
+  let protectedDisableError: ProtectedAuditPolicyDisableError | undefined;
   const auditResult = await audit.recordEntityChange(
     {
       tenantId: PLATFORM_TENANT_SENTINEL,
@@ -112,7 +113,20 @@ export async function updateAuditPolicyWithAudit(
         throw new AuditPolicyOptimisticLockError(input.policyId, input.expectedLockVersion);
       }
       if (input.patch.enabled === false) {
-        assertPolicySnapshotCanBeDisabled(beforeRow);
+        protectedDisableError = protectedPolicyDisableError(beforeRow);
+        if (protectedDisableError !== undefined) {
+          const attemptedRow = applyPatchToSnapshotRow(beforeRow, input.patch);
+          return {
+            before: policySnapshot(beforeRow),
+            after: policySnapshot(attemptedRow),
+            changes: {
+              status: 'rejected',
+              fields: policyPatchChanges(beforeRow, attemptedRow, input.patch),
+            },
+            metadata: { operation: 'failed', reason: 'protected_event_disable' },
+            snapshotData: policySnapshot(beforeRow),
+          };
+        }
       }
 
       const updatedAt = new Date();
@@ -147,6 +161,10 @@ export async function updateAuditPolicyWithAudit(
     },
   );
 
+  if (protectedDisableError !== undefined) {
+    throw protectedDisableError;
+  }
+
   if (updatedPolicy === undefined) {
     return { policyId: input.policyId, lockVersion: auditResult.subjectSequence, updatedAt: new Date(0), auditEventId: auditResult.eventId, duplicate: true };
   }
@@ -169,12 +187,13 @@ async function assertPolicyCanBeDisabled(db: Pick<DrizzleDatabase, 'select'>, po
   }
 }
 
-function assertPolicySnapshotCanBeDisabled(row: AuditPolicySnapshotRow): void {
+function protectedPolicyDisableError(row: AuditPolicySnapshotRow): ProtectedAuditPolicyDisableError | undefined {
   if (row.eventType === null || row.eventVersion === null) return;
   const definition = auditEventRegistry.requireSupportedVersion(row.eventType, parseEventVersion(row.eventVersion));
   if (!definition.canBeDisabled) {
-    throw new ProtectedAuditPolicyDisableError(row.eventType, row.eventVersion);
+    return new ProtectedAuditPolicyDisableError(row.eventType, row.eventVersion);
   }
+  return undefined;
 }
 
 function parseEventVersion(eventVersion: string): number {
@@ -294,4 +313,18 @@ function snapshotField(row: AuditPolicySnapshotRow, key: keyof AuditPolicyPatch)
   if (key === 'allowlist') return parseStringArray(row.allowlist);
   if (key === 'masking') return parseStringArray(row.masking);
   return row[key];
+}
+
+function applyPatchToSnapshotRow(row: AuditPolicySnapshotRow, patch: AuditPolicyPatch): AuditPolicySnapshotRow {
+  return {
+    ...row,
+    ...(patch.enabled !== undefined ? { enabled: patch.enabled } : {}),
+    ...(patch.siteVisible !== undefined ? { siteVisible: patch.siteVisible } : {}),
+    ...(patch.snapshotMode !== undefined ? { snapshotMode: patch.snapshotMode } : {}),
+    ...(patch.allowlist !== undefined ? { allowlist: patch.allowlist === null ? null : [...patch.allowlist] } : {}),
+    ...(patch.masking !== undefined ? { masking: patch.masking === null ? null : [...patch.masking] } : {}),
+    ...(patch.retentionDays !== undefined ? { retentionDays: patch.retentionDays } : {}),
+    ...(patch.severity !== undefined ? { severity: patch.severity } : {}),
+    ...(patch.exportAllowed !== undefined ? { exportAllowed: patch.exportAllowed } : {}),
+  };
 }

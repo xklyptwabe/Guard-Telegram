@@ -131,6 +131,59 @@ describe('audit policy store optimistic locking', () => {
       snapshotData: { enabled: false, retentionDays: 90, lockVersion: 3 },
     });
   });
+
+  it('records rejected protected-setting attempts without updating the policy row', async () => {
+    const updatedAt = new Date('2026-08-06T10:00:00.000Z');
+    const tx = fakePolicyDb({
+      selectedPolicy: {
+        policyId: 'global:event:module.state.changed:v1',
+        chatId: null,
+        eventType: 'module.state.changed',
+        eventVersion: 'v1',
+        moduleId: null,
+        enabled: true,
+        siteVisible: null,
+        snapshotMode: null,
+        allowlist: null,
+        masking: null,
+        retentionDays: null,
+        severity: null,
+        exportAllowed: null,
+        lockVersion: 4,
+        updatedAt,
+      },
+      updatedRows: [],
+    });
+    const audit = fakeAuditService(tx);
+
+    await expect(
+      updateAuditPolicyWithAudit(audit as unknown as AuditService, {
+        policyId: 'global:event:module.state.changed:v1',
+        expectedLockVersion: 4,
+        patch: { enabled: false },
+        idempotencyKey: 'audit-policy-protected-attempt-1',
+      }),
+    ).rejects.toThrow(ProtectedAuditPolicyDisableError);
+
+    expect(tx.calls.set).toBeUndefined();
+    expect(audit.calls.input).toMatchObject({
+      eventType: 'audit.policy.changed',
+      eventVersion: 'v1',
+      subjectType: 'audit_policy',
+      subjectId: 'global:event:module.state.changed:v1',
+      idempotencyKey: 'audit-policy-protected-attempt-1',
+    });
+    expect(audit.calls.mutation).toMatchObject({
+      before: { enabled: true, lockVersion: 4 },
+      after: { enabled: false, lockVersion: 4 },
+      changes: {
+        status: 'rejected',
+        fields: { enabled: { before: true, after: false } },
+      },
+      metadata: { operation: 'failed', reason: 'protected_event_disable' },
+      snapshotData: { enabled: true, lockVersion: 4 },
+    });
+  });
 });
 
 function fakePolicyDb(options: {
