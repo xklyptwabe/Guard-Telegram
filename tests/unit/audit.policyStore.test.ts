@@ -65,8 +65,8 @@ describe('audit policy store optimistic locking', () => {
     const updatedAt = new Date('2026-08-06T10:00:00.000Z');
     const tx = fakePolicyDb({
       selectedPolicy: {
-        policyId: 'global:event:message.deleted:v1',
-        chatId: null,
+        policyId: 'chat:chat-42:event:message.deleted:v1',
+        chatId: 'chat-42',
         eventType: 'message.deleted',
         eventVersion: 'v1',
         moduleId: null,
@@ -83,8 +83,8 @@ describe('audit policy store optimistic locking', () => {
       },
       updatedRows: [
         {
-          policyId: 'global:event:message.deleted:v1',
-          chatId: null,
+          policyId: 'chat:chat-42:event:message.deleted:v1',
+          chatId: 'chat-42',
           eventType: 'message.deleted',
           eventVersion: 'v1',
           moduleId: null,
@@ -104,14 +104,14 @@ describe('audit policy store optimistic locking', () => {
     const audit = fakeAuditService(tx);
 
     await expect(
-      updateAuditPolicyWithAudit(audit as unknown as AuditService, {
-        policyId: 'global:event:message.deleted:v1',
+      updateAuditPolicyWithAudit(tx as never, audit as unknown as AuditService, {
+        policyId: 'chat:chat-42:event:message.deleted:v1',
         expectedLockVersion: 2,
         patch: { enabled: false, retentionDays: 90 },
         idempotencyKey: 'audit-policy-change-1',
       }),
     ).resolves.toEqual({
-      policyId: 'global:event:message.deleted:v1',
+      policyId: 'chat:chat-42:event:message.deleted:v1',
       lockVersion: 3,
       updatedAt,
       auditEventId: 'event-1',
@@ -119,10 +119,11 @@ describe('audit policy store optimistic locking', () => {
     });
 
     expect(audit.calls.input).toMatchObject({
+      tenantId: 'chat-42',
       eventType: 'audit.policy.changed',
       eventVersion: 'v1',
       subjectType: 'audit_policy',
-      subjectId: 'global:event:message.deleted:v1',
+      subjectId: 'chat:chat-42:event:message.deleted:v1',
       idempotencyKey: 'audit-policy-change-1',
     });
     expect(audit.calls.mutation).toMatchObject({
@@ -157,7 +158,7 @@ describe('audit policy store optimistic locking', () => {
     const audit = fakeAuditService(tx);
 
     await expect(
-      updateAuditPolicyWithAudit(audit as unknown as AuditService, {
+      updateAuditPolicyWithAudit(tx as never, audit as unknown as AuditService, {
         policyId: 'global:event:module.state.changed:v1',
         expectedLockVersion: 4,
         patch: { enabled: false },
@@ -167,6 +168,7 @@ describe('audit policy store optimistic locking', () => {
 
     expect(tx.calls.set).toBeUndefined();
     expect(audit.calls.input).toMatchObject({
+      tenantId: '__platform__',
       eventType: 'audit.policy.changed',
       eventVersion: 'v1',
       subjectType: 'audit_policy',

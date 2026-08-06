@@ -89,14 +89,16 @@ export async function updateAuditPolicyWithLock(
 }
 
 export async function updateAuditPolicyWithAudit(
+  db: Pick<DrizzleDatabase, 'select'>,
   audit: AuditService,
   input: UpdateAuditPolicyWithAuditInput,
 ): Promise<AuditedPolicyUpdateResult> {
+  const tenantId = await selectPolicyTenantId(db, input.policyId, input.expectedLockVersion);
   let updatedPolicy: UpdatedAuditPolicy | undefined;
   let protectedDisableError: ProtectedAuditPolicyDisableError | undefined;
   const auditResult = await audit.recordEntityChange(
     {
-      tenantId: PLATFORM_TENANT_SENTINEL,
+      tenantId,
       subjectType: 'audit_policy',
       subjectId: input.policyId,
       eventType: 'audit.policy.changed',
@@ -170,6 +172,23 @@ export async function updateAuditPolicyWithAudit(
   }
 
   return { ...updatedPolicy, auditEventId: auditResult.eventId, duplicate: auditResult.duplicate };
+}
+
+async function selectPolicyTenantId(
+  db: Pick<DrizzleDatabase, 'select'>,
+  policyId: string,
+  expectedLockVersion: number,
+): Promise<string> {
+  const rows = await db
+    .select({ chatId: eventPolicies.chatId })
+    .from(eventPolicies)
+    .where(eq(eventPolicies.policyId, policyId))
+    .limit(1);
+  const row = rows[0];
+  if (row === undefined) {
+    throw new AuditPolicyOptimisticLockError(policyId, expectedLockVersion);
+  }
+  return row.chatId ?? PLATFORM_TENANT_SENTINEL;
 }
 
 async function assertPolicyCanBeDisabled(db: Pick<DrizzleDatabase, 'select'>, policyId: string): Promise<void> {
