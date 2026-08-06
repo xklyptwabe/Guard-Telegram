@@ -70,7 +70,6 @@ export function expiredAuditEventsDeleteQuery(now: Date, batchSize: number) {
           - (((event."metadata" #>> '{auditPolicy,values,retentionDays}')::int) * INTERVAL '1 day')
       ORDER BY event."occurred_at" ASC, event."id" ASC
       LIMIT ${batchSize}
-      FOR UPDATE SKIP LOCKED
     )
     DELETE FROM "audit"."events" AS event
     USING expired

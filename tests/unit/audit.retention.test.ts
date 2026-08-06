@@ -24,13 +24,13 @@ describe('audit retention batch job', () => {
     );
   });
 
-  it('uses bounded row-level cleanup SQL without table-level history locks', () => {
+  it('uses bounded cleanup SQL without explicit history locks', () => {
     const dialect = new PgDialect();
     const query = dialect.sqlToQuery(expiredAuditEventsDeleteQuery(new Date('2026-08-06T10:00:00.000Z'), 100)).sql;
 
     expect(query).toContain('LIMIT $2');
-    expect(query).toContain('FOR UPDATE SKIP LOCKED');
     expect(query).toContain('DELETE FROM "audit"."events" AS event');
+    expect(query).not.toMatch(/\bFOR\s+UPDATE\b/i);
     expect(query).not.toMatch(/\bLOCK\s+TABLE\b/i);
     expect(query).not.toMatch(/\bTRUNCATE\b/i);
   });
