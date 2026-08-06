@@ -129,6 +129,7 @@ export const auditRetentionCompletedSchema = z.object({
   jobId: z.string().min(1),
   deletedCount: z.number().int().nonnegative(),
   retentionDays: z.number().int().nonnegative(),
+  batchSize: z.number().int().positive(),
   startedAt: z.string(),
   finishedAt: z.string(),
 });

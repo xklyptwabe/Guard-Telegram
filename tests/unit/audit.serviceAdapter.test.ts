@@ -299,7 +299,14 @@ function fixtureAfterFor(name: (typeof AUDIT_EVENT_NAMES)[number]): Record<strin
     case 'audit.exported':
       return { exportId: 'export-1', requestedBy: 'admin-1', format: 'json', rangeFrom: '2026-08-01T00:00:00.000Z', rangeTo: '2026-08-04T00:00:00.000Z', rowCount: 1 };
     case 'audit.retention.completed':
-      return { jobId: 'job-1', deletedCount: 1, retentionDays: 90, startedAt: '2026-08-04T00:00:00.000Z', finishedAt: '2026-08-04T00:01:00.000Z' };
+      return {
+        jobId: 'job-1',
+        deletedCount: 1,
+        retentionDays: 90,
+        batchSize: 500,
+        startedAt: '2026-08-04T00:00:00.000Z',
+        finishedAt: '2026-08-04T00:01:00.000Z',
+      };
   }
 }
 

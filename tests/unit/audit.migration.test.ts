@@ -45,9 +45,11 @@ describe('audit migrations', () => {
     const sql = readFileSync('src/db/migrations/0009_grant_audit_retention_role.sql', 'utf8');
 
     expect(sql).toContain("rolname = 'audit_retention'");
-    expect(sql).toContain('GRANT SELECT, DELETE ON audit.events TO audit_retention');
-    expect(sql).toContain('GRANT SELECT, DELETE ON audit.outbox TO audit_retention');
-    expect(sql).toContain('REVOKE INSERT, UPDATE ON audit.events FROM audit_retention');
+    expect(sql).toContain('GRANT USAGE ON SEQUENCE audit.subject_sequence TO audit_retention');
+    expect(sql).toContain('GRANT SELECT, INSERT, DELETE ON audit.events TO audit_retention');
+    expect(sql).toContain('GRANT SELECT, INSERT, DELETE ON audit.outbox TO audit_retention');
+    expect(sql).toContain('GRANT SELECT, INSERT, UPDATE ON audit.entity_snapshots TO audit_retention');
+    expect(sql).toContain('REVOKE UPDATE ON audit.events FROM audit_retention');
     expect(sql).toContain('REVOKE INSERT, UPDATE, DELETE ON audit.event_policies FROM audit_retention');
   });
 });

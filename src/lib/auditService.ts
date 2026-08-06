@@ -49,7 +49,7 @@ export interface AuditChange<TSnapshot extends Record<string, unknown>> {
 
 export type AuditMutationResult<TSnapshot extends Record<string, unknown>> = AuditChange<TSnapshot>;
 
-type AuditTransaction = Pick<DrizzleDatabase, 'select' | 'insert' | 'update' | 'delete'>;
+type AuditTransaction = Pick<DrizzleDatabase, 'select' | 'insert' | 'update' | 'delete' | 'execute'>;
 
 export class AuditService {
   public constructor(private readonly db: DrizzleDatabase) {}

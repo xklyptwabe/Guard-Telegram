@@ -206,6 +206,6 @@ export const AUDIT_EVENT_DEFINITIONS: AuditEventDefinitions = {
     siteVisible: false,
     canBeDisabled: false,
     snapshotSchema: auditRetentionCompletedSchema,
-    allowlist: ['jobId', 'deletedCount', 'retentionDays', 'startedAt', 'finishedAt'],
+    allowlist: ['jobId', 'deletedCount', 'retentionDays', 'batchSize', 'startedAt', 'finishedAt'],
   }),
 };
