@@ -109,6 +109,7 @@ export class ModuleRegistry {
         eventVersion: 'v1',
         category: 'module',
         source: 'telegram.command',
+        moduleId,
         idempotencyKey,
         ...(actorId !== undefined ? { actorId, actorType: 'telegram_user' } : { actorType: 'telegram_user' }),
       },

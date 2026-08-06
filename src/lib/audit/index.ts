@@ -38,4 +38,15 @@ export {
   type AuditPolicyPriorityMatch,
   type AuditPolicyResolutionTarget,
 } from './policyPriority.js';
+export {
+  resolveEffectiveAuditPolicy,
+  resolveEffectiveAuditPolicyFromRows,
+  type AuditPolicyResolutionRow,
+  type AuditPolicyValueName,
+  type AuditPolicyValueSource,
+  type AuditPolicyValueSources,
+  type AuditPolicyValues,
+  type AuditSnapshotMode,
+  type EffectiveAuditPolicy,
+} from './policyResolution.js';
 export * from './shapes.js';
