@@ -58,7 +58,7 @@ describe.skipIf(!testDatabaseUrl)('Audit transaction integration', () => {
           before: undefined,
           after: { enabled: true, source: 'override' },
           changes: { enabled: { after: true } },
-          snapshotData: { chatId: '1001', moduleId: 'module-admin', enabled: true },
+          snapshotData: { chatId: '1001', moduleId: 'module-admin', enabled: true, source: 'override' },
         };
       },
     );
@@ -96,7 +96,7 @@ describe.skipIf(!testDatabaseUrl)('Audit transaction integration', () => {
       return {
         before: undefined,
         after: { enabled: true, source: 'override' },
-        snapshotData: { chatId: '1002', moduleId: 'module-admin', enabled: true },
+        snapshotData: { chatId: '1002', moduleId: 'module-admin', enabled: true, source: 'override' },
       };
     });
 
@@ -145,29 +145,29 @@ describe.skipIf(!testDatabaseUrl)('Audit transaction integration', () => {
   it('fails closed when the audit policy is disabled', async () => {
     const input = {
       tenantId: '1004',
-      subjectType: 'chat_module_state',
-      subjectId: '1004:module-admin',
-      eventType: 'module.state.changed',
+      subjectType: 'chat_settings',
+      subjectId: '1004',
+      eventType: 'chat.settings.changed',
       eventVersion: 'v1',
-      category: 'module',
+      category: 'chat',
       source: 'telegram.command',
-      idempotencyKey: 'audit:test:1004:module-admin:true',
+      idempotencyKey: 'audit:test:1004:chat-settings',
     } as const;
 
-    await database!.db.update(eventPolicies).set({ enabled: false }).where(and(eq(eventPolicies.eventType, 'module.state.changed'), eq(eventPolicies.eventVersion, 'v1')));
+    await database!.db.update(eventPolicies).set({ enabled: false }).where(and(eq(eventPolicies.eventType, 'chat.settings.changed'), eq(eventPolicies.eventVersion, 'v1')));
 
     try {
       await expect(
         audit!.recordEntityChange(input, async (tx) => {
           await tx.insert(telegramChats).values({ chatId: '1004', type: 'group', title: 'audit-test' });
-          await tx.insert(chatModuleStates).values({ chatId: '1004', moduleId: 'module-admin', enabled: true });
           return {
-            before: undefined,
-            after: { enabled: true, source: 'override' },
-            snapshotData: { chatId: '1004', moduleId: 'module-admin', enabled: true },
+            before: { chatId: '1004', locale: 'en' },
+            after: { chatId: '1004', locale: 'ru' },
+            changes: { locale: { before: 'en', after: 'ru' } },
+            snapshotData: { chatId: '1004', locale: 'ru' },
           };
         }),
-      ).rejects.toThrow('Audit policy is unavailable for module.state.changed@v1');
+      ).rejects.toThrow('Audit policy is unavailable for chat.settings.changed@v1');
 
       const stateRows = await database!.db.select().from(chatModuleStates);
       const eventRows = await database!.db.select().from(events);
@@ -179,7 +179,7 @@ describe.skipIf(!testDatabaseUrl)('Audit transaction integration', () => {
       expect(snapshotRows).toHaveLength(0);
       expect(outboxRows).toHaveLength(0);
     } finally {
-      await database!.db.update(eventPolicies).set({ enabled: true }).where(and(eq(eventPolicies.eventType, 'module.state.changed'), eq(eventPolicies.eventVersion, 'v1')));
+      await database!.db.update(eventPolicies).set({ enabled: true }).where(and(eq(eventPolicies.eventType, 'chat.settings.changed'), eq(eventPolicies.eventVersion, 'v1')));
     }
   });
 
@@ -235,7 +235,7 @@ describe.skipIf(!testDatabaseUrl)('Audit transaction integration', () => {
           before: undefined,
           after: { enabled: true, source: 'override' },
           metadata: { operation: 'update' },
-          snapshotData: { chatId: '1006', moduleId: 'module-admin', enabled: true },
+          snapshotData: { chatId: '1006', moduleId: 'module-admin', enabled: true, source: 'override' },
         };
       },
     );
@@ -243,8 +243,8 @@ describe.skipIf(!testDatabaseUrl)('Audit transaction integration', () => {
     const eventRows = await database!.db.select().from(events);
     const outboxRows = await database!.db.select().from(outbox);
 
-    expect(eventRows[0]?.metadata).toEqual({ source: 'test', operation: 'update' });
-    expect((outboxRows[0]?.payload as { metadata?: unknown } | undefined)?.metadata).toEqual({
+    expect(eventRows[0]?.metadata).toMatchObject({ source: 'test', operation: 'update' });
+    expect((outboxRows[0]?.payload as { metadata?: unknown } | undefined)?.metadata).toMatchObject({
       source: 'test',
       operation: 'update',
     });

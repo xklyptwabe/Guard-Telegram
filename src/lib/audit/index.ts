@@ -28,4 +28,36 @@ export { AUDIT_EVENT_DEFINITIONS } from './definitions.js';
 export { AuditEventRegistry, auditEventRegistry } from './registry.js';
 export type { AuditEventDefinition, AuditRecord, AuditEventWriter } from './types.js';
 export { AuditEventProcessor, auditEventProcessor, type RaiseAuditEventInput } from './eventProcessor.js';
+export {
+  AUDIT_POLICY_PRIORITY_ORDER,
+  classifyAuditPolicyPriority,
+  selectAuditPolicyByPriority,
+  sortAuditPoliciesByPriority,
+  type AuditPolicyPriority,
+  type AuditPolicyPriorityCandidate,
+  type AuditPolicyPriorityMatch,
+  type AuditPolicyResolutionTarget,
+} from './policyPriority.js';
+export {
+  resolveEffectiveAuditPolicy,
+  resolveEffectiveAuditPolicyFromRows,
+  type AuditPolicyResolutionRow,
+  type AuditPolicyValueName,
+  type AuditPolicyValueSource,
+  type AuditPolicyValueSources,
+  type AuditPolicyValues,
+  type AuditSnapshotMode,
+  type EffectiveAuditPolicy,
+} from './policyResolution.js';
+export {
+  AuditPolicyOptimisticLockError,
+  ProtectedAuditPolicyDisableError,
+  updateAuditPolicyWithAudit,
+  updateAuditPolicyWithLock,
+  type AuditedPolicyUpdateResult,
+  type AuditPolicyPatch,
+  type UpdatedAuditPolicy,
+  type UpdateAuditPolicyWithAuditInput,
+  type UpdateAuditPolicyWithLockInput,
+} from './policyStore.js';
 export * from './shapes.js';

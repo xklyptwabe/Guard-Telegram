@@ -28,6 +28,7 @@ describe('audit persistence validation', () => {
         {
           before: undefined,
           after: { enabled: true },
+          snapshotData: { enabled: true, source: 'override' },
         },
         definition,
       ),
@@ -65,6 +66,15 @@ describe('audit persistence validation', () => {
             unlistedField: { before: 'old', after: 'new' },
           },
         },
+        snapshotData: {
+          chatId: 'chat-1',
+          userId: 'user-1',
+          moduleId: 'module-admin',
+          commandId: 'modules.enable',
+          argsRedacted: true,
+          durationMs: 15,
+          success: true,
+        },
       },
       definition,
     );
@@ -86,6 +96,82 @@ describe('audit persistence validation', () => {
     });
   });
 
+  it('normalizes entity snapshot data through the event schema and allowlist before persistence', () => {
+    const input = {
+      eventType: 'module.state.changed',
+      eventVersion: 'v1',
+      category: 'module',
+    };
+    const definition = requireAuditPersistenceDefinition(input);
+
+    const mutation = normalizeAuditMutationForPersistence(
+      input,
+      {
+        before: undefined,
+        after: { chatId: 'chat-1', moduleId: 'module-admin', enabled: true, source: 'override' },
+        snapshotData: {
+          chatId: 'chat-1',
+          moduleId: 'module-admin',
+          enabled: true,
+          source: 'override',
+          defaultEnabled: false,
+          token: 'must-not-persist',
+        } as never,
+      },
+      definition,
+    );
+
+    expect(mutation.snapshotData).toEqual({
+      chatId: 'chat-1',
+      moduleId: 'module-admin',
+      enabled: true,
+      source: 'override',
+    });
+  });
+
+  it('applies the runtime allowlist and masking to snapshots and changes before persistence', () => {
+    const input = {
+      eventType: 'message.deleted',
+      eventVersion: 'v1',
+      category: 'message',
+      auditPolicy: {
+        allowMessageTextLogging: true,
+        allowlist: ['chatId', 'messageId', 'text'],
+        masking: ['text'],
+      },
+    } as const;
+    const definition = requireAuditPersistenceDefinition(input);
+
+    const mutation = normalizeAuditMutationForPersistence(
+      input,
+      {
+        before: { chatId: 'chat-1', messageId: 'message-1', userId: 'user-1', text: 'before secret' },
+        after: { chatId: 'chat-1', messageId: 'message-2', userId: 'user-2', text: 'after secret' },
+        changes: {
+          status: 'computed',
+          fields: {
+            messageId: { before: 'message-1', after: 'message-2' },
+            userId: { before: 'user-1', after: 'user-2' },
+            text: { before: 'before secret', after: 'after secret' },
+          },
+        },
+        snapshotData: { chatId: 'chat-1', messageId: 'message-2', userId: 'user-2', text: 'after secret' },
+      },
+      definition,
+    );
+
+    expect(mutation.before).toEqual({ chatId: 'chat-1', messageId: 'message-1', text: '[redacted]' });
+    expect(mutation.after).toEqual({ chatId: 'chat-1', messageId: 'message-2', text: '[redacted]' });
+    expect(mutation.changes).toEqual({
+      status: 'computed',
+      fields: {
+        messageId: { before: 'message-1', after: 'message-2' },
+        text: { before: '[redacted]', after: '[redacted]' },
+      },
+    });
+    expect(mutation.snapshotData).toEqual({ chatId: 'chat-1', messageId: 'message-2', text: '[redacted]' });
+  });
+
   it('preserves unavailable ChangeSet status and reason while stripping forbidden nested values', () => {
     const input = {
       eventType: 'chat.settings.changed',
@@ -99,6 +185,7 @@ describe('audit persistence validation', () => {
       {
         before: undefined,
         after: { chatId: 'chat-1', locale: 'ru' },
+        snapshotData: { chatId: 'chat-1', locale: 'ru' },
         changes: {
           status: 'unavailable',
           reason: 'before_not_observed',

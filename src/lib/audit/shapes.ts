@@ -42,8 +42,20 @@ export const chatSettingsChangedSchema = z.object({
 export const auditPolicyChangedSchema = z.object({
   policyId: z.string().min(1),
   scope: z.string().min(1),
-  textLoggingEnabled: z.boolean(),
-  retentionDays: z.number().int().nonnegative(),
+  targetType: z.enum(['global', 'chat', 'event_type', 'module']),
+  chatId: z.string().min(1).optional(),
+  eventType: z.string().min(1).optional(),
+  eventVersion: z.string().min(1).optional(),
+  moduleId: z.string().min(1).optional(),
+  enabled: z.boolean().nullable(),
+  siteVisible: z.boolean().nullable(),
+  snapshotMode: z.enum(['metadata', 'snapshot']).nullable(),
+  allowlist: z.array(z.string().min(1)).nullable(),
+  masking: z.array(z.string().min(1)).nullable(),
+  retentionDays: z.number().int().nonnegative().nullable(),
+  severity: z.enum(['debug', 'info', 'notice', 'warning', 'critical']).nullable(),
+  exportAllowed: z.boolean().nullable(),
+  lockVersion: z.number().int().positive(),
 });
 
 export const memberStatusSchema = z.enum(['member', 'administrator', 'creator', 'restricted', 'left', 'kicked']);
@@ -117,6 +129,7 @@ export const auditRetentionCompletedSchema = z.object({
   jobId: z.string().min(1),
   deletedCount: z.number().int().nonnegative(),
   retentionDays: z.number().int().nonnegative(),
+  batchSize: z.number().int().positive(),
   startedAt: z.string(),
   finishedAt: z.string(),
 });

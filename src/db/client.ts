@@ -16,6 +16,31 @@ export interface DatabaseClient {
 }
 
 export function createDatabase(config: Pick<AppConfig, 'databaseUrl' | 'databaseTlsRejectUnauthorized' | 'databaseTlsCa' | 'databaseTlsCert' | 'databaseTlsKey'>): DatabaseClient {
+  return createDatabaseClient({
+    databaseUrl: config.databaseUrl,
+    databaseTlsRejectUnauthorized: config.databaseTlsRejectUnauthorized,
+    databaseTlsCa: config.databaseTlsCa,
+    databaseTlsCert: config.databaseTlsCert,
+    databaseTlsKey: config.databaseTlsKey,
+  });
+}
+
+export function createAuditRetentionDatabase(
+  config: Pick<AppConfig, 'auditRetentionDatabaseUrl' | 'databaseTlsRejectUnauthorized' | 'databaseTlsCa' | 'databaseTlsCert' | 'databaseTlsKey'>,
+): DatabaseClient {
+  if (config.auditRetentionDatabaseUrl === undefined) {
+    throw new Error('AUDIT_RETENTION_DATABASE_URL is required for the audit retention job.');
+  }
+  return createDatabaseClient({
+    databaseUrl: config.auditRetentionDatabaseUrl,
+    databaseTlsRejectUnauthorized: config.databaseTlsRejectUnauthorized,
+    databaseTlsCa: config.databaseTlsCa,
+    databaseTlsCert: config.databaseTlsCert,
+    databaseTlsKey: config.databaseTlsKey,
+  });
+}
+
+function createDatabaseClient(config: Pick<AppConfig, 'databaseUrl' | 'databaseTlsRejectUnauthorized' | 'databaseTlsCa' | 'databaseTlsCert' | 'databaseTlsKey'>): DatabaseClient {
   const pool = new Pool({
     connectionString: config.databaseUrl,
     ssl: {

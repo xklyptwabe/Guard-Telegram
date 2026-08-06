@@ -35,6 +35,7 @@ async function main(): Promise<void> {
 
   for (const definition of definitions) {
     const eventVersion = `v${definition.version}`;
+    const policyId = `global:event:${definition.name}:${eventVersion}`;
 
     const existingType = await database.db
       .select({ eventType: eventTypes.eventType })
@@ -73,8 +74,8 @@ async function main(): Promise<void> {
       // never touch `enabled` on a re-run.
       await database.db
         .insert(eventPolicies)
-        .values({ eventType: definition.name, eventVersion, required: true, enabled: true, updatedAt: new Date() })
-        .onConflictDoNothing({ target: [eventPolicies.eventType, eventPolicies.eventVersion] });
+        .values({ policyId, eventType: definition.name, eventVersion, required: true, enabled: true, updatedAt: new Date() })
+        .onConflictDoNothing({ target: eventPolicies.policyId });
     } else {
       // Not allowed to be disabled per the registry — (re-)assert
       // enabled:true on every run, even overriding a prior manual/stale
@@ -83,9 +84,9 @@ async function main(): Promise<void> {
       // manual edit; that's exactly the enforcement this seed exists for.
       await database.db
         .insert(eventPolicies)
-        .values({ eventType: definition.name, eventVersion, required: true, enabled: true, updatedAt: new Date() })
+        .values({ policyId, eventType: definition.name, eventVersion, required: true, enabled: true, updatedAt: new Date() })
         .onConflictDoUpdate({
-          target: [eventPolicies.eventType, eventPolicies.eventVersion],
+          target: eventPolicies.policyId,
           set: { enabled: true, updatedAt: new Date() },
         });
     }

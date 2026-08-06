@@ -20,6 +20,7 @@ export interface AuditPersistenceMutation {
   readonly beforeSnapshotStatus?: SnapshotStatus;
   readonly afterSnapshotStatus?: SnapshotStatus;
   readonly changes?: Record<string, unknown>;
+  readonly snapshotData: Record<string, unknown>;
 }
 
 export interface NormalizedAuditPersistenceMutation {
@@ -28,6 +29,7 @@ export interface NormalizedAuditPersistenceMutation {
   readonly beforeSnapshotStatus: SnapshotStatus;
   readonly afterSnapshotStatus: SnapshotStatus;
   readonly changes?: Record<string, unknown>;
+  readonly snapshotData: Record<string, unknown>;
 }
 
 export function requireAuditPersistenceDefinition(
@@ -59,6 +61,7 @@ export function normalizeAuditMutationForPersistence(
     beforeSnapshotStatus,
     afterSnapshotStatus,
     ...(mutation.changes === undefined ? {} : { changes: normalizeChanges(definition, policy, mutation.changes) }),
+    snapshotData: normalizeSnapshotData(definition, policy, mutation.snapshotData),
   };
 }
 
@@ -88,6 +91,19 @@ function normalizeSnapshotSide(
   return applyAllowlist(result.data as Record<string, unknown>, definition.allowlist, policy);
 }
 
+function normalizeSnapshotData(
+  definition: AuditEventDefinition<Record<string, unknown>>,
+  policy: AuditPolicyContext,
+  data: Record<string, unknown>,
+): Record<string, unknown> {
+  const schema = definition.sparseSnapshotSchema ?? definition.snapshotSchema;
+  const result = schema.safeParse(data);
+  if (!result.success) {
+    throw new AuditSnapshotValidationError(definition.name, 'snapshotData', result.error.message);
+  }
+  return applyAllowlist(result.data as Record<string, unknown>, definition.allowlist, policy);
+}
+
 function normalizeChanges(
   definition: AuditEventDefinition<Record<string, unknown>>,
   policy: AuditPolicyContext,
@@ -95,12 +111,13 @@ function normalizeChanges(
 ): Record<string, unknown> {
   const stripped = stripForbidden(changes);
   const allowedFields = allowedFieldNames(definition.allowlist, policy);
+  const maskedFields = new Set(policy.masking ?? []);
   const fields = stripped.fields;
   if (isRecord(fields)) {
-    return { ...stripped, fields: filterChangeFields(fields, allowedFields) };
+    return { ...stripped, fields: filterChangeFields(fields, allowedFields, maskedFields) };
   }
   if (typeof stripped.status === 'string') return stripped;
-  return filterChangeFields(stripped, allowedFields);
+  return filterChangeFields(stripped, allowedFields, maskedFields);
 }
 
 function allowedFieldNames(
@@ -108,10 +125,12 @@ function allowedFieldNames(
   policy: AuditPolicyContext,
 ): ReadonlySet<string> {
   const fields = new Set<string>();
+  const runtimeAllowlist = policy.allowlist === undefined ? undefined : new Set(policy.allowlist);
   for (const entry of allowlist) {
     const field = typeof entry === 'object' ? entry.field : entry;
     const allowed = typeof entry === 'object' ? entry.when(policy) : true;
-    if (allowed) fields.add(String(field));
+    const fieldName = String(field);
+    if (allowed && (runtimeAllowlist === undefined || runtimeAllowlist.has(fieldName))) fields.add(fieldName);
   }
   return fields;
 }
@@ -119,12 +138,27 @@ function allowedFieldNames(
 function filterChangeFields(
   fields: Record<string, unknown>,
   allowedFields: ReadonlySet<string>,
+  maskedFields: ReadonlySet<string>,
 ): Record<string, unknown> {
   const result: Record<string, unknown> = {};
   for (const [field, value] of Object.entries(fields)) {
-    if (allowedFields.has(field)) result[field] = value;
+    if (!allowedFields.has(field)) continue;
+    result[field] = maskedFields.has(field) ? maskFieldChange(value) : value;
   }
   return result;
+}
+
+function maskFieldChange(value: unknown): unknown {
+  if (!isRecord(value)) return '[redacted]';
+
+  const hasBefore = Object.hasOwn(value, 'before');
+  const hasAfter = Object.hasOwn(value, 'after');
+  if (!hasBefore && !hasAfter) return '[redacted]';
+
+  return {
+    ...(hasBefore ? { before: value.before === undefined ? undefined : '[redacted]' } : {}),
+    ...(hasAfter ? { after: value.after === undefined ? undefined : '[redacted]' } : {}),
+  };
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

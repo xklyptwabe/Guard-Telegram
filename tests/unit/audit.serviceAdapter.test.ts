@@ -54,7 +54,22 @@ describe('toDownstreamInput', () => {
       version: 1,
       operation: 'update',
       before: notApplicable(),
-      after: observed({ policyId: 'p1', scope: 'global', textLoggingEnabled: false, retentionDays: 90 }),
+      after: observed({
+        policyId: 'p1',
+        scope: 'global',
+        targetType: 'event_type',
+        eventType: 'message.deleted',
+        eventVersion: 'v1',
+        enabled: false,
+        siteVisible: false,
+        snapshotMode: 'metadata',
+        allowlist: ['chatId', 'messageId'],
+        masking: ['reason'],
+        retentionDays: 90,
+        severity: 'warning',
+        exportAllowed: false,
+        lockVersion: 2,
+      }),
     });
 
     const input = toDownstreamInput(record);
@@ -70,7 +85,21 @@ describe('toDownstreamInput', () => {
       version: 1,
       operation: 'update',
       before: notApplicable(),
-      after: observed({ policyId: 'p2', scope: 'chat-42', textLoggingEnabled: true, retentionDays: 30 }),
+      after: observed({
+        policyId: 'p2',
+        scope: 'chat-42',
+        targetType: 'chat',
+        chatId: 'chat-42',
+        enabled: true,
+        siteVisible: true,
+        snapshotMode: 'snapshot',
+        allowlist: ['chatId'],
+        masking: [],
+        retentionDays: 30,
+        severity: 'info',
+        exportAllowed: true,
+        lockVersion: 3,
+      }),
     });
 
     expect(tenantIdFor(record)).toBe('chat-42');
@@ -237,7 +266,22 @@ function fixtureAfterFor(name: (typeof AUDIT_EVENT_NAMES)[number]): Record<strin
     case 'chat.settings.changed':
       return { chatId: 'chat-1', locale: 'ru' };
     case 'audit.policy.changed':
-      return { policyId: 'policy-1', scope: 'global', textLoggingEnabled: false, retentionDays: 90 };
+      return {
+        policyId: 'policy-1',
+        scope: 'global',
+        targetType: 'event_type',
+        eventType: 'message.deleted',
+        eventVersion: 'v1',
+        enabled: false,
+        siteVisible: false,
+        snapshotMode: 'metadata',
+        allowlist: ['chatId', 'messageId'],
+        masking: ['text'],
+        retentionDays: 90,
+        severity: 'warning',
+        exportAllowed: false,
+        lockVersion: 2,
+      };
     case 'member.status.changed':
       return { chatId: 'chat-1', userId: 'user-1', status: 'member' };
     case 'bot.membership.changed':
@@ -255,7 +299,14 @@ function fixtureAfterFor(name: (typeof AUDIT_EVENT_NAMES)[number]): Record<strin
     case 'audit.exported':
       return { exportId: 'export-1', requestedBy: 'admin-1', format: 'json', rangeFrom: '2026-08-01T00:00:00.000Z', rangeTo: '2026-08-04T00:00:00.000Z', rowCount: 1 };
     case 'audit.retention.completed':
-      return { jobId: 'job-1', deletedCount: 1, retentionDays: 90, startedAt: '2026-08-04T00:00:00.000Z', finishedAt: '2026-08-04T00:01:00.000Z' };
+      return {
+        jobId: 'job-1',
+        deletedCount: 1,
+        retentionDays: 90,
+        batchSize: 500,
+        startedAt: '2026-08-04T00:00:00.000Z',
+        finishedAt: '2026-08-04T00:01:00.000Z',
+      };
   }
 }
 

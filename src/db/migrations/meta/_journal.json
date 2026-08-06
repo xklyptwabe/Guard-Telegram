@@ -50,6 +50,48 @@
       "when": 1785853000000,
       "tag": "0006_enforce_audit_policy_event_type_fk",
       "breakpoints": true
+    },
+    {
+      "idx": 7,
+      "version": "7",
+      "when": 1786020000000,
+      "tag": "0007_extend_audit_event_policies",
+      "breakpoints": true
+    },
+    {
+      "idx": 8,
+      "version": "7",
+      "when": 1786021000000,
+      "tag": "0008_add_audit_policy_lock_version",
+      "breakpoints": true
+    },
+    {
+      "idx": 9,
+      "version": "7",
+      "when": 1786022000000,
+      "tag": "0009_grant_audit_retention_role",
+      "breakpoints": true
+    },
+    {
+      "idx": 10,
+      "version": "7",
+      "when": 1786023000000,
+      "tag": "0010_index_audit_retention_candidates",
+      "breakpoints": true
+    },
+    {
+      "idx": 11,
+      "version": "7",
+      "when": 1786024000000,
+      "tag": "0011_grant_audit_application_updates",
+      "breakpoints": true
+    },
+    {
+      "idx": 12,
+      "version": "7",
+      "when": 1786025000000,
+      "tag": "0012_ensure_audit_retention_role",
+      "breakpoints": true
     }
   ]
 }
