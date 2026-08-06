@@ -73,4 +73,16 @@ describe('audit migrations', () => {
     expect(sql).toContain('REVOKE UPDATE, DELETE ON audit.events FROM telegram_bot');
     expect(sql).not.toMatch(/GRANT\s+UPDATE(?:\s*\([^)]*\))?\s+ON\s+audit\.events/i);
   });
+
+  it('provisions the limited audit retention role without storing login credentials', () => {
+    const sql = readFileSync('src/db/migrations/0012_ensure_audit_retention_role.sql', 'utf8');
+
+    expect(sql).toContain('CREATE ROLE audit_retention');
+    expect(sql).toContain('NOLOGIN');
+    expect(sql).toContain('GRANT SELECT, INSERT, DELETE ON audit.events TO audit_retention');
+    expect(sql).toContain('GRANT SELECT, INSERT, UPDATE ON audit.entity_snapshots TO audit_retention');
+    expect(sql).toContain('REVOKE UPDATE ON audit.events FROM audit_retention');
+    expect(sql).toContain('REVOKE INSERT, UPDATE, DELETE ON audit.event_policies FROM audit_retention');
+    expect(sql).not.toMatch(/PASSWORD/i);
+  });
 });
