@@ -60,4 +60,17 @@ describe('audit migrations', () => {
     expect(sql).toContain('ON "audit"."events" ("occurred_at" ASC, "id" ASC)');
     expect(sql).toContain('WHERE "metadata" #>> \'{auditPolicy,values,retentionDays}\' ~ \'^[0-9]+$\'');
   });
+
+  it('grants the application only the audit updates required by policy and snapshot services', () => {
+    const sql = readFileSync('src/db/migrations/0011_grant_audit_application_updates.sql', 'utf8');
+
+    expect(sql).toContain("rolname = 'telegram_bot'");
+    expect(sql).toContain('ON audit.entity_snapshots TO telegram_bot');
+    expect(sql).toContain('snapshot_status');
+    expect(sql).toContain('last_subject_sequence');
+    expect(sql).toContain('ON audit.event_policies TO telegram_bot');
+    expect(sql).toContain('lock_version');
+    expect(sql).toContain('REVOKE UPDATE, DELETE ON audit.events FROM telegram_bot');
+    expect(sql).not.toMatch(/GRANT\s+UPDATE(?:\s*\([^)]*\))?\s+ON\s+audit\.events/i);
+  });
 });
