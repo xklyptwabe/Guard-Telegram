@@ -4,11 +4,19 @@ import type { DrizzleDatabase } from '../../db/client.js';
 import { eventPolicies } from '../../db/schema/audit.js';
 import type { EventSeverity } from './enums.js';
 import type { AuditSnapshotMode } from './policyResolution.js';
+import { auditEventRegistry } from './registry.js';
 
 export class AuditPolicyOptimisticLockError extends Error {
   public constructor(policyId: string, expectedLockVersion: number) {
     super(`Audit policy ${policyId} was not at lock version ${expectedLockVersion}.`);
     this.name = 'AuditPolicyOptimisticLockError';
+  }
+}
+
+export class ProtectedAuditPolicyDisableError extends Error {
+  public constructor(eventType: string, eventVersion: string) {
+    super(`Audit event ${eventType}@${eventVersion} cannot be disabled.`);
+    this.name = 'ProtectedAuditPolicyDisableError';
   }
 }
 
@@ -35,12 +43,16 @@ export interface UpdatedAuditPolicy {
   readonly updatedAt: Date;
 }
 
-type AuditPolicyWriter = Pick<DrizzleDatabase, 'update'>;
+type AuditPolicyWriter = Pick<DrizzleDatabase, 'select' | 'update'>;
 
 export async function updateAuditPolicyWithLock(
   db: AuditPolicyWriter,
   input: UpdateAuditPolicyWithLockInput,
 ): Promise<UpdatedAuditPolicy> {
+  if (input.patch.enabled === false) {
+    await assertPolicyCanBeDisabled(db, input.policyId);
+  }
+
   const set = policyPatchToUpdateSet(input.patch);
   const updatedAt = new Date();
   const rows = await db
@@ -62,6 +74,27 @@ export async function updateAuditPolicyWithLock(
     throw new AuditPolicyOptimisticLockError(input.policyId, input.expectedLockVersion);
   }
   return row;
+}
+
+async function assertPolicyCanBeDisabled(db: Pick<DrizzleDatabase, 'select'>, policyId: string): Promise<void> {
+  const rows = await db
+    .select({ eventType: eventPolicies.eventType, eventVersion: eventPolicies.eventVersion })
+    .from(eventPolicies)
+    .where(eq(eventPolicies.policyId, policyId))
+    .limit(1);
+  const row = rows[0];
+  if (row === undefined || row.eventType === null || row.eventVersion === null) return;
+
+  const definition = auditEventRegistry.requireSupportedVersion(row.eventType, parseEventVersion(row.eventVersion));
+  if (!definition.canBeDisabled) {
+    throw new ProtectedAuditPolicyDisableError(row.eventType, row.eventVersion);
+  }
+}
+
+function parseEventVersion(eventVersion: string): number {
+  const match = /^v(\d+)$/.exec(eventVersion);
+  if (!match) throw new Error(`Audit event version must use v<number> format, received "${eventVersion}"`);
+  return Number(match[1]);
 }
 
 function policyPatchToUpdateSet(patch: AuditPolicyPatch): Partial<typeof eventPolicies.$inferInsert> {

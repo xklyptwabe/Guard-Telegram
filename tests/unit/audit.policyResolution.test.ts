@@ -70,6 +70,21 @@ describe('audit policy resolution', () => {
       values: { enabled: false },
     });
   });
+
+  it('keeps protected events enabled even when a broad policy disables events', () => {
+    const policy = resolveEffectiveAuditPolicyFromRows(
+      [row('global', { enabled: false })],
+      {
+        chatId: 'chat-1',
+        eventType: 'module.state.changed',
+        eventVersion: 'v1',
+        moduleId: 'module-admin',
+      },
+    );
+
+    expect(policy.values.enabled).toBe(true);
+    expect(policy.sources.enabled).toEqual({ value: true, source: 'protected_event' });
+  });
 });
 
 function row(policyId: string, values: Partial<AuditPolicyResolutionRow>): AuditPolicyResolutionRow {

@@ -34,7 +34,7 @@ export interface AuditPolicyValues {
 
 export interface AuditPolicyValueSource<TValue> {
   readonly value: TValue;
-  readonly source: 'default' | 'policy';
+  readonly source: 'default' | 'policy' | 'protected_event';
   readonly policyId?: string;
   readonly priority?: AuditPolicyPriority;
 }
@@ -100,7 +100,8 @@ export function resolveEffectiveAuditPolicyFromRows(
   rows: readonly AuditPolicyResolutionRow[],
   target: AuditPolicyResolutionTarget,
 ): EffectiveAuditPolicy {
-  const defaults = defaultPolicyValues(target);
+  const definition = auditEventRegistry.requireSupportedVersion(target.eventType, parseEventVersion(target.eventVersion));
+  const defaults = defaultPolicyValues(definition);
   const values: MutableAuditPolicyValues = { ...defaults };
   const sources: MutableAuditPolicyValueSources = defaultPolicySources(defaults);
   const matches = sortAuditPoliciesByPriority(rows, target);
@@ -114,6 +115,11 @@ export function resolveEffectiveAuditPolicyFromRows(
   applyPolicyValue('severity', values, sources, matches);
   applyPolicyValue('exportAllowed', values, sources, matches);
 
+  if (!definition.canBeDisabled && values.enabled === false && sources.enabled.source === 'policy') {
+    values.enabled = true;
+    sources.enabled = { value: true, source: 'protected_event' };
+  }
+
   return {
     eventType: target.eventType,
     eventVersion: target.eventVersion,
@@ -122,8 +128,7 @@ export function resolveEffectiveAuditPolicyFromRows(
   };
 }
 
-function defaultPolicyValues(target: AuditPolicyResolutionTarget): AuditPolicyValues {
-  const definition = auditEventRegistry.requireSupportedVersion(target.eventType, parseEventVersion(target.eventVersion));
+function defaultPolicyValues(definition: ReturnType<typeof auditEventRegistry.requireByName>): AuditPolicyValues {
   return {
     enabled: false,
     siteVisible: definition.siteVisible,

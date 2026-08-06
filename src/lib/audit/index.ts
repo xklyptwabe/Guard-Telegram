@@ -51,6 +51,7 @@ export {
 } from './policyResolution.js';
 export {
   AuditPolicyOptimisticLockError,
+  ProtectedAuditPolicyDisableError,
   updateAuditPolicyWithLock,
   type AuditPolicyPatch,
   type UpdatedAuditPolicy,

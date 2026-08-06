@@ -31,4 +31,13 @@ describe('audit migrations', () => {
 
     expect(sql).toContain('ADD COLUMN IF NOT EXISTS "lock_version" integer DEFAULT 1 NOT NULL');
   });
+
+  it('keeps protected event disable enforcement compatible with scoped policies', () => {
+    const sql = readFileSync('src/db/migrations/0007_extend_audit_event_policies.sql', 'utf8');
+
+    expect(sql).toContain('IF NEW."enabled" IS DISTINCT FROM false THEN');
+    expect(sql).toContain('IF NEW."event_type" IS NULL THEN');
+    expect(sql).toContain("RAISE EXCEPTION 'Audit event %.% cannot be disabled'");
+    expect(sql).toContain("USING ERRCODE = '23514'");
+  });
 });
