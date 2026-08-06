@@ -64,6 +64,13 @@
       "when": 1786021000000,
       "tag": "0008_add_audit_policy_lock_version",
       "breakpoints": true
+    },
+    {
+      "idx": 9,
+      "version": "7",
+      "when": 1786022000000,
+      "tag": "0009_grant_audit_retention_role",
+      "breakpoints": true
     }
   ]
 }

@@ -40,4 +40,14 @@ describe('audit migrations', () => {
     expect(sql).toContain("RAISE EXCEPTION 'Audit event %.% cannot be disabled'");
     expect(sql).toContain("USING ERRCODE = '23514'");
   });
+
+  it('grants only narrow audit retention permissions when the role exists', () => {
+    const sql = readFileSync('src/db/migrations/0009_grant_audit_retention_role.sql', 'utf8');
+
+    expect(sql).toContain("rolname = 'audit_retention'");
+    expect(sql).toContain('GRANT SELECT, DELETE ON audit.events TO audit_retention');
+    expect(sql).toContain('GRANT SELECT, DELETE ON audit.outbox TO audit_retention');
+    expect(sql).toContain('REVOKE INSERT, UPDATE ON audit.events FROM audit_retention');
+    expect(sql).toContain('REVOKE INSERT, UPDATE, DELETE ON audit.event_policies FROM audit_retention');
+  });
 });

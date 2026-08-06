@@ -34,4 +34,13 @@ describe('validateConfig', () => {
     expect(config.redisUsername).toBe('default');
     expect(redisConnectionOptions(config)).toMatchObject({ username: 'default', password: 'redis-password' });
   });
+
+  it('accepts a dedicated audit retention PostgreSQL URL', () => {
+    const config = validateConfig({
+      ...baseEnv,
+      AUDIT_RETENTION_DATABASE_URL: 'postgres://audit_retention:password@db.example.internal:5432/telegram',
+    });
+
+    expect(config.auditRetentionDatabaseUrl).toBe('postgres://audit_retention:password@db.example.internal:5432/telegram');
+  });
 });
