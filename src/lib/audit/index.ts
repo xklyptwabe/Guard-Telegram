@@ -49,4 +49,11 @@ export {
   type AuditSnapshotMode,
   type EffectiveAuditPolicy,
 } from './policyResolution.js';
+export {
+  AuditPolicyOptimisticLockError,
+  updateAuditPolicyWithLock,
+  type AuditPolicyPatch,
+  type UpdatedAuditPolicy,
+  type UpdateAuditPolicyWithLockInput,
+} from './policyStore.js';
 export * from './shapes.js';

@@ -25,4 +25,10 @@ describe('audit migrations', () => {
     expect(sql).toContain('ADD CONSTRAINT "event_policies_policy_id_pk" PRIMARY KEY ("policy_id")');
     expect(sql).toContain('CREATE UNIQUE INDEX IF NOT EXISTS "event_policies_selector_unique_idx"');
   });
+
+  it('adds lock versions for optimistic audit policy updates', () => {
+    const sql = readFileSync('src/db/migrations/0008_add_audit_policy_lock_version.sql', 'utf8');
+
+    expect(sql).toContain('ADD COLUMN IF NOT EXISTS "lock_version" integer DEFAULT 1 NOT NULL');
+  });
 });

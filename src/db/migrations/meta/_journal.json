@@ -57,6 +57,13 @@
       "when": 1786020000000,
       "tag": "0007_extend_audit_event_policies",
       "breakpoints": true
+    },
+    {
+      "idx": 8,
+      "version": "7",
+      "when": 1786021000000,
+      "tag": "0008_add_audit_policy_lock_version",
+      "breakpoints": true
     }
   ]
 }

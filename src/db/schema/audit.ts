@@ -48,6 +48,7 @@ export const eventPolicies = auditSchema.table(
     masking: jsonb('masking'),
     severity: text('severity', { enum: ['debug', 'info', 'notice', 'warning', 'critical'] }),
     exportAllowed: boolean('export_allowed'),
+    lockVersion: integer('lock_version').notNull().default(1),
     createdAt: createdAt(),
     updatedAt: updatedAt(),
   },
