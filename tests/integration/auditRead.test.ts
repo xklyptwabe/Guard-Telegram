@@ -5,6 +5,7 @@ import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { validateConfig } from '../../src/config.js';
 import { createDatabase, type DatabaseClient } from '../../src/db/client.js';
 import { listAuditEvents } from '../../src/lib/audit/eventReadRepository.js';
+import { PLATFORM_TENANT_SENTINEL } from '../../src/lib/audit/serviceAdapter.js';
 
 const testDatabaseUrl = process.env.TEST_DATABASE_URL;
 let database: DatabaseClient | undefined;
@@ -74,5 +75,47 @@ describe.skipIf(!testDatabaseUrl)('Audit read integration', () => {
       'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa',
     ]);
     expect(new Set(pageIds).size).toBe(pageIds.length);
+  });
+
+  it('keeps platform audit hidden from non-system principals', async () => {
+    const rollback = new Error('rollback platform audit read test');
+    let nonSystemIds: readonly string[] = [];
+    let systemIds: readonly string[] = [];
+
+    try {
+      await database!.db.transaction(async (tx) => {
+        await tx.execute(sql`
+          INSERT INTO audit.events (
+            id, event_type, event_version, category, occurred_at, source, status,
+            tenant_id, subject_type, subject_id, idempotency_key,
+            before_snapshot_status, after_snapshot_status
+          ) VALUES (
+            'eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee', 'audit.retention.completed', 'v1', 'audit',
+            '2026-08-07 11:00:00+00'::timestamptz, 'audit-read-platform-test', 'recorded',
+            ${PLATFORM_TENANT_SENTINEL}, 'retention_job', 'job-1', 'audit-read-platform-event',
+            'not_applicable', 'observed'
+          )
+        `);
+
+        const filters = { source: 'audit-read-platform-test' } as const;
+        const nonSystemPage = await listAuditEvents(tx, {
+          scope: { systemAdmin: false, allowedChatIds: [PLATFORM_TENANT_SENTINEL] },
+          filters,
+        });
+        const systemPage = await listAuditEvents(tx, {
+          scope: { systemAdmin: true, allowedChatIds: [] },
+          filters,
+        });
+        nonSystemIds = nonSystemPage.items.map((event) => event.id);
+        systemIds = systemPage.items.map((event) => event.id);
+
+        throw rollback;
+      });
+    } catch (error: unknown) {
+      if (error !== rollback) throw error;
+    }
+
+    expect(nonSystemIds).toEqual([]);
+    expect(systemIds).toEqual(['eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee']);
   });
 });

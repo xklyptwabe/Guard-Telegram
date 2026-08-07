@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 
 import {
   authenticateBackendApiPrincipal,
+  backendApiPrincipalConfigSchema,
   canAccessBackendApiChat,
   canAccessGlobalAudit,
   hasBackendApiPermission,
@@ -62,6 +63,30 @@ describe('backend API access control', () => {
     expect(canAccessBackendApiChat(principal, 'chat-1')).toBe(true);
     expect(canAccessBackendApiChat(principal, 'chat-2')).toBe(false);
     expect(canAccessGlobalAudit(principal)).toBe(false);
+  });
+
+  it('rejects the platform tenant for non-system principals even when it is explicitly allowed', () => {
+    const principal = {
+      actorId: 'reader',
+      permissions: ['audit.events.read'] as const,
+      allowedChatIds: ['__platform__'],
+      systemAdmin: false,
+    };
+
+    expect(canAccessBackendApiChat(principal, '__platform__')).toBe(false);
+    expect(() =>
+      backendApiPrincipalConfigSchema.parse({
+        token: 'platform-token-123456',
+        ...principal,
+      }),
+    ).toThrow(/reserved for system administrators/);
+    expect(
+      backendApiPrincipalConfigSchema.safeParse({
+        token: 'platform-admin-token-123456',
+        ...principal,
+        systemAdmin: true,
+      }).success,
+    ).toBe(true);
   });
 
   it('allows global audit access only for system administrators', () => {

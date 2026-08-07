@@ -2,6 +2,8 @@ import { timingSafeEqual } from 'node:crypto';
 
 import { z } from 'zod';
 
+import { PLATFORM_TENANT_SENTINEL } from '../lib/audit/serviceAdapter.js';
+
 export const backendApiPermissionSchema = z.enum([
   'audit.events.read',
   'audit.policies.manage',
@@ -10,13 +12,23 @@ export const backendApiPermissionSchema = z.enum([
 
 export type BackendApiPermission = z.infer<typeof backendApiPermissionSchema>;
 
-export const backendApiPrincipalConfigSchema = z.object({
-  token: z.string().min(16).max(512).regex(/^[A-Za-z0-9._~+/-]+=*$/),
-  actorId: z.string().trim().min(1).max(128),
-  permissions: z.array(backendApiPermissionSchema).default([]),
-  allowedChatIds: z.array(z.string().trim().min(1).max(128)).default([]),
-  systemAdmin: z.boolean().default(false),
-});
+export const backendApiPrincipalConfigSchema = z
+  .object({
+    token: z.string().min(16).max(512).regex(/^[A-Za-z0-9._~+/-]+=*$/),
+    actorId: z.string().trim().min(1).max(128),
+    permissions: z.array(backendApiPermissionSchema).default([]),
+    allowedChatIds: z.array(z.string().trim().min(1).max(128)).default([]),
+    systemAdmin: z.boolean().default(false),
+  })
+  .superRefine((principal, context) => {
+    if (!principal.systemAdmin && principal.allowedChatIds.includes(PLATFORM_TENANT_SENTINEL)) {
+      context.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['allowedChatIds'],
+        message: 'Platform audit tenant is reserved for system administrators.',
+      });
+    }
+  });
 
 export type BackendApiPrincipalConfig = z.infer<typeof backendApiPrincipalConfigSchema>;
 
@@ -51,7 +63,10 @@ export function hasBackendApiPermission(
 }
 
 export function canAccessBackendApiChat(principal: BackendApiPrincipal, chatId: string): boolean {
-  return principal.systemAdmin || principal.allowedChatIds.includes(chatId);
+  return (
+    principal.systemAdmin ||
+    (chatId !== PLATFORM_TENANT_SENTINEL && principal.allowedChatIds.includes(chatId))
+  );
 }
 
 export function canAccessGlobalAudit(principal: BackendApiPrincipal): boolean {

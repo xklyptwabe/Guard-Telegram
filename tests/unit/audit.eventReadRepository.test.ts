@@ -91,6 +91,24 @@ describe('audit event read repository', () => {
     expect(query.sql).toContain('where FALSE');
   });
 
+  it('does not treat the platform tenant as an allowed chat for non-system principals', () => {
+    const listQuery = buildAuditEventsListQuery(db, {
+      scope: { systemAdmin: false, allowedChatIds: ['__platform__'] },
+    }).toSQL();
+    const eventQuery = buildAuditEventByIdQuery(db, {
+      id: 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa',
+      scope: { systemAdmin: false, allowedChatIds: ['__platform__'] },
+    }).toSQL();
+    const policyQuery = buildAuditPoliciesListQuery(db, {
+      systemAdmin: false,
+      allowedChatIds: ['__platform__'],
+    }).toSQL();
+
+    expect(listQuery.sql).toContain('where FALSE');
+    expect(eventQuery.sql).toContain('and FALSE');
+    expect(policyQuery.sql).toContain('where FALSE');
+  });
+
   it('does not restrict tenant scope for system administrators unless a chat filter is requested', () => {
     const query = buildAuditEventsListQuery(
       db,

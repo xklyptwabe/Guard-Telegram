@@ -3,6 +3,7 @@ import { and, asc, desc, eq, gte, inArray, lte, or, sql, type SQL, type SQLWrapp
 import type { DrizzleDatabase } from '../../db/client.js';
 import { eventPolicies, events, eventTypes } from '../../db/schema/audit.js';
 import type { EventCategory } from './enums.js';
+import { PLATFORM_TENANT_SENTINEL } from './serviceAdapter.js';
 
 export const AUDIT_EVENTS_DEFAULT_LIMIT = 50;
 export const AUDIT_EVENTS_MAX_LIMIT = 100;
@@ -332,16 +333,20 @@ function auditEventScopeConditions(scope: AuditEventsReadScope, requestedChatIds
 
 function auditPolicyScopeConditions(scope: AuditEventsReadScope): SQL[] {
   if (scope.systemAdmin) return [];
-  const chatIds = uniqueNonEmpty(scope.allowedChatIds);
+  const chatIds = nonPlatformChatIds(scope.allowedChatIds);
   return [chatIds.length === 0 ? sql`FALSE` : oneOrMany(eventPolicies.chatId, chatIds)];
 }
 
 function scopedAuditChatIds(scope: AuditEventsReadScope, requestedChatIds: readonly string[] | undefined): readonly string[] | undefined {
   const requested = requestedChatIds === undefined ? undefined : uniqueNonEmpty(requestedChatIds);
   if (scope.systemAdmin) return requested;
-  const allowed = new Set(uniqueNonEmpty(scope.allowedChatIds));
+  const allowed = new Set(nonPlatformChatIds(scope.allowedChatIds));
   if (requested !== undefined) return requested.filter((chatId) => allowed.has(chatId));
   return [...allowed];
+}
+
+function nonPlatformChatIds(chatIds: readonly string[]): readonly string[] {
+  return uniqueNonEmpty(chatIds).filter((chatId) => chatId !== PLATFORM_TENANT_SENTINEL);
 }
 
 type AuditEventTextColumn =

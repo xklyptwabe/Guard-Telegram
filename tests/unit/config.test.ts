@@ -95,4 +95,22 @@ describe('validateConfig', () => {
       }),
     ).toThrow(/duplicate token/);
   });
+
+  it('rejects the reserved platform tenant for a non-system backend principal', () => {
+    expect(() =>
+      validateConfig({
+        ...baseEnv,
+        BACKEND_API_ENABLED: 'true',
+        BACKEND_API_TOKENS: JSON.stringify([
+          {
+            token: 'platform-token-123456',
+            actorId: 'operator-1',
+            permissions: ['audit.events.read'],
+            allowedChatIds: ['__platform__'],
+            systemAdmin: false,
+          },
+        ]),
+      }),
+    ).toThrow(/reserved for system administrators/);
+  });
 });

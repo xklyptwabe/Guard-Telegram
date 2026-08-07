@@ -132,6 +132,7 @@ const configSchema = z
         context.addIssue({ code: z.ZodIssueCode.custom, path: ['rabbitMqUrl'], message: 'RabbitMQ requires an amqps:// URL when enabled' });
       }
     }
+    if (!Array.isArray(config.backendApiPrincipals)) return;
     if (config.backendApiEnabled && config.backendApiPrincipals.length === 0) {
       context.addIssue({ code: z.ZodIssueCode.custom, path: ['backendApiPrincipals'], message: 'BACKEND_API_TOKENS is required when BACKEND_API_ENABLED=true' });
     }
