@@ -168,10 +168,30 @@ export async function updateAuditPolicyWithAudit(
   }
 
   if (updatedPolicy === undefined) {
-    return { policyId: input.policyId, lockVersion: auditResult.subjectSequence, updatedAt: new Date(0), auditEventId: auditResult.eventId, duplicate: true };
+    const currentPolicy = await selectPolicyUpdateResult(db, input.policyId, input.expectedLockVersion);
+    return { ...currentPolicy, auditEventId: auditResult.eventId, duplicate: true };
   }
 
   return { ...updatedPolicy, auditEventId: auditResult.eventId, duplicate: auditResult.duplicate };
+}
+
+async function selectPolicyUpdateResult(
+  db: Pick<DrizzleDatabase, 'select'>,
+  policyId: string,
+  expectedLockVersion: number,
+): Promise<UpdatedAuditPolicy> {
+  const rows = await db
+    .select({
+      policyId: eventPolicies.policyId,
+      lockVersion: eventPolicies.lockVersion,
+      updatedAt: eventPolicies.updatedAt,
+    })
+    .from(eventPolicies)
+    .where(eq(eventPolicies.policyId, policyId))
+    .limit(1);
+  const policy = rows[0];
+  if (policy === undefined) throw new AuditPolicyOptimisticLockError(policyId, expectedLockVersion);
+  return policy;
 }
 
 async function selectPolicyTenantId(

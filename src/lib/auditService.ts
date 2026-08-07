@@ -51,6 +51,13 @@ export type AuditMutationResult<TSnapshot extends Record<string, unknown>> = Aud
 
 type AuditTransaction = Pick<DrizzleDatabase, 'select' | 'insert' | 'update' | 'delete' | 'execute'>;
 
+export class AuditIdempotencyConflictError extends Error {
+  public constructor() {
+    super('Audit idempotency key is already associated with another operation.');
+    this.name = 'AuditIdempotencyConflictError';
+  }
+}
+
 export class AuditService {
   public constructor(private readonly db: DrizzleDatabase) {}
 
@@ -62,12 +69,28 @@ export class AuditService {
     const auditDefinition = requireAuditPersistenceDefinition(input);
     return this.db.transaction(async (tx) => {
       const existing = await tx
-        .select({ id: events.id, subjectSequence: events.subjectSequence })
+        .select({
+          id: events.id,
+          subjectSequence: events.subjectSequence,
+          tenantId: events.tenantId,
+          eventType: events.eventType,
+          eventVersion: events.eventVersion,
+          category: events.category,
+          source: events.source,
+          actorId: events.actorId,
+          actorType: events.actorType,
+          subjectType: events.subjectType,
+          subjectId: events.subjectId,
+        })
         .from(events)
         .where(eq(events.idempotencyKey, input.idempotencyKey))
         .limit(1);
-      if (existing[0]) {
-        return { eventId: existing[0].id, subjectSequence: existing[0].subjectSequence, duplicate: true };
+      const existingEvent = existing[0];
+      if (existingEvent !== undefined) {
+        if (!sameIdempotentOperation(existingEvent, input)) {
+          throw new AuditIdempotencyConflictError();
+        }
+        return { eventId: existingEvent.id, subjectSequence: existingEvent.subjectSequence, duplicate: true };
       }
 
       const effectivePolicy = await resolveEffectiveAuditPolicy(tx, {
@@ -188,6 +211,33 @@ export class AuditService {
       return { eventId: eventRow.id, subjectSequence: eventRow.subjectSequence, duplicate: false };
     });
   }
+}
+
+function sameIdempotentOperation(
+  existing: {
+    readonly tenantId: string;
+    readonly eventType: string;
+    readonly eventVersion: string;
+    readonly category: string;
+    readonly source: string;
+    readonly actorId: string | null;
+    readonly actorType: string | null;
+    readonly subjectType: string;
+    readonly subjectId: string;
+  },
+  input: AuditEventInput,
+): boolean {
+  return (
+    existing.tenantId === input.tenantId &&
+    existing.eventType === input.eventType &&
+    existing.eventVersion === input.eventVersion &&
+    existing.category === input.category &&
+    existing.source === input.source &&
+    existing.actorId === (input.actorId ?? null) &&
+    existing.actorType === (input.actorType ?? null) &&
+    existing.subjectType === input.subjectType &&
+    existing.subjectId === input.subjectId
+  );
 }
 
 function buildPersistencePolicy(

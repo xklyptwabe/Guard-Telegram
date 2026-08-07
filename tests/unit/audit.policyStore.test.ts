@@ -133,6 +133,37 @@ describe('audit policy store optimistic locking', () => {
     });
   });
 
+  it('returns the policy lock version instead of the audit subject sequence for a duplicate', async () => {
+    const updatedAt = new Date('2026-08-06T10:05:00.000Z');
+    const db = fakePolicyDb({
+      selectedPolicy: {
+        policyId: 'chat:chat-42:event:message.deleted:v1',
+        chatId: 'chat-42',
+        lockVersion: 3,
+        updatedAt,
+      },
+      updatedRows: [],
+    });
+    const audit = {
+      recordEntityChange: async () => ({ eventId: 'event-1', subjectSequence: 99, duplicate: true }),
+    };
+
+    await expect(
+      updateAuditPolicyWithAudit(db as never, audit as unknown as AuditService, {
+        policyId: 'chat:chat-42:event:message.deleted:v1',
+        expectedLockVersion: 2,
+        patch: { retentionDays: 90 },
+        idempotencyKey: 'audit-policy-change-duplicate',
+      }),
+    ).resolves.toMatchObject({
+      policyId: 'chat:chat-42:event:message.deleted:v1',
+      lockVersion: 3,
+      updatedAt,
+      auditEventId: 'event-1',
+      duplicate: true,
+    });
+  });
+
   it('records rejected protected-setting attempts without updating the policy row', async () => {
     const updatedAt = new Date('2026-08-06T10:00:00.000Z');
     const tx = fakePolicyDb({

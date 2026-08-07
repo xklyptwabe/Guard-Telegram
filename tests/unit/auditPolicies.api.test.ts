@@ -48,11 +48,43 @@ describe('audit policy write API', () => {
     expect(audit.calls.input).toMatchObject({
       actorId: 'operator-1',
       eventType: 'audit.policy.changed',
-      idempotencyKey: 'backend-api-policy-update-1',
       subjectId: 'chat:chat-1:event:message.deleted:v1',
       tenantId: 'chat-1',
     });
+    const auditInput = audit.calls.input as { readonly idempotencyKey: string };
+    expect(auditInput.idempotencyKey).toMatch(/^backend-api:audit-policy:[A-Za-z0-9_-]{43}$/);
+    expect(auditInput.idempotencyKey).not.toContain('backend-api-policy-update-1');
     expect(tx.calls.set).toMatchObject({ enabled: false, retentionDays: 90 });
+  });
+
+  it('does not reuse a client idempotency key for a different policy operation', async () => {
+    const firstAudit = fakeAuditService(fakePolicyTx());
+    const secondAudit = fakeAuditService(fakePolicyTx());
+
+    await handleAuditPolicyWriteRequest(
+      'PATCH',
+      url('/api/v1/audit/policies/chat%3Achat-1%3Aevent%3Amessage.deleted%3Av1'),
+      { expectedLockVersion: 2, idempotencyKey: 'shared-client-key', enabled: false },
+      managerPrincipal,
+      {
+        db: fakePolicyApiDb({ policies: [policyRow()] }) as never,
+        audit: firstAudit as unknown as AuditService,
+      },
+    );
+    await handleAuditPolicyWriteRequest(
+      'PATCH',
+      url('/api/v1/audit/policies/chat%3Achat-1%3Aevent%3Amessage.deleted%3Av1'),
+      { expectedLockVersion: 2, idempotencyKey: 'shared-client-key', retentionDays: 30 },
+      managerPrincipal,
+      {
+        db: fakePolicyApiDb({ policies: [policyRow()] }) as never,
+        audit: secondAudit as unknown as AuditService,
+      },
+    );
+
+    const firstInput = firstAudit.calls.input as { readonly idempotencyKey: string };
+    const secondInput = secondAudit.calls.input as { readonly idempotencyKey: string };
+    expect(firstInput.idempotencyKey).not.toBe(secondInput.idempotencyKey);
   });
 
   it('does not allow read-only principals to update policies', async () => {

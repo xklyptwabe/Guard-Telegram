@@ -580,7 +580,12 @@
         "required": ["expectedLockVersion", "idempotencyKey"],
         "properties": {
           "expectedLockVersion": { "type": "integer", "minimum": 1 },
-          "idempotencyKey": { "type": "string", "minLength": 1, "maxLength": 256 },
+          "idempotencyKey": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 256,
+            "description": "Client retry key. The server namespaces it by actor, policy, lock version, and patch before audit persistence."
+          },
           "enabled": { "type": ["boolean", "null"] },
           "siteVisible": { "type": ["boolean", "null"] },
           "snapshotMode": {

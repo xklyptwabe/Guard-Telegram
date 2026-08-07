@@ -1,3 +1,5 @@
+import { createHash } from 'node:crypto';
+
 import { z } from 'zod';
 
 import type { DrizzleDatabase } from '../db/client.js';
@@ -74,14 +76,15 @@ export async function handleAuditPolicyWriteRequest(
   const scope = writeScope(principal);
   const policy = await getAuditPolicyById(deps.db, { policyId, scope });
   if (policy === undefined) return notFound();
+  const patch = toPolicyPatch(parsed.data);
 
   try {
     const updated = await updateAuditPolicyWithAudit(deps.db, deps.audit, {
       policyId,
       expectedLockVersion: parsed.data.expectedLockVersion,
-      patch: toPolicyPatch(parsed.data),
+      patch,
       actorId: principal.actorId,
-      idempotencyKey: parsed.data.idempotencyKey,
+      idempotencyKey: policyUpdateIdempotencyKey(policyId, principal.actorId, parsed.data, patch),
     });
     return {
       statusCode: 200,
@@ -115,6 +118,23 @@ function matchPolicyId(pathname: string): string | undefined {
 
 function writeScope(principal: BackendApiPrincipal): AuditEventsReadScope {
   return { systemAdmin: principal.systemAdmin, allowedChatIds: principal.allowedChatIds };
+}
+
+function policyUpdateIdempotencyKey(
+  policyId: string,
+  actorId: string,
+  request: PolicyPatchRequest,
+  patch: AuditPolicyPatch,
+): string {
+  const operation = JSON.stringify({
+    clientKey: request.idempotencyKey,
+    actorId,
+    policyId,
+    expectedLockVersion: request.expectedLockVersion,
+    patch,
+  });
+  const digest = createHash('sha256').update(operation).digest('base64url');
+  return `backend-api:audit-policy:${digest}`;
 }
 
 function toPolicyPatch(request: PolicyPatchRequest): AuditPolicyPatch {
