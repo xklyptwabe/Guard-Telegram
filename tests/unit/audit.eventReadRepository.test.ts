@@ -5,6 +5,7 @@ import * as auditSchema from '../../src/db/schema/audit.js';
 import {
   AuditEventsCursorError,
   buildAuditEventByIdQuery,
+  buildAuditPolicyByIdQuery,
   buildAuditEventsListQuery,
   buildAuditPoliciesListQuery,
   decodeAuditEventsCursor,
@@ -121,6 +122,17 @@ describe('audit event read repository', () => {
 
     expect(query.sql).toContain('"audit"."event_policies"."chat_id" = $1');
     expect(query.params).toEqual(['chat-1']);
+  });
+
+  it('scopes policy reads by id before management operations', () => {
+    const query = buildAuditPolicyByIdQuery(db, {
+      policyId: 'chat:chat-1:event:message.deleted:v1',
+      scope: { systemAdmin: false, allowedChatIds: ['chat-1'] },
+    }).toSQL();
+
+    expect(query.sql).toContain('"audit"."event_policies"."policy_id" = $1');
+    expect(query.sql).toContain('"audit"."event_policies"."chat_id" = $2');
+    expect(query.params).toEqual(['chat:chat-1:event:message.deleted:v1', 'chat-1', 1]);
   });
 
   it('allows system administrators to read global policies', () => {

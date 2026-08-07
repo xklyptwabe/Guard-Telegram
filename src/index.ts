@@ -74,7 +74,7 @@ async function bootstrap(): Promise<void> {
     await registerCommands(bot, modules, dispatcher, i18n, logger);
     transport = config.telegramTransport === 'webhook' ? await startWebhook(bot, config, logger) : startLongPolling(bot, config, logger);
     if (config.backendApiEnabled) {
-      backendApi = await startBackendApiServer(config, database.db, logger);
+      backendApi = await startBackendApiServer(config, database.db, audit, logger);
     }
     logger.info({ event: 'bootstrap.completed', details: { ...healthSnapshot(config, redis, storage, rabbitMq) } });
   } catch (error: unknown) {

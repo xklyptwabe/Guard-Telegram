@@ -46,7 +46,7 @@ async function dispatch(
         },
       ],
     },
-    { db: fakeDb() as never },
+    { db: fakeDb() as never, audit: fakeAudit() as never },
     logger,
   );
 
@@ -86,5 +86,11 @@ function fakeDb() {
         }),
       }),
     }),
+  };
+}
+
+function fakeAudit() {
+  return {
+    recordEntityChange: async () => ({ eventId: 'event-1', subjectSequence: 1, duplicate: false }),
   };
 }

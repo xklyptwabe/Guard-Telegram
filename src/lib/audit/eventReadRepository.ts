@@ -161,6 +161,14 @@ export async function listAuditPolicies(
   return buildAuditPoliciesListQuery(db, scope);
 }
 
+export async function getAuditPolicyById(
+  db: AuditEventsReader,
+  input: { readonly policyId: string; readonly scope: AuditEventsReadScope },
+): Promise<AuditPolicyReadRow | undefined> {
+  const rows = await buildAuditPolicyByIdQuery(db, input);
+  return rows[0];
+}
+
 export function buildAuditEventByIdQuery(
   db: AuditEventsReader,
   input: { readonly id: string; readonly scope: AuditEventsReadScope },
@@ -169,6 +177,17 @@ export function buildAuditEventByIdQuery(
     .select(auditEventSelection)
     .from(events)
     .where(and(eq(events.id, input.id), ...auditEventScopeConditions(input.scope)))
+    .limit(1);
+}
+
+export function buildAuditPolicyByIdQuery(
+  db: AuditEventsReader,
+  input: { readonly policyId: string; readonly scope: AuditEventsReadScope },
+) {
+  return db
+    .select(auditPolicySelection)
+    .from(eventPolicies)
+    .where(and(eq(eventPolicies.policyId, input.policyId), ...auditPolicyScopeConditions(input.scope)))
     .limit(1);
 }
 

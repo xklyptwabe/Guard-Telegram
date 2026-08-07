@@ -16,6 +16,7 @@ import {
 } from '../lib/audit/eventReadRepository.js';
 import type { BackendApiPrincipal } from './access.js';
 import { hasBackendApiPermission } from './access.js';
+import { badRequest, forbidden, notFound, type ApiResponse } from './responses.js';
 
 const eventCategorySchema = z.enum([
   'module',
@@ -30,11 +31,6 @@ const eventCategorySchema = z.enum([
 ]);
 const eventStatusSchema = z.enum(['recorded', 'failed']);
 const uuidPathSegmentSchema = z.string().uuid();
-
-export interface ApiResponse {
-  readonly statusCode: number;
-  readonly body: unknown;
-}
 
 export interface AuditReadApiDependencies {
   readonly db: DrizzleDatabase;
@@ -224,16 +220,4 @@ function serializePolicies(rows: readonly AuditPolicyReadRow[]): readonly Record
     createdAt: row.createdAt.toISOString(),
     updatedAt: row.updatedAt.toISOString(),
   }));
-}
-
-function badRequest(message: string): ApiResponse {
-  return { statusCode: 400, body: { error: { code: 'bad_request', message } } };
-}
-
-function forbidden(): ApiResponse {
-  return { statusCode: 403, body: { error: { code: 'forbidden', message: 'Forbidden' } } };
-}
-
-function notFound(): ApiResponse {
-  return { statusCode: 404, body: { error: { code: 'not_found', message: 'Not found' } } };
 }
