@@ -10,7 +10,6 @@ import {
   buildAuditPoliciesListQuery,
   decodeAuditEventsCursor,
   encodeAuditEventsCursor,
-  isAuditEventRowPastCursor,
   listAuditEvents,
   type AuditEventReadRow,
 } from '../../src/lib/audit/eventReadRepository.js';
@@ -146,7 +145,7 @@ describe('audit event read repository', () => {
 
   it('encodes cursor pagination as occurred_at plus id for descending order', () => {
     const cursor = encodeAuditEventsCursor({
-      occurredAt: new Date('2026-08-06T10:00:00.000Z'),
+      occurredAt: '2026-08-06 10:00:00.123456+00',
       id: 'bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb',
     });
     const query = buildAuditEventsListQuery(
@@ -158,37 +157,17 @@ describe('audit event read repository', () => {
     ).toSQL();
 
     expect(decodeAuditEventsCursor(cursor)).toEqual({
-      occurredAt: new Date('2026-08-06T10:00:00.000Z'),
+      occurredAt: '2026-08-06 10:00:00.123456+00',
       id: 'bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb',
     });
     expect(query.sql).toContain('"audit"."events"."occurred_at" < $2::timestamptz');
-    expect(query.sql).toContain('"audit"."events"."occurred_at" = $3 and "audit"."events"."id" < $4::uuid');
+    expect(query.sql).toContain(
+      '"audit"."events"."occurred_at" = $3::timestamptz and "audit"."events"."id" < $4::uuid',
+    );
   });
 
   it('rejects malformed cursors', () => {
     expect(() => decodeAuditEventsCursor('not-base64-json')).toThrow(AuditEventsCursorError);
-  });
-
-  it('uses the same cursor boundary semantics without duplicates or gaps for equal timestamps', () => {
-    const occurredAt = new Date('2026-08-06T10:00:00.000Z');
-    const rows = [
-      row('dddddddd-dddd-dddd-dddd-dddddddddddd', occurredAt),
-      row('cccccccc-cccc-cccc-cccc-cccccccccccc', occurredAt),
-      row('bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb', occurredAt),
-      row('aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa', new Date('2026-08-06T09:59:00.000Z')),
-    ];
-    const firstPage = rows.slice(0, 2);
-    const cursor = { occurredAt: firstPage[1]!.occurredAt, id: firstPage[1]!.id };
-    const secondPage = rows.filter((item) => isAuditEventRowPastCursor(item, cursor)).slice(0, 2);
-
-    expect(firstPage.map((item) => item.id)).toEqual([
-      'dddddddd-dddd-dddd-dddd-dddddddddddd',
-      'cccccccc-cccc-cccc-cccc-cccccccccccc',
-    ]);
-    expect(secondPage.map((item) => item.id)).toEqual([
-      'bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb',
-      'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa',
-    ]);
   });
 
   it('fetches one extra row to produce a next cursor', async () => {
@@ -208,11 +187,14 @@ describe('audit event read repository', () => {
       'cccccccc-cccc-cccc-cccc-cccccccccccc',
       'bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb',
     ]);
-    expect(page.nextCursor).toBe(encodeAuditEventsCursor({ occurredAt: rows[1]!.occurredAt, id: rows[1]!.id }));
+    expect(page.items[0]).not.toHaveProperty('cursorOccurredAt');
+    expect(page.nextCursor).toBe(encodeAuditEventsCursor({ occurredAt: rows[1]!.cursorOccurredAt, id: rows[1]!.id }));
   });
 });
 
-function row(id: string, occurredAt: Date): AuditEventReadRow {
+type AuditEventListRow = AuditEventReadRow & { readonly cursorOccurredAt: string };
+
+function row(id: string, occurredAt: Date): AuditEventListRow {
   return {
     id,
     eventType: 'message.deleted',
@@ -236,10 +218,11 @@ function row(id: string, occurredAt: Date): AuditEventReadRow {
     afterSnapshotStatus: 'observed',
     changes: null,
     metadata: null,
+    cursorOccurredAt: occurredAt.toISOString(),
   };
 }
 
-function fakeAuditEventsDb(rows: readonly AuditEventReadRow[]) {
+function fakeAuditEventsDb(rows: readonly AuditEventListRow[]) {
   return {
     select: () => ({
       from: () => ({

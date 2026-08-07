@@ -38,7 +38,7 @@ export interface AuditEventsListInput {
 }
 
 export interface AuditEventsCursor {
-  readonly occurredAt: Date;
+  readonly occurredAt: string;
   readonly id: string;
 }
 
@@ -119,12 +119,12 @@ export async function listAuditEvents(
 ): Promise<AuditEventsPage> {
   const limit = normalizeAuditEventsLimit(input.limit);
   const rows = await buildAuditEventsListQuery(db, input);
-  const items = rows.slice(0, limit);
-  const last = items.at(-1);
+  const pageRows = rows.slice(0, limit);
+  const last = pageRows.at(-1);
   return {
-    items,
+    items: pageRows.map(toAuditEventReadRow),
     ...(rows.length > limit && last !== undefined
-      ? { nextCursor: encodeAuditEventsCursor({ occurredAt: last.occurredAt, id: last.id }) }
+      ? { nextCursor: encodeAuditEventsCursor({ occurredAt: last.cursorOccurredAt, id: last.id }) }
       : {}),
   };
 }
@@ -203,7 +203,10 @@ export function buildAuditEventsListQuery(db: AuditEventsReader, input: AuditEve
   const limit = normalizeAuditEventsLimit(input.limit);
   const cursor = input.cursor === undefined ? undefined : decodeAuditEventsCursor(input.cursor);
   return db
-    .select(auditEventSelection)
+    .select({
+      ...auditEventSelection,
+      cursorOccurredAt: sql<string>`${events.occurredAt}::text`,
+    })
     .from(events)
     .where(and(...auditEventsWhereConditions(input.scope, input.filters ?? {}, cursor)))
     .orderBy(desc(events.occurredAt), desc(events.id))
@@ -256,9 +259,7 @@ const auditPolicySelection = {
 } as const;
 
 export function encodeAuditEventsCursor(cursor: AuditEventsCursor): string {
-  return Buffer.from(JSON.stringify({ occurredAt: cursor.occurredAt.toISOString(), id: cursor.id }), 'utf8').toString(
-    'base64url',
-  );
+  return Buffer.from(JSON.stringify(cursor), 'utf8').toString('base64url');
 }
 
 export function decodeAuditEventsCursor(value: string): AuditEventsCursor {
@@ -267,23 +268,13 @@ export function decodeAuditEventsCursor(value: string): AuditEventsCursor {
     if (!isRecord(parsed) || typeof parsed.occurredAt !== 'string' || typeof parsed.id !== 'string') {
       throw new AuditEventsCursorError();
     }
-    const occurredAt = new Date(parsed.occurredAt);
-    if (Number.isNaN(occurredAt.getTime()) || parsed.id.length === 0) {
+    if (Number.isNaN(Date.parse(parsed.occurredAt)) || parsed.id.length === 0) {
       throw new AuditEventsCursorError();
     }
-    return { occurredAt, id: parsed.id };
+    return { occurredAt: parsed.occurredAt, id: parsed.id };
   } catch {
     throw new AuditEventsCursorError();
   }
-}
-
-export function isAuditEventRowPastCursor(
-  row: Pick<AuditEventReadRow, 'occurredAt' | 'id'>,
-  cursor: AuditEventsCursor,
-): boolean {
-  const rowTime = row.occurredAt.getTime();
-  const cursorTime = cursor.occurredAt.getTime();
-  return rowTime < cursorTime || (rowTime === cursorTime && row.id < cursor.id);
 }
 
 function auditEventsWhereConditions(
@@ -323,7 +314,10 @@ function auditEventsWhereConditions(
     conditions.push(
       or(
         sql`${events.occurredAt} < ${cursor.occurredAt}::timestamptz`,
-        and(eq(events.occurredAt, cursor.occurredAt), sql`${events.id} < ${cursor.id}::uuid`),
+        and(
+          sql`${events.occurredAt} = ${cursor.occurredAt}::timestamptz`,
+          sql`${events.id} < ${cursor.id}::uuid`,
+        ),
       )!,
     );
   }
@@ -380,4 +374,12 @@ function uniqueNonEmpty(values: readonly string[]): readonly string[] {
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === 'object' && !Array.isArray(value);
+}
+
+function toAuditEventReadRow(
+  row: AuditEventReadRow & { readonly cursorOccurredAt: string },
+): AuditEventReadRow {
+  const event = { ...row };
+  Reflect.deleteProperty(event, 'cursorOccurredAt');
+  return event;
 }

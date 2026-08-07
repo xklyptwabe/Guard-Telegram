@@ -72,7 +72,6 @@ export {
   encodeAuditEventsCursor,
   getAuditEventById,
   getAuditPolicyById,
-  isAuditEventRowPastCursor,
   listAuditEventTypes,
   listAuditEvents,
   listAuditPolicies,
