@@ -116,8 +116,12 @@ export class AuditService {
         ),
         effectivePolicy,
       );
+      const inputMetadata = mergeAuditMetadata(
+        input.moduleId === undefined ? undefined : { moduleId: input.moduleId },
+        input.metadata,
+      );
       const metadata = mergeAuditMetadata(
-        mergeAuditMetadata(input.metadata, mutation.metadata),
+        mergeAuditMetadata(inputMetadata, mutation.metadata),
         buildAuditPolicyMetadata(effectivePolicy),
       );
       const telegramContext = input.telegramContext ?? buildTelegramContext(context);
@@ -239,6 +243,7 @@ function buildTelegramContext(context: ReturnType<typeof getUpdateContext>): Rec
     updateId: context.updateId,
     ...(context.chatId ? { chatId: context.chatId } : {}),
     ...(context.userId ? { userId: context.userId } : {}),
+    ...(context.messageThreadId ? { messageThreadId: context.messageThreadId } : {}),
   };
 }
 

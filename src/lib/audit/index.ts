@@ -60,4 +60,21 @@ export {
   type UpdateAuditPolicyWithAuditInput,
   type UpdateAuditPolicyWithLockInput,
 } from './policyStore.js';
+export {
+  AUDIT_EVENTS_DEFAULT_LIMIT,
+  AUDIT_EVENTS_MAX_LIMIT,
+  AuditEventsCursorError,
+  buildAuditEventsListQuery,
+  decodeAuditEventsCursor,
+  encodeAuditEventsCursor,
+  isAuditEventRowPastCursor,
+  listAuditEvents,
+  type AuditEventReadRow,
+  type AuditEventStatus,
+  type AuditEventsCursor,
+  type AuditEventsListInput,
+  type AuditEventsPage,
+  type AuditEventsReadFilters,
+  type AuditEventsReadScope,
+} from './eventReadRepository.js';
 export * from './shapes.js';
