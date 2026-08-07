@@ -1,4 +1,5 @@
 import { and, asc, desc, eq, gte, inArray, lte, or, sql, type SQL, type SQLWrapper } from 'drizzle-orm';
+import { z } from 'zod';
 
 import type { DrizzleDatabase } from '../../db/client.js';
 import { eventPolicies, events, eventTypes } from '../../db/schema/audit.js';
@@ -111,6 +112,13 @@ export class AuditEventsCursorError extends Error {
     this.name = 'AuditEventsCursorError';
   }
 }
+
+const auditEventsCursorSchema = z
+  .object({
+    occurredAt: z.string().refine((value) => !Number.isNaN(Date.parse(value))),
+    id: z.string().uuid(),
+  })
+  .strict();
 
 type AuditEventsReader = Pick<DrizzleDatabase, 'select'>;
 
@@ -266,13 +274,7 @@ export function encodeAuditEventsCursor(cursor: AuditEventsCursor): string {
 export function decodeAuditEventsCursor(value: string): AuditEventsCursor {
   try {
     const parsed = JSON.parse(Buffer.from(value, 'base64url').toString('utf8')) as unknown;
-    if (!isRecord(parsed) || typeof parsed.occurredAt !== 'string' || typeof parsed.id !== 'string') {
-      throw new AuditEventsCursorError();
-    }
-    if (Number.isNaN(Date.parse(parsed.occurredAt)) || parsed.id.length === 0) {
-      throw new AuditEventsCursorError();
-    }
-    return { occurredAt: parsed.occurredAt, id: parsed.id };
+    return auditEventsCursorSchema.parse(parsed);
   } catch {
     throw new AuditEventsCursorError();
   }
@@ -375,10 +377,6 @@ function normalizeAuditEventsLimit(limit: number | undefined): number {
 
 function uniqueNonEmpty(values: readonly string[]): readonly string[] {
   return [...new Set(values.filter((value) => value.length > 0))];
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return value !== null && typeof value === 'object' && !Array.isArray(value);
 }
 
 function toAuditEventReadRow(

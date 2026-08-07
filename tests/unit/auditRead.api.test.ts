@@ -2,10 +2,11 @@ import { describe, expect, it } from 'vitest';
 
 import { handleAuditReadRequest } from '../../src/api/auditRead.js';
 import type { BackendApiPrincipal } from '../../src/api/access.js';
-import type {
-  AuditEventReadRow,
-  AuditEventTypeReadRow,
-  AuditPolicyReadRow,
+import {
+  encodeAuditEventsCursor,
+  type AuditEventReadRow,
+  type AuditEventTypeReadRow,
+  type AuditPolicyReadRow,
 } from '../../src/lib/audit/eventReadRepository.js';
 
 const readPrincipal: BackendApiPrincipal = {
@@ -39,6 +40,30 @@ describe('audit read API', () => {
       ],
     });
     expect(response?.body).toHaveProperty('nextCursor');
+  });
+
+  it('returns bad request for a cursor with a non-UUID id before querying the database', async () => {
+    const cursor = encodeAuditEventsCursor({
+      occurredAt: '2026-08-07 10:00:00.123456+00',
+      id: 'not-a-uuid',
+    });
+    const db = {
+      select: () => {
+        throw new Error('database must not be queried for an invalid cursor');
+      },
+    };
+
+    const response = await handleAuditReadRequest(
+      'GET',
+      url(`/api/v1/audit/events?cursor=${cursor}`),
+      readPrincipal,
+      { db: db as never },
+    );
+
+    expect(response).toEqual({
+      statusCode: 400,
+      body: { error: { code: 'bad_request', message: 'Audit events cursor is invalid.' } },
+    });
   });
 
   it('returns a single event through the same read permission', async () => {

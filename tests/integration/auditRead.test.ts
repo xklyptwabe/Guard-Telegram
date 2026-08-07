@@ -4,7 +4,11 @@ import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 
 import { validateConfig } from '../../src/config.js';
 import { createDatabase, type DatabaseClient } from '../../src/db/client.js';
-import { listAuditEvents } from '../../src/lib/audit/eventReadRepository.js';
+import {
+  AuditEventsCursorError,
+  encodeAuditEventsCursor,
+  listAuditEvents,
+} from '../../src/lib/audit/eventReadRepository.js';
 import { PLATFORM_TENANT_SENTINEL } from '../../src/lib/audit/serviceAdapter.js';
 
 const testDatabaseUrl = process.env.TEST_DATABASE_URL;
@@ -117,5 +121,19 @@ describe.skipIf(!testDatabaseUrl)('Audit read integration', () => {
 
     expect(nonSystemIds).toEqual([]);
     expect(systemIds).toEqual(['eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee']);
+  });
+
+  it('rejects a non-UUID cursor id before PostgreSQL casts it', async () => {
+    const cursor = encodeAuditEventsCursor({
+      occurredAt: '2026-08-07 10:00:00.123456+00',
+      id: 'not-a-uuid',
+    });
+
+    await expect(
+      listAuditEvents(database!.db, {
+        scope: { systemAdmin: false, allowedChatIds: ['audit-read-pagination'] },
+        cursor,
+      }),
+    ).rejects.toThrow(AuditEventsCursorError);
   });
 });

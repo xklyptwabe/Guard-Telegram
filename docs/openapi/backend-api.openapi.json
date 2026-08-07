@@ -347,7 +347,7 @@
       "Cursor": {
         "name": "cursor",
         "in": "query",
-        "description": "Opaque base64url cursor based on occurredAt and id.",
+        "description": "Opaque base64url cursor based on occurredAt and a UUID id. Malformed cursors return 400.",
         "schema": { "type": "string" }
       }
     },

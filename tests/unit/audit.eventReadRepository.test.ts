@@ -186,6 +186,14 @@ describe('audit event read repository', () => {
 
   it('rejects malformed cursors', () => {
     expect(() => decodeAuditEventsCursor('not-base64-json')).toThrow(AuditEventsCursorError);
+    expect(() =>
+      decodeAuditEventsCursor(
+        encodeAuditEventsCursor({
+          occurredAt: '2026-08-06 10:00:00.123456+00',
+          id: 'not-a-uuid',
+        }),
+      ),
+    ).toThrow(AuditEventsCursorError);
   });
 
   it('fetches one extra row to produce a next cursor', async () => {
