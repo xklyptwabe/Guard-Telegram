@@ -18,7 +18,8 @@
     "db:migrate": "tsx src/db/migrate.ts",
     "db:studio": "drizzle-kit studio",
     "check:locales": "tsx scripts/check-locales.ts",
-    "seed:audit-event-types": "tsx scripts/seedAuditEventTypes.ts"
+    "seed:audit-event-types": "tsx scripts/seedAuditEventTypes.ts",
+    "audit:retention": "tsx scripts/runAuditRetention.ts"
   },
   "dependencies": {
     "@aws-sdk/client-s3": "^3.0.0",

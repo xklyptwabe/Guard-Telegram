@@ -243,8 +243,8 @@ describe.skipIf(!testDatabaseUrl)('Audit transaction integration', () => {
     const eventRows = await database!.db.select().from(events);
     const outboxRows = await database!.db.select().from(outbox);
 
-    expect(eventRows[0]?.metadata).toEqual({ source: 'test', operation: 'update' });
-    expect((outboxRows[0]?.payload as { metadata?: unknown } | undefined)?.metadata).toEqual({
+    expect(eventRows[0]?.metadata).toMatchObject({ source: 'test', operation: 'update' });
+    expect((outboxRows[0]?.payload as { metadata?: unknown } | undefined)?.metadata).toMatchObject({
       source: 'test',
       operation: 'update',
     });

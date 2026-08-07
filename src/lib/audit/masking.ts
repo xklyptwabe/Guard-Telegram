@@ -8,6 +8,10 @@
 export interface AuditPolicyContext {
   /** Whether raw/edited message text may be persisted for this chat. */
   readonly allowMessageTextLogging: boolean;
+  /** Optional runtime allowlist; it narrows the event definition allowlist. */
+  readonly allowlist?: readonly string[];
+  /** Optional runtime masking list applied after the field is allowed. */
+  readonly masking?: readonly string[];
 }
 
 const DEFAULT_POLICY: AuditPolicyContext = { allowMessageTextLogging: false };
@@ -88,12 +92,15 @@ export function applyAllowlist<T extends Record<string, unknown>>(
   policy: AuditPolicyContext = DEFAULT_POLICY,
 ): Partial<T> {
   const projected: Partial<T> = {};
+  const runtimeAllowlist = policy.allowlist === undefined ? undefined : new Set(policy.allowlist);
+  const runtimeMasking = new Set(policy.masking ?? []);
   for (const entry of allowlist) {
     const field = typeof entry === 'object' ? entry.field : entry;
     const allowed = typeof entry === 'object' ? entry.when(policy) : true;
     if (!allowed) continue;
+    if (runtimeAllowlist !== undefined && !runtimeAllowlist.has(String(field))) continue;
     if (!(field in data)) continue;
-    projected[field] = data[field];
+    projected[field] = (runtimeMasking.has(String(field)) ? '[redacted]' : data[field]) as T[typeof field];
   }
   return stripForbidden(projected);
 }
