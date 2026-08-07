@@ -86,4 +86,11 @@ export {
   type AuditEventsReadScope,
   type AuditPolicyReadRow,
 } from './eventReadRepository.js';
+export {
+  AuditExportPolicyError,
+  createAuditExport,
+  type AuditExportFormat,
+  type AuditExportResult,
+  type CreateAuditExportInput,
+} from './exportService.js';
 export * from './shapes.js';

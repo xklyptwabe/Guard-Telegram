@@ -6,6 +6,7 @@ import type { AuditService } from '../lib/auditService.js';
 import type { Logger } from '../lib/logger.js';
 import type { BackendApiPrincipalConfig } from './access.js';
 import { authenticateBackendApiPrincipal } from './access.js';
+import { handleAuditExportRequest, type AuditExportApiDependencies } from './auditExports.js';
 import { handleAuditPolicyWriteRequest, type AuditPolicyApiDependencies } from './auditPolicies.js';
 import { handleAuditReadRequest, type AuditReadApiDependencies } from './auditRead.js';
 import { badRequest, payloadTooLarge } from './responses.js';
@@ -20,7 +21,7 @@ interface BackendApiServerConfig {
   readonly backendApiPrincipals: readonly BackendApiPrincipalConfig[];
 }
 
-export type BackendApiDependencies = AuditReadApiDependencies & AuditPolicyApiDependencies;
+export type BackendApiDependencies = AuditReadApiDependencies & AuditPolicyApiDependencies & AuditExportApiDependencies;
 
 export type BackendApiConfig = Pick<
   AppConfig,
@@ -95,6 +96,11 @@ async function handleBackendApiRequest(
     const policyWrite = await handleAuditPolicyWriteRequest(request.method, url, body, principal, deps);
     if (policyWrite !== undefined) {
       writeJson(response, policyWrite.statusCode, policyWrite.body);
+      return;
+    }
+    const auditExport = await handleAuditExportRequest(request.method, url, body, principal, deps);
+    if (auditExport !== undefined) {
+      writeJson(response, auditExport.statusCode, auditExport.body);
       return;
     }
     writeJson(response, 404, { error: { code: 'not_found', message: 'Not found' } });
