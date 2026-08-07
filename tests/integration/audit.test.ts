@@ -18,22 +18,17 @@ describe.skipIf(!testDatabaseUrl)('Audit transaction integration', () => {
       TELEGRAM_BOT_TOKEN: 'test-token',
       DATABASE_URL: testDatabaseUrl,
       NODE_ENV: 'test',
-      DATABASE_TLS_REJECT_UNAUTHORIZED: 'true',
+      DATABASE_TLS_REJECT_UNAUTHORIZED: process.env.DATABASE_TLS_REJECT_UNAUTHORIZED ?? 'true',
     });
     database = createDatabase(config);
     await migrate(database.db, { migrationsFolder: 'src/db/migrations' });
     audit = new AuditService(database.db);
   });
 
-  beforeEach(async () => {
-    await database!.db.delete(telegramChats);
-    await database!.db.delete(chatModuleStates);
-    await database!.db.delete(outbox);
-    await database!.db.delete(events);
-    await database!.db.delete(entitySnapshots);
-  });
+  beforeEach(cleanup);
 
   afterAll(async () => {
+    await cleanup();
     await database?.close();
   });
 
@@ -249,4 +244,49 @@ describe.skipIf(!testDatabaseUrl)('Audit transaction integration', () => {
       operation: 'update',
     });
   });
+
+  it('keeps input.moduleId canonical in event and outbox metadata', async () => {
+    await audit!.recordEntityChange(
+      {
+        tenantId: '1007',
+        subjectType: 'chat_module_state',
+        subjectId: '1007:module-admin',
+        eventType: 'module.state.changed',
+        eventVersion: 'v1',
+        category: 'module',
+        source: 'telegram.command',
+        moduleId: 'module-admin',
+        idempotencyKey: 'audit:test:1007:module-admin:canonical-metadata',
+        metadata: { moduleId: 'input-metadata-module' },
+      },
+      async (tx) => {
+        await tx.insert(telegramChats).values({ chatId: '1007', type: 'group', title: 'audit-test' });
+        await tx.insert(chatModuleStates).values({ chatId: '1007', moduleId: 'module-admin', enabled: true });
+        return {
+          before: undefined,
+          after: { enabled: true, source: 'override' },
+          metadata: { moduleId: 'mutation-metadata-module', operation: 'update' },
+          snapshotData: { chatId: '1007', moduleId: 'module-admin', enabled: true, source: 'override' },
+        };
+      },
+    );
+
+    const [event] = await database!.db.select().from(events);
+    const [outboxRow] = await database!.db.select().from(outbox);
+
+    expect(event?.metadata).toMatchObject({ moduleId: 'module-admin', operation: 'update' });
+    expect((outboxRow?.payload as { metadata?: unknown } | undefined)?.metadata).toMatchObject({
+      moduleId: 'module-admin',
+      operation: 'update',
+    });
+  });
 });
+
+async function cleanup(): Promise<void> {
+  if (database === undefined) return;
+  await database.db.delete(telegramChats);
+  await database.db.delete(chatModuleStates);
+  await database.db.delete(outbox);
+  await database.db.delete(events);
+  await database.db.delete(entitySnapshots);
+}

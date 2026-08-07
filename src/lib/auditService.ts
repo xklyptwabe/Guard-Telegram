@@ -139,13 +139,12 @@ export class AuditService {
         ),
         effectivePolicy,
       );
-      const inputMetadata = mergeAuditMetadata(
-        input.moduleId === undefined ? undefined : { moduleId: input.moduleId },
-        input.metadata,
-      );
-      const metadata = mergeAuditMetadata(
-        mergeAuditMetadata(inputMetadata, mutation.metadata),
-        buildAuditPolicyMetadata(effectivePolicy),
+      const metadata = applyCanonicalModuleId(
+        mergeAuditMetadata(
+          mergeAuditMetadata(input.metadata, mutation.metadata),
+          buildAuditPolicyMetadata(effectivePolicy),
+        ),
+        input.moduleId,
       );
       const telegramContext = input.telegramContext ?? buildTelegramContext(context);
       const [eventRow] = await tx
@@ -304,4 +303,18 @@ function mergeAuditMetadata(
   if (inputMetadata === undefined) return mutationMetadata;
   if (mutationMetadata === undefined) return inputMetadata;
   return { ...inputMetadata, ...mutationMetadata };
+}
+
+function applyCanonicalModuleId(
+  metadata: Record<string, unknown> | undefined,
+  moduleId: string | undefined,
+): Record<string, unknown> | undefined {
+  if (metadata === undefined) return moduleId === undefined ? undefined : { moduleId };
+  const result = { ...metadata };
+  if (moduleId === undefined) {
+    Reflect.deleteProperty(result, 'moduleId');
+  } else {
+    result.moduleId = moduleId;
+  }
+  return result;
 }

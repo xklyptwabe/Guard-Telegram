@@ -102,6 +102,69 @@ describe('audit export service', () => {
 
     expect(audit.calls.input).toBeUndefined();
   });
+
+  it('fails closed when metadata and snapshots disagree about the module', async () => {
+    const audit = fakeAuditService();
+    const event = eventRow('aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa');
+
+    await expect(
+      createAuditExport(
+        fakeExportDb({
+          events: [{ ...event, before: { moduleId: 'canonical-module' }, metadata: { moduleId: 'other-module' } }],
+          policies: [policyRow({ exportAllowed: true, enabled: true })],
+        }) as never,
+        audit as unknown as AuditService,
+        {
+          scope: { systemAdmin: false, allowedChatIds: ['chat-1'] },
+          filters: {},
+          format: 'json',
+          requestedBy: 'operator-1',
+        },
+      ),
+    ).rejects.toThrow(AuditExportPolicyError);
+
+    expect(audit.calls.input).toBeUndefined();
+  });
+
+  it('applies the module export policy to the canonical event module', async () => {
+    const audit = fakeAuditService();
+
+    await expect(
+      createAuditExport(
+        fakeExportDb({
+          events: [eventRow('aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa')],
+          policies: [
+            policyRow({
+              policyId: 'global',
+              chatId: null,
+              eventType: null,
+              eventVersion: null,
+              moduleId: null,
+              exportAllowed: true,
+              enabled: true,
+            }),
+            policyRow({
+              policyId: 'chat:chat-1:module:moderation',
+              eventType: null,
+              eventVersion: null,
+              moduleId: 'moderation',
+              exportAllowed: false,
+              enabled: true,
+            }),
+          ],
+        }) as never,
+        audit as unknown as AuditService,
+        {
+          scope: { systemAdmin: false, allowedChatIds: ['chat-1'] },
+          filters: {},
+          format: 'json',
+          requestedBy: 'operator-1',
+        },
+      ),
+    ).rejects.toThrow(AuditExportPolicyError);
+
+    expect(audit.calls.input).toBeUndefined();
+  });
 });
 
 function fakeExportDb(options: {

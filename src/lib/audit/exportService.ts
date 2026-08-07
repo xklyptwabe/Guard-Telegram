@@ -156,7 +156,15 @@ function exportRange(
 }
 
 function moduleIdFor(row: AuditEventReadRow): string | undefined {
-  return stringField(row.metadata, 'moduleId') ?? stringField(row.before, 'moduleId') ?? stringField(row.after, 'moduleId');
+  const moduleIds = new Set(
+    [
+      stringField(row.metadata, 'moduleId'),
+      stringField(row.before, 'moduleId'),
+      stringField(row.after, 'moduleId'),
+    ].filter((moduleId): moduleId is string => moduleId !== undefined),
+  );
+  if (moduleIds.size > 1) throw new AuditExportPolicyError();
+  return moduleIds.values().next().value;
 }
 
 function serializeEventForExport(row: AuditEventReadRow): Record<string, unknown> {
