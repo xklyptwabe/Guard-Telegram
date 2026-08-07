@@ -4,7 +4,9 @@ import { describe, expect, it } from 'vitest';
 import * as auditSchema from '../../src/db/schema/audit.js';
 import {
   AuditEventsCursorError,
+  buildAuditEventByIdQuery,
   buildAuditEventsListQuery,
+  buildAuditPoliciesListQuery,
   decodeAuditEventsCursor,
   encodeAuditEventsCursor,
   isAuditEventRowPastCursor,
@@ -98,6 +100,36 @@ describe('audit event read repository', () => {
     ).toSQL();
 
     expect(query.sql).not.toMatch(/where[\s\S]*"tenant_id"/);
+  });
+
+  it('scopes single-event reads by id to the principal chats', () => {
+    const query = buildAuditEventByIdQuery(db, {
+      id: 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa',
+      scope: { systemAdmin: false, allowedChatIds: ['chat-1', 'chat-2'] },
+    }).toSQL();
+
+    expect(query.sql).toContain('"audit"."events"."id" = $1');
+    expect(query.sql).toContain('"audit"."events"."tenant_id" in ($2, $3)');
+    expect(query.params).toEqual(['aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa', 'chat-1', 'chat-2', 1]);
+  });
+
+  it('does not expose global policies to non-system principals', () => {
+    const query = buildAuditPoliciesListQuery(db, {
+      systemAdmin: false,
+      allowedChatIds: ['chat-1'],
+    }).toSQL();
+
+    expect(query.sql).toContain('"audit"."event_policies"."chat_id" = $1');
+    expect(query.params).toEqual(['chat-1']);
+  });
+
+  it('allows system administrators to read global policies', () => {
+    const query = buildAuditPoliciesListQuery(db, {
+      systemAdmin: true,
+      allowedChatIds: [],
+    }).toSQL();
+
+    expect(query.sql).not.toMatch(/where[\s\S]*"chat_id"/);
   });
 
   it('encodes cursor pagination as occurred_at plus id for descending order', () => {

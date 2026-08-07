@@ -13,15 +13,18 @@ describe('backend API request handler', () => {
     expect(result.body).toContain('"unauthorized"');
   });
 
-  it('accepts authenticated requests and returns not_found until routes are registered', async () => {
-    const result = await dispatch({ authorization: 'Bearer test-token-123456' });
+  it('accepts authenticated requests and returns not_found for unknown routes', async () => {
+    const result = await dispatch({ authorization: 'Bearer test-token-123456' }, '/api/v1/unknown');
 
     expect(result.statusCode).toBe(404);
     expect(result.body).toContain('"not_found"');
   });
 });
 
-async function dispatch(headers: { readonly authorization: string | undefined }): Promise<{
+async function dispatch(
+  headers: { readonly authorization: string | undefined },
+  url = '/api/v1/audit/events',
+): Promise<{
   readonly statusCode: number;
   readonly body: string;
 }> {
@@ -43,12 +46,13 @@ async function dispatch(headers: { readonly authorization: string | undefined })
         },
       ],
     },
+    { db: fakeDb() as never },
     logger,
   );
 
   const request = {
     method: 'GET',
-    url: '/api/v1/audit/events',
+    url,
     headers,
   } as unknown as IncomingMessage;
 
@@ -69,4 +73,18 @@ async function dispatch(headers: { readonly authorization: string | undefined })
 
     handler(request, response);
   });
+}
+
+function fakeDb() {
+  return {
+    select: () => ({
+      from: () => ({
+        where: () => ({
+          orderBy: () => ({
+            limit: async () => [],
+          }),
+        }),
+      }),
+    }),
+  };
 }

@@ -1,9 +1,11 @@
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
 
 import type { AppConfig } from '../config.js';
+import type { DrizzleDatabase } from '../db/client.js';
 import type { Logger } from '../lib/logger.js';
 import type { BackendApiPrincipalConfig } from './access.js';
 import { authenticateBackendApiPrincipal } from './access.js';
+import { handleAuditReadRequest, type AuditReadApiDependencies } from './auditRead.js';
 
 export interface BackendApiController {
   stop(): Promise<void>;
@@ -15,6 +17,8 @@ interface BackendApiServerConfig {
   readonly backendApiPrincipals: readonly BackendApiPrincipalConfig[];
 }
 
+export type BackendApiDependencies = AuditReadApiDependencies;
+
 export type BackendApiConfig = Pick<
   AppConfig,
   'backendApiHost' | 'backendApiPort' | 'backendApiPrincipals'
@@ -22,18 +26,20 @@ export type BackendApiConfig = Pick<
 
 export function createBackendApiRequestHandler(
   config: Pick<BackendApiServerConfig, 'backendApiPrincipals'>,
+  deps: BackendApiDependencies,
   logger: Logger,
 ): (request: IncomingMessage, response: ServerResponse) => void {
   return (request, response) => {
-    handleBackendApiRequest(request, response, config, logger);
+    void handleBackendApiRequest(request, response, config, deps, logger);
   };
 }
 
 export async function startBackendApiServer(
   config: BackendApiConfig,
+  db: DrizzleDatabase,
   logger: Logger,
 ): Promise<BackendApiController> {
-  const server = createServer(createBackendApiRequestHandler(config, logger));
+  const server = createServer(createBackendApiRequestHandler(config, { db }, logger));
   await new Promise<void>((resolve, reject) => {
     server.once('error', reject);
     server.listen(config.backendApiPort, config.backendApiHost, () => {
@@ -53,12 +59,13 @@ export async function startBackendApiServer(
   };
 }
 
-function handleBackendApiRequest(
+async function handleBackendApiRequest(
   request: IncomingMessage,
   response: ServerResponse,
   config: Pick<BackendApiServerConfig, 'backendApiPrincipals'>,
+  deps: BackendApiDependencies,
   logger: Logger,
-): void {
+): Promise<void> {
   try {
     const principal = authenticateBackendApiPrincipal(
       request.headers.authorization,
@@ -70,7 +77,16 @@ function handleBackendApiRequest(
     }
 
     const url = new URL(request.url ?? '/', 'http://backend-api.local');
-    logger.debug({ event: 'backend_api.request', userId: principal.actorId, details: { method: request.method, path: url.pathname } });
+    logger.debug({
+      event: 'backend_api.request',
+      userId: principal.actorId,
+      details: { method: request.method, path: url.pathname },
+    });
+    const routed = await handleAuditReadRequest(request.method, url, principal, deps);
+    if (routed !== undefined) {
+      writeJson(response, routed.statusCode, routed.body);
+      return;
+    }
     writeJson(response, 404, { error: { code: 'not_found', message: 'Not found' } });
   } catch (error: unknown) {
     logger.error({

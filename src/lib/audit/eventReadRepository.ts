@@ -1,7 +1,7 @@
-import { and, desc, eq, gte, inArray, lte, or, sql, type SQL, type SQLWrapper } from 'drizzle-orm';
+import { and, asc, desc, eq, gte, inArray, lte, or, sql, type SQL, type SQLWrapper } from 'drizzle-orm';
 
 import type { DrizzleDatabase } from '../../db/client.js';
-import { events } from '../../db/schema/audit.js';
+import { eventPolicies, events, eventTypes } from '../../db/schema/audit.js';
 import type { EventCategory } from './enums.js';
 
 export const AUDIT_EVENTS_DEFAULT_LIMIT = 50;
@@ -72,6 +72,38 @@ export interface AuditEventsPage {
   readonly nextCursor?: string;
 }
 
+export interface AuditEventTypeReadRow {
+  readonly eventType: string;
+  readonly eventVersion: string;
+  readonly category: string;
+  readonly description: string | null;
+  readonly severity: string;
+  readonly siteVisible: boolean;
+  readonly canBeDisabled: boolean;
+  readonly createdAt: Date;
+  readonly updatedAt: Date;
+}
+
+export interface AuditPolicyReadRow {
+  readonly policyId: string;
+  readonly chatId: string | null;
+  readonly eventType: string | null;
+  readonly eventVersion: string | null;
+  readonly moduleId: string | null;
+  readonly required: boolean;
+  readonly retentionDays: number | null;
+  readonly enabled: boolean | null;
+  readonly siteVisible: boolean | null;
+  readonly snapshotMode: string | null;
+  readonly allowlist: unknown;
+  readonly masking: unknown;
+  readonly severity: string | null;
+  readonly exportAllowed: boolean | null;
+  readonly lockVersion: number;
+  readonly createdAt: Date;
+  readonly updatedAt: Date;
+}
+
 export class AuditEventsCursorError extends Error {
   public constructor() {
     super('Audit events cursor is invalid.');
@@ -97,39 +129,112 @@ export async function listAuditEvents(
   };
 }
 
+export async function getAuditEventById(
+  db: AuditEventsReader,
+  input: { readonly id: string; readonly scope: AuditEventsReadScope },
+): Promise<AuditEventReadRow | undefined> {
+  const rows = await buildAuditEventByIdQuery(db, input);
+  return rows[0];
+}
+
+export async function listAuditEventTypes(db: AuditEventsReader): Promise<readonly AuditEventTypeReadRow[]> {
+  return db
+    .select({
+      eventType: eventTypes.eventType,
+      eventVersion: eventTypes.eventVersion,
+      category: eventTypes.category,
+      description: eventTypes.description,
+      severity: eventTypes.severity,
+      siteVisible: eventTypes.siteVisible,
+      canBeDisabled: eventTypes.canBeDisabled,
+      createdAt: eventTypes.createdAt,
+      updatedAt: eventTypes.updatedAt,
+    })
+    .from(eventTypes)
+    .orderBy(asc(eventTypes.category), asc(eventTypes.eventType), asc(eventTypes.eventVersion));
+}
+
+export async function listAuditPolicies(
+  db: AuditEventsReader,
+  scope: AuditEventsReadScope,
+): Promise<readonly AuditPolicyReadRow[]> {
+  return buildAuditPoliciesListQuery(db, scope);
+}
+
+export function buildAuditEventByIdQuery(
+  db: AuditEventsReader,
+  input: { readonly id: string; readonly scope: AuditEventsReadScope },
+) {
+  return db
+    .select(auditEventSelection)
+    .from(events)
+    .where(and(eq(events.id, input.id), ...auditEventScopeConditions(input.scope)))
+    .limit(1);
+}
+
+export function buildAuditPoliciesListQuery(db: AuditEventsReader, scope: AuditEventsReadScope) {
+  return db
+    .select(auditPolicySelection)
+    .from(eventPolicies)
+    .where(and(...auditPolicyScopeConditions(scope)))
+    .orderBy(asc(eventPolicies.chatId), asc(eventPolicies.eventType), asc(eventPolicies.moduleId), asc(eventPolicies.policyId));
+}
+
 export function buildAuditEventsListQuery(db: AuditEventsReader, input: AuditEventsListInput) {
   const limit = normalizeAuditEventsLimit(input.limit);
   const cursor = input.cursor === undefined ? undefined : decodeAuditEventsCursor(input.cursor);
   return db
-    .select({
-      id: events.id,
-      eventType: events.eventType,
-      eventVersion: events.eventVersion,
-      category: events.category,
-      occurredAt: events.occurredAt,
-      recordedAt: events.recordedAt,
-      source: events.source,
-      status: events.status,
-      tenantId: events.tenantId,
-      actorId: events.actorId,
-      actorType: events.actorType,
-      subjectType: events.subjectType,
-      subjectId: events.subjectId,
-      subjectSequence: events.subjectSequence,
-      correlationId: events.correlationId,
-      telegramContext: events.telegramContext,
-      before: events.before,
-      after: events.after,
-      beforeSnapshotStatus: events.beforeSnapshotStatus,
-      afterSnapshotStatus: events.afterSnapshotStatus,
-      changes: events.changes,
-      metadata: events.metadata,
-    })
+    .select(auditEventSelection)
     .from(events)
     .where(and(...auditEventsWhereConditions(input.scope, input.filters ?? {}, cursor)))
     .orderBy(desc(events.occurredAt), desc(events.id))
     .limit(limit + 1);
 }
+
+const auditEventSelection = {
+  id: events.id,
+  eventType: events.eventType,
+  eventVersion: events.eventVersion,
+  category: events.category,
+  occurredAt: events.occurredAt,
+  recordedAt: events.recordedAt,
+  source: events.source,
+  status: events.status,
+  tenantId: events.tenantId,
+  actorId: events.actorId,
+  actorType: events.actorType,
+  subjectType: events.subjectType,
+  subjectId: events.subjectId,
+  subjectSequence: events.subjectSequence,
+  correlationId: events.correlationId,
+  telegramContext: events.telegramContext,
+  before: events.before,
+  after: events.after,
+  beforeSnapshotStatus: events.beforeSnapshotStatus,
+  afterSnapshotStatus: events.afterSnapshotStatus,
+  changes: events.changes,
+  metadata: events.metadata,
+} as const;
+
+const auditPolicySelection = {
+  policyId: eventPolicies.policyId,
+  chatId: eventPolicies.chatId,
+  eventType: eventPolicies.eventType,
+  eventVersion: eventPolicies.eventVersion,
+  moduleId: eventPolicies.moduleId,
+  required: eventPolicies.required,
+  retentionDays: eventPolicies.retentionDays,
+  enabled: eventPolicies.enabled,
+  siteVisible: eventPolicies.siteVisible,
+  snapshotMode: eventPolicies.snapshotMode,
+  allowlist: eventPolicies.allowlist,
+  masking: eventPolicies.masking,
+  severity: eventPolicies.severity,
+  exportAllowed: eventPolicies.exportAllowed,
+  lockVersion: eventPolicies.lockVersion,
+  createdAt: eventPolicies.createdAt,
+  updatedAt: eventPolicies.updatedAt,
+} as const;
 
 export function encodeAuditEventsCursor(cursor: AuditEventsCursor): string {
   return Buffer.from(JSON.stringify({ occurredAt: cursor.occurredAt.toISOString(), id: cursor.id }), 'utf8').toString(
@@ -167,11 +272,7 @@ function auditEventsWhereConditions(
   filters: AuditEventsReadFilters,
   cursor: AuditEventsCursor | undefined,
 ): SQL[] {
-  const conditions: SQL[] = [];
-  const scopedChatIds = scopedAuditChatIds(scope, filters.chatIds);
-  if (scopedChatIds !== undefined) {
-    conditions.push(scopedChatIds.length === 0 ? sql`FALSE` : oneOrMany(events.tenantId, scopedChatIds));
-  }
+  const conditions: SQL[] = [...auditEventScopeConditions(scope, filters.chatIds)];
   if (filters.occurredFrom !== undefined) conditions.push(gte(events.occurredAt, filters.occurredFrom));
   if (filters.occurredTo !== undefined) conditions.push(lte(events.occurredAt, filters.occurredTo));
   if (filters.topicId !== undefined) {
@@ -210,6 +311,18 @@ function auditEventsWhereConditions(
   return conditions;
 }
 
+function auditEventScopeConditions(scope: AuditEventsReadScope, requestedChatIds?: readonly string[]): SQL[] {
+  const scopedChatIds = scopedAuditChatIds(scope, requestedChatIds);
+  if (scopedChatIds === undefined) return [];
+  return [scopedChatIds.length === 0 ? sql`FALSE` : oneOrMany(events.tenantId, scopedChatIds)];
+}
+
+function auditPolicyScopeConditions(scope: AuditEventsReadScope): SQL[] {
+  if (scope.systemAdmin) return [];
+  const chatIds = uniqueNonEmpty(scope.allowedChatIds);
+  return [chatIds.length === 0 ? sql`FALSE` : oneOrMany(eventPolicies.chatId, chatIds)];
+}
+
 function scopedAuditChatIds(scope: AuditEventsReadScope, requestedChatIds: readonly string[] | undefined): readonly string[] | undefined {
   const requested = requestedChatIds === undefined ? undefined : uniqueNonEmpty(requestedChatIds);
   if (scope.systemAdmin) return requested;
@@ -218,7 +331,11 @@ function scopedAuditChatIds(scope: AuditEventsReadScope, requestedChatIds: reado
   return [...allowed];
 }
 
-type AuditEventTextColumn = typeof events.tenantId | typeof events.eventType | typeof events.category;
+type AuditEventTextColumn =
+  | typeof events.tenantId
+  | typeof events.eventType
+  | typeof events.category
+  | typeof eventPolicies.chatId;
 
 function oneOrMany(column: AuditEventTextColumn, values: readonly string[]): SQL {
   if (values.length === 0) return sql`FALSE`;
