@@ -1,5 +1,7 @@
 import { z } from 'zod';
 
+import { backendApiPrincipalConfigSchema } from './api/access.js';
+
 const optionalString = z.string().trim().optional().transform((value) => value || undefined);
 const booleanFromEnv = (defaultValue: boolean) =>
   z
@@ -17,6 +19,19 @@ const httpsUrl = z.string().url().refine(
   'URL must use HTTPS',
 );
 const optionalHttpsUrl = optionalString.pipe(httpsUrl.optional());
+const backendApiPrincipals = optionalString.transform((value, context) => {
+  if (value === undefined) return [];
+  try {
+    const parsed: unknown = JSON.parse(value);
+    return z.array(backendApiPrincipalConfigSchema).parse(parsed);
+  } catch (error: unknown) {
+    context.addIssue({
+      code: z.ZodIssueCode.custom,
+      message: error instanceof Error ? error.message : 'BACKEND_API_TOKENS must be a JSON array',
+    });
+    return z.NEVER;
+  }
+});
 const telegramUpdateTypes = [
   'message',
   'edited_message',
@@ -65,6 +80,10 @@ const configSchema = z
     databaseTlsCa: optionalString,
     databaseTlsCert: optionalString,
     databaseTlsKey: optionalString,
+    backendApiEnabled: booleanFromEnv(false),
+    backendApiHost: z.string().trim().min(1).default('127.0.0.1'),
+    backendApiPort: positiveInteger(8081),
+    backendApiPrincipals,
     auditRetentionDatabaseUrl: optionalString.pipe(databaseUrl.optional()),
     redisEnabled: booleanFromEnv(false),
     redisHost: z.string().trim().min(1).default('127.0.0.1'),
@@ -113,6 +132,17 @@ const configSchema = z
         context.addIssue({ code: z.ZodIssueCode.custom, path: ['rabbitMqUrl'], message: 'RabbitMQ requires an amqps:// URL when enabled' });
       }
     }
+    if (config.backendApiEnabled && config.backendApiPrincipals.length === 0) {
+      context.addIssue({ code: z.ZodIssueCode.custom, path: ['backendApiPrincipals'], message: 'BACKEND_API_TOKENS is required when BACKEND_API_ENABLED=true' });
+    }
+    const tokens = new Set<string>();
+    for (const principal of config.backendApiPrincipals) {
+      if (tokens.has(principal.token)) {
+        context.addIssue({ code: z.ZodIssueCode.custom, path: ['backendApiPrincipals'], message: 'BACKEND_API_TOKENS contains a duplicate token' });
+        break;
+      }
+      tokens.add(principal.token);
+    }
   });
 
 export type AppConfig = z.infer<typeof configSchema>;
@@ -134,6 +164,10 @@ function envToConfigInput(env: NodeJS.ProcessEnv): Record<string, string | undef
     databaseTlsCa: env.DATABASE_TLS_CA,
     databaseTlsCert: env.DATABASE_TLS_CERT,
     databaseTlsKey: env.DATABASE_TLS_KEY,
+    backendApiEnabled: env.BACKEND_API_ENABLED,
+    backendApiHost: env.BACKEND_API_HOST,
+    backendApiPort: env.BACKEND_API_PORT,
+    backendApiPrincipals: env.BACKEND_API_TOKENS,
     auditRetentionDatabaseUrl: env.AUDIT_RETENTION_DATABASE_URL,
     redisEnabled: env.REDIS_ENABLED,
     redisHost: env.REDIS_HOST,
