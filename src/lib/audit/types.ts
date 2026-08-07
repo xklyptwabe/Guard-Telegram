@@ -46,8 +46,8 @@ export interface AuditEventDefinition<T extends Record<string, unknown> = Record
 
 /**
  * The fully processed, safe-to-persist result for one occurrence of an
- * event. This is what a real `AuditService` implementation (task 1) would
- * accept — the registry's whole job ends at producing this value.
+ * event. This is what an `AuditEventWriter` implementation would accept —
+ * the registry's whole job ends at producing this value.
  */
 export interface AuditRecord<T extends Record<string, unknown> = Record<string, unknown>> {
   readonly eventName: string;
@@ -57,6 +57,7 @@ export interface AuditRecord<T extends Record<string, unknown> = Record<string, 
   readonly siteVisible: boolean;
   readonly operation: AuditOperation;
   readonly occurredAt: string;
+  readonly idempotencyKey?: string;
   readonly actorId: string | undefined;
   readonly chatId: string | undefined;
   /** Masked, allowlisted "before" snapshot — never raw domain data. */
@@ -67,12 +68,23 @@ export interface AuditRecord<T extends Record<string, unknown> = Record<string, 
 }
 
 /**
- * Contract for task 1's AuditService. BOTS-7 only depends on this interface
- * — no implementation lives here. Anything producing `AuditRecord`s (see
- * `service.ts`) should take an `AuditService` via constructor injection so
- * the real implementation can be swapped in later without touching the
- * registry/validation/masking code.
+ * Minimal "just persist this" contract — BOTS-7 only depends on this
+ * interface, no implementation lives here. Anything producing
+ * `AuditRecord`s (see `eventProcessor.ts`) can take one via constructor
+ * injection so a real implementation can be swapped in without touching
+ * the registry/validation/masking code.
+ *
+ * Deliberately named *not* `AuditService`: BOTS-6's real, transactional
+ * service (`src/lib/auditService.ts`, `AuditService.recordEntityChange`)
+ * is a different, richer contract — identity is tenantId/subjectType/
+ * subjectId, not chatId, and persistence happens inside a caller-supplied
+ * `mutate` alongside the business write. This interface predates that
+ * being confirmed and was originally also called `AuditService`, which
+ * read as two incompatible implementations of "the same" thing. Kept here
+ * only as a narrow, swappable seam for simple/log-like events; entity-like
+ * events should go through BOTS-6's `recordEntityChange` directly (see
+ * `serviceAdapter.ts`), not through this interface.
  */
-export interface AuditService {
+export interface AuditEventWriter {
   record(entry: AuditRecord): Promise<void>;
 }

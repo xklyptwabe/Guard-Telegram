@@ -22,7 +22,7 @@ export class UnsupportedAuditEventVersionError extends Error {
 export class AuditSnapshotValidationError extends Error {
   public constructor(
     public readonly eventName: string,
-    public readonly side: 'before' | 'after',
+    public readonly side: 'before' | 'after' | 'snapshotData',
     public readonly issues: string,
   ) {
     super(`Audit event "${eventName}" ${side} snapshot failed schema validation: ${issues}`);

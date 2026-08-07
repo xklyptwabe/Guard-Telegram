@@ -27,6 +27,13 @@ export const moduleStateChangedSchema = z.object({
   source: moduleStateSourceSchema,
 });
 
+export const moduleStateChangedSparseSchema = z.object({
+  chatId: z.string().min(1).optional(),
+  moduleId: z.string().min(1).optional(),
+  enabled: z.boolean(),
+  source: moduleStateSourceSchema,
+});
+
 export const chatSettingsChangedSchema = z.object({
   chatId: z.string().min(1),
   locale: z.string().min(2).max(10),

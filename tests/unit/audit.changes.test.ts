@@ -128,4 +128,12 @@ describe('computeChanges', () => {
     }
     expect(Object.keys(OPERATION_ABSENCE_RULES).sort()).toEqual([...operations].sort());
   });
+
+  it('does not report an unchanged NaN field as changed (NaN !== NaN in plain JS equality)', () => {
+    const before: Snapshot<Partial<Fields>> = observed({ enabled: true, locale: NaN as unknown as string });
+    const after: Snapshot<Partial<Fields>> = observed({ enabled: true, locale: NaN as unknown as string });
+
+    const result = computeChanges('update', before, after);
+    expect(result).toEqual({ status: 'computed', fields: {} });
+  });
 });
