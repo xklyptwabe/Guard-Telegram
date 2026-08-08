@@ -2,6 +2,8 @@ import { readFileSync } from 'node:fs';
 
 import { describe, expect, it } from 'vitest';
 
+import { validateConfig } from '../../src/config.js';
+
 const openApiPath = 'docs/openapi/backend-api.openapi.json';
 const requiredPaths = [
   '/api/v1/audit/events',
@@ -35,6 +37,18 @@ describe('backend API OpenAPI document', () => {
     expect(document.paths['/api/v1/audit/events']?.get?.operationId).toBe('listAuditEvents');
     expect(document.paths['/api/v1/audit/policies/{id}']?.patch?.operationId).toBe('patchAuditPolicy');
     expect(document.paths['/api/v1/audit/exports']?.post?.operationId).toBe('createAuditExport');
+  });
+
+  it('uses the backend API runtime default port in the local server URL', () => {
+    const document = JSON.parse(readFileSync(openApiPath, 'utf8')) as {
+      readonly servers?: readonly { readonly url?: string }[];
+    };
+    const runtimeDefaultPort = validateConfig({
+      TELEGRAM_BOT_TOKEN: 'test-token',
+      DATABASE_URL: 'postgres://bot:password@db.example.internal:5432/telegram',
+    }).backendApiPort;
+
+    expect(document.servers?.[0]?.url).toBe(`http://localhost:${runtimeDefaultPort}`);
   });
 
   it('documents optional backend effective-policy resolution without changing raw items', () => {
