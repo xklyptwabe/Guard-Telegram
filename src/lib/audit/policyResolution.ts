@@ -75,7 +75,15 @@ export async function resolveEffectiveAuditPolicy(
   db: AuditPolicyReader,
   target: AuditPolicyResolutionTarget,
 ): Promise<EffectiveAuditPolicy> {
-  const rows = await db
+  const rows = await readAuditPolicyResolutionRows(db);
+
+  return resolveEffectiveAuditPolicyFromRows(rows, target);
+}
+
+export async function readAuditPolicyResolutionRows(
+  db: AuditPolicyReader,
+): Promise<readonly AuditPolicyResolutionRow[]> {
+  return db
     .select({
       policyId: eventPolicies.policyId,
       chatId: eventPolicies.chatId,
@@ -92,8 +100,6 @@ export async function resolveEffectiveAuditPolicy(
       exportAllowed: eventPolicies.exportAllowed,
     })
     .from(eventPolicies);
-
-  return resolveEffectiveAuditPolicyFromRows(rows, target);
 }
 
 export function resolveEffectiveAuditPolicyFromRows(

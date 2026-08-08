@@ -75,7 +75,7 @@ async function listEvents(
   if (!query.success) return badRequest(query.error.message);
 
   try {
-    const page = await listAuditEvents(deps.db, { scope, ...query.data });
+    const page = await listAuditEvents(deps.db, { scope, siteVisibleOnly: true, ...query.data });
     return {
       statusCode: 200,
       body: {
@@ -94,7 +94,7 @@ async function getEvent(
   deps: AuditReadApiDependencies,
   scope: AuditEventsReadScope,
 ): Promise<ApiResponse> {
-  const event = await getAuditEventById(deps.db, { id, scope });
+  const event = await getAuditEventById(deps.db, { id, scope, siteVisibleOnly: true });
   if (event === undefined) return notFound();
   return { statusCode: 200, body: { item: serializeEvent(event) } };
 }

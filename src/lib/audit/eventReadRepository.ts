@@ -4,6 +4,11 @@ import { z } from 'zod';
 import type { DrizzleDatabase } from '../../db/client.js';
 import { eventPolicies, events, eventTypes } from '../../db/schema/audit.js';
 import type { EventCategory } from './enums.js';
+import {
+  readAuditPolicyResolutionRows,
+  resolveEffectiveAuditPolicyFromRows,
+  type AuditPolicyResolutionRow,
+} from './policyResolution.js';
 import { PLATFORM_TENANT_SENTINEL } from './serviceAdapter.js';
 
 export const AUDIT_EVENTS_DEFAULT_LIMIT = 50;
@@ -37,6 +42,7 @@ export interface AuditEventsListInput {
   readonly filters?: AuditEventsReadFilters;
   readonly limit?: number;
   readonly cursor?: string;
+  readonly siteVisibleOnly?: boolean;
 }
 
 export interface AuditEventsCursor {
@@ -127,23 +133,23 @@ export async function listAuditEvents(
   input: AuditEventsListInput,
 ): Promise<AuditEventsPage> {
   const limit = normalizeAuditEventsLimit(input.limit);
+  if (input.cursor !== undefined) decodeAuditEventsCursor(input.cursor);
+  if (input.siteVisibleOnly === true) return listSiteVisibleAuditEvents(db, input, limit);
+
   const rows = await buildAuditEventsListQuery(db, input);
-  const pageRows = rows.slice(0, limit);
-  const last = pageRows.at(-1);
-  return {
-    items: pageRows.map(toAuditEventReadRow),
-    ...(rows.length > limit && last !== undefined
-      ? { nextCursor: encodeAuditEventsCursor({ occurredAt: last.cursorOccurredAt, id: last.id }) }
-      : {}),
-  };
+  return auditEventsPage(rows, limit);
 }
 
 export async function getAuditEventById(
   db: AuditEventsReader,
-  input: { readonly id: string; readonly scope: AuditEventsReadScope },
+  input: { readonly id: string; readonly scope: AuditEventsReadScope; readonly siteVisibleOnly?: boolean },
 ): Promise<AuditEventReadRow | undefined> {
   const rows = await buildAuditEventByIdQuery(db, input);
-  return rows[0];
+  const event = rows[0];
+  if (event === undefined || input.siteVisibleOnly !== true) return event;
+
+  const policies = await readAuditPolicyResolutionRows(db);
+  return isEventSiteVisible(event, policies, new Map()) ? event : undefined;
 }
 
 export async function listAuditEventTypes(db: AuditEventsReader): Promise<readonly AuditEventTypeReadRow[]> {
@@ -267,6 +273,94 @@ const auditPolicySelection = {
   updatedAt: eventPolicies.updatedAt,
 } as const;
 
+type AuditEventListRow = AuditEventReadRow & { readonly cursorOccurredAt: string };
+
+async function listSiteVisibleAuditEvents(
+  db: AuditEventsReader,
+  input: AuditEventsListInput,
+  limit: number,
+): Promise<AuditEventsPage> {
+  const policies = await readAuditPolicyResolutionRows(db);
+  const visibilityCache = new Map<string, boolean>();
+  const visibleRows: AuditEventListRow[] = [];
+  let scanCursor = input.cursor;
+
+  while (visibleRows.length <= limit) {
+    const candidates = await buildAuditEventsListQuery(db, {
+      ...input,
+      limit: AUDIT_EVENTS_MAX_LIMIT,
+      ...(scanCursor === undefined ? {} : { cursor: scanCursor }),
+    });
+    if (candidates.length === 0) break;
+
+    for (const candidate of candidates) {
+      if (isEventSiteVisible(candidate, policies, visibilityCache)) visibleRows.push(candidate);
+      if (visibleRows.length > limit) break;
+    }
+    if (visibleRows.length > limit || candidates.length <= AUDIT_EVENTS_MAX_LIMIT) break;
+
+    const lastCandidate = candidates.at(-1);
+    if (lastCandidate === undefined) break;
+    scanCursor = encodeAuditEventsCursor({
+      occurredAt: lastCandidate.cursorOccurredAt,
+      id: lastCandidate.id,
+    });
+  }
+
+  return auditEventsPage(visibleRows, limit);
+}
+
+function auditEventsPage(rows: readonly AuditEventListRow[], limit: number): AuditEventsPage {
+  const pageRows = rows.slice(0, limit);
+  const last = pageRows.at(-1);
+  return {
+    items: pageRows.map(toAuditEventReadRow),
+    ...(rows.length > limit && last !== undefined
+      ? { nextCursor: encodeAuditEventsCursor({ occurredAt: last.cursorOccurredAt, id: last.id }) }
+      : {}),
+  };
+}
+
+function isEventSiteVisible(
+  event: AuditEventReadRow,
+  policies: readonly AuditPolicyResolutionRow[],
+  cache: Map<string, boolean>,
+): boolean {
+  const moduleId = eventModuleId(event);
+  if (moduleId === null) return false;
+
+  const key = [event.tenantId, event.eventType, event.eventVersion, moduleId ?? ''].join('\0');
+  const cached = cache.get(key);
+  if (cached !== undefined) return cached;
+
+  const effective = resolveEffectiveAuditPolicyFromRows(policies, {
+    chatId: event.tenantId,
+    eventType: event.eventType,
+    eventVersion: event.eventVersion,
+    ...(moduleId === undefined ? {} : { moduleId }),
+  });
+  cache.set(key, effective.values.siteVisible);
+  return effective.values.siteVisible;
+}
+
+function eventModuleId(event: AuditEventReadRow): string | undefined | null {
+  const moduleIds = new Set(
+    [
+      stringField(event.metadata, 'moduleId'),
+      stringField(event.before, 'moduleId'),
+      stringField(event.after, 'moduleId'),
+    ].filter((moduleId): moduleId is string => moduleId !== undefined),
+  );
+  if (moduleIds.size > 1) return null;
+  return moduleIds.values().next().value;
+}
+
+function stringField(value: unknown, field: string): string | undefined {
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) return undefined;
+  const candidate = (value as Record<string, unknown>)[field];
+  return typeof candidate === 'string' && candidate.length > 0 ? candidate : undefined;
+}
+
 export function encodeAuditEventsCursor(cursor: AuditEventsCursor): string {
   return Buffer.from(JSON.stringify(cursor), 'utf8').toString('base64url');
 }
@@ -380,7 +474,7 @@ function uniqueNonEmpty(values: readonly string[]): readonly string[] {
 }
 
 function toAuditEventReadRow(
-  row: AuditEventReadRow & { readonly cursorOccurredAt: string },
+  row: AuditEventListRow,
 ): AuditEventReadRow {
   const event = { ...row };
   Reflect.deleteProperty(event, 'cursorOccurredAt');

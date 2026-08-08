@@ -21,7 +21,7 @@
       "get": {
         "operationId": "listAuditEvents",
         "summary": "List audit events",
-        "description": "Requires audit.events.read. Non-system principals are restricted to their allowed chat_id values. System administrators may read global audit data.",
+        "description": "Requires audit.events.read. Non-system principals are restricted to their allowed chat_id values. System administrators may read global audit data. Events whose current effective policy has siteVisible=false are omitted for every principal, including system administrators.",
         "parameters": [
           { "$ref": "#/components/parameters/OccurredFrom" },
           { "$ref": "#/components/parameters/OccurredTo" },
@@ -59,7 +59,7 @@
       "get": {
         "operationId": "getAuditEvent",
         "summary": "Get one audit event",
-        "description": "Requires audit.events.read. Returns 404 both when the event does not exist and when it is outside the principal chat scope.",
+        "description": "Requires audit.events.read. Returns 404 when the event does not exist, is outside the principal chat scope, or its current effective policy has siteVisible=false. System administrators do not bypass siteVisible.",
         "parameters": [
           {
             "name": "id",

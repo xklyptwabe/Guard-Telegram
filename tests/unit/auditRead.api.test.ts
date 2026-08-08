@@ -25,7 +25,7 @@ describe('audit read API', () => {
 
     const response = await handleAuditReadRequest(
       'GET',
-      url('/api/v1/audit/events?chatId=chat-1&eventType=message.deleted&category=message&limit=1'),
+      url('/api/v1/audit/events?chatId=chat-1&eventType=command.executed&category=command&limit=1'),
       readPrincipal,
       { db: fakeReadDb({ events: rows }) as never },
     );
@@ -238,9 +238,9 @@ function selectedRowsFor(
 function auditEventRow(id: string, occurredAt: Date): AuditEventReadRow {
   return {
     id,
-    eventType: 'message.deleted',
+    eventType: 'command.executed',
     eventVersion: 'v1',
-    category: 'message',
+    category: 'command',
     occurredAt,
     recordedAt: occurredAt,
     source: 'telegram.command',
