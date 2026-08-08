@@ -60,7 +60,7 @@ export function normalizeAuditMutationForPersistence(
     after: normalizeSnapshotSide(definition, policy, 'after', afterSnapshotStatus, mutation.after),
     beforeSnapshotStatus,
     afterSnapshotStatus,
-    ...(mutation.changes === undefined ? {} : { changes: normalizeChanges(definition, policy, mutation.changes) }),
+    ...(mutation.changes === undefined ? {} : { changes: applyAuditPolicyToChanges(definition, policy, mutation.changes) }),
     snapshotData: normalizeSnapshotData(definition, policy, mutation.snapshotData),
   };
 }
@@ -104,7 +104,7 @@ function normalizeSnapshotData(
   return applyAllowlist(result.data as Record<string, unknown>, definition.allowlist, policy);
 }
 
-function normalizeChanges(
+export function applyAuditPolicyToChanges(
   definition: AuditEventDefinition<Record<string, unknown>>,
   policy: AuditPolicyContext,
   changes: Record<string, unknown>,

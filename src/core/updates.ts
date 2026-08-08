@@ -22,13 +22,24 @@ function chatTitle(ctx: Context): string | undefined {
   return ctx.chat && 'title' in ctx.chat ? ctx.chat.title : undefined;
 }
 
+function messageThreadId(ctx: Context): string | undefined {
+  if ('message' in ctx.update && ctx.update.message?.message_thread_id !== undefined) {
+    return String(ctx.update.message.message_thread_id);
+  }
+  if ('callback_query' in ctx.update && ctx.update.callback_query.message?.message_thread_id !== undefined) {
+    return String(ctx.update.callback_query.message.message_thread_id);
+  }
+  return undefined;
+}
+
 export function registerPlatformMiddleware(bot: Bot<Context>, database: DrizzleDatabase, registry: ModuleRegistry, logger: Logger): void {
   bot.use(async (ctx, next) => {
     const updateId = String(ctx.update.update_id);
     const chatId = ctx.chat ? String(ctx.chat.id) : undefined;
     const userId = ctx.from ? String(ctx.from.id) : undefined;
+    const threadId = messageThreadId(ctx);
     await runWithUpdateContext(
-      { updateId, ...(chatId ? { chatId } : {}), ...(userId ? { userId } : {}) },
+      { updateId, ...(chatId ? { chatId } : {}), ...(userId ? { userId } : {}), ...(threadId ? { messageThreadId: threadId } : {}) },
       async () => {
         if (ctx.chat) await registry.ensureChat(chatId!, ctx.chat.type, chatTitle(ctx));
         if (ctx.from) {

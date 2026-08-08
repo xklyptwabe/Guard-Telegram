@@ -2,6 +2,7 @@ import 'dotenv/config';
 
 import { migrate } from 'drizzle-orm/node-postgres/migrator';
 
+import { startBackendApiServer, type BackendApiController } from './api/server.js';
 import { validateConfig } from './config.js';
 import { collectCommands, registerCommands } from './core/commandRegistrar.js';
 import { CommandDispatcher } from './core/dispatcher.js';
@@ -30,6 +31,7 @@ async function bootstrap(): Promise<void> {
   const i18n = await initializeI18n();
   const database = createDatabase(config);
   let transport: TransportController | undefined;
+  let backendApi: BackendApiController | undefined;
   let redis: Awaited<ReturnType<typeof createRedis>> | undefined;
   let storage: ReturnType<typeof createStorage> | undefined;
   let rabbitMq: Awaited<ReturnType<typeof createRabbitMq>> | undefined;
@@ -39,7 +41,7 @@ async function bootstrap(): Promise<void> {
     if (shuttingDown) return;
     shuttingDown = true;
     logger.info({ event: 'shutdown.started', details: { signal } });
-    const closers = [transport?.stop(), rabbitMq?.close(), redis?.close(), storage?.close(), database.close()].filter(
+    const closers = [transport?.stop(), backendApi?.stop(), rabbitMq?.close(), redis?.close(), storage?.close(), database.close()].filter(
       (operation): operation is Promise<void> => operation !== undefined,
     );
     const results = await Promise.allSettled(closers);
@@ -71,6 +73,9 @@ async function bootstrap(): Promise<void> {
     registerModuleUpdateHandlers(bot, modules, registry, logger);
     await registerCommands(bot, modules, dispatcher, i18n, logger);
     transport = config.telegramTransport === 'webhook' ? await startWebhook(bot, config, logger) : startLongPolling(bot, config, logger);
+    if (config.backendApiEnabled) {
+      backendApi = await startBackendApiServer(config, database.db, audit, logger);
+    }
     logger.info({ event: 'bootstrap.completed', details: { ...healthSnapshot(config, redis, storage, rabbitMq) } });
   } catch (error: unknown) {
     logger.error({ event: 'bootstrap.failed', error: { name: error instanceof Error ? error.name : 'UnknownError', message: error instanceof Error ? error.message : String(error) } });

@@ -1,0 +1,787 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "Telegram Guard Backend API",
+    "version": "0.1.0",
+    "description": "Authenticated backend API for audit reads, audit policy management, and audit exports."
+  },
+  "servers": [
+    {
+      "url": "http://localhost:8081",
+      "description": "Local backend API listener when BACKEND_API_ENABLED=true"
+    }
+  ],
+  "security": [
+    {
+      "backendBearerAuth": []
+    }
+  ],
+  "paths": {
+    "/api/v1/audit/events": {
+      "get": {
+        "operationId": "listAuditEvents",
+        "summary": "List audit events",
+        "description": "Requires audit.events.read. Non-system principals are restricted to their allowed chat_id values. System administrators may read global audit data. Events whose current effective policy has siteVisible=false are omitted for every principal, including system administrators.",
+        "parameters": [
+          { "$ref": "#/components/parameters/OccurredFrom" },
+          { "$ref": "#/components/parameters/OccurredTo" },
+          { "$ref": "#/components/parameters/ChatId" },
+          { "$ref": "#/components/parameters/TopicId" },
+          { "$ref": "#/components/parameters/ActorId" },
+          { "$ref": "#/components/parameters/EventType" },
+          { "$ref": "#/components/parameters/Category" },
+          { "$ref": "#/components/parameters/ModuleId" },
+          { "$ref": "#/components/parameters/Source" },
+          { "$ref": "#/components/parameters/Status" },
+          { "$ref": "#/components/parameters/SubjectType" },
+          { "$ref": "#/components/parameters/SubjectId" },
+          { "$ref": "#/components/parameters/CorrelationId" },
+          { "$ref": "#/components/parameters/Limit" },
+          { "$ref": "#/components/parameters/Cursor" }
+        ],
+        "responses": {
+          "200": {
+            "description": "Audit events ordered by occurredAt desc, id desc.",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/AuditEventsPage" }
+              }
+            }
+          },
+          "400": { "$ref": "#/components/responses/BadRequest" },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "403": { "$ref": "#/components/responses/Forbidden" },
+          "500": { "$ref": "#/components/responses/InternalError" }
+        }
+      }
+    },
+    "/api/v1/audit/events/{id}": {
+      "get": {
+        "operationId": "getAuditEvent",
+        "summary": "Get one audit event",
+        "description": "Requires audit.events.read. Returns 404 when the event does not exist, is outside the principal chat scope, or its current effective policy has siteVisible=false. System administrators do not bypass siteVisible.",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Audit event.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": ["item"],
+                  "properties": {
+                    "item": { "$ref": "#/components/schemas/AuditEvent" }
+                  },
+                  "additionalProperties": false
+                }
+              }
+            }
+          },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "403": { "$ref": "#/components/responses/Forbidden" },
+          "404": { "$ref": "#/components/responses/NotFound" },
+          "500": { "$ref": "#/components/responses/InternalError" }
+        }
+      }
+    },
+    "/api/v1/audit/event-types": {
+      "get": {
+        "operationId": "listAuditEventTypes",
+        "summary": "List audit event types",
+        "description": "Requires audit.events.read.",
+        "responses": {
+          "200": {
+            "description": "Registered audit event types.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": ["items"],
+                  "properties": {
+                    "items": {
+                      "type": "array",
+                      "items": { "$ref": "#/components/schemas/AuditEventType" }
+                    }
+                  },
+                  "additionalProperties": false
+                }
+              }
+            }
+          },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "403": { "$ref": "#/components/responses/Forbidden" },
+          "500": { "$ref": "#/components/responses/InternalError" }
+        }
+      }
+    },
+    "/api/v1/audit/policies": {
+      "get": {
+        "operationId": "listAuditPolicies",
+        "summary": "List audit policies",
+        "description": "Requires audit.events.read. Non-system principals only receive raw policies scoped to their allowed chat_id values; global policy rows are visible only to system administrators. When eventType and eventVersion are supplied, the response also contains backend-resolved effective values and their sources for the target context. Non-system principals must supply an allowed chatId.",
+        "parameters": [
+          {
+            "name": "chatId",
+            "in": "query",
+            "description": "Optional for system administrators and required for non-system effective-policy resolution.",
+            "schema": { "type": "string", "minLength": 1, "maxLength": 128 }
+          },
+          {
+            "name": "eventType",
+            "in": "query",
+            "description": "Required together with eventVersion when requesting effective-policy resolution.",
+            "schema": { "type": "string", "minLength": 1, "maxLength": 128 }
+          },
+          {
+            "name": "eventVersion",
+            "in": "query",
+            "description": "Required together with eventType when requesting effective-policy resolution.",
+            "schema": { "type": "string", "pattern": "^v[0-9]+$" }
+          },
+          {
+            "name": "moduleId",
+            "in": "query",
+            "description": "Optional module context for effective-policy resolution.",
+            "schema": { "type": "string", "minLength": 1, "maxLength": 128 }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Audit policies visible to the principal.",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/AuditPolicyListResponse" }
+              }
+            }
+          },
+          "400": { "$ref": "#/components/responses/BadRequest" },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "403": { "$ref": "#/components/responses/Forbidden" },
+          "500": { "$ref": "#/components/responses/InternalError" }
+        }
+      }
+    },
+    "/api/v1/audit/policies/{id}": {
+      "patch": {
+        "operationId": "patchAuditPolicy",
+        "summary": "Patch an audit policy",
+        "description": "Requires audit.policies.manage. The policy id must be URL-encoded when it contains ':' or other reserved characters. Returns 404 for missing policies and policies outside the principal chat scope.",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "minLength": 1
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/AuditPolicyPatchRequest" }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Updated policy metadata and audit event id.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": ["item"],
+                  "properties": {
+                    "item": { "$ref": "#/components/schemas/AuditPolicyPatchResult" }
+                  },
+                  "additionalProperties": false
+                }
+              }
+            }
+          },
+          "400": { "$ref": "#/components/responses/BadRequest" },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "403": { "$ref": "#/components/responses/Forbidden" },
+          "404": { "$ref": "#/components/responses/NotFound" },
+          "409": { "$ref": "#/components/responses/OptimisticLockConflict" },
+          "413": { "$ref": "#/components/responses/PayloadTooLarge" },
+          "500": { "$ref": "#/components/responses/InternalError" }
+        }
+      }
+    },
+    "/api/v1/audit/exports": {
+      "post": {
+        "operationId": "createAuditExport",
+        "summary": "Create an audit export",
+        "description": "Requires audit.exports.create. The selected rows are restricted by the principal chat scope. Export fails closed when any selected row is not allowed by the effective export policy. Each successful export records audit.exported.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/AuditExportRequest" }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "Created audit export.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": ["item"],
+                  "properties": {
+                    "item": { "$ref": "#/components/schemas/AuditExportResult" }
+                  },
+                  "additionalProperties": false
+                }
+              }
+            }
+          },
+          "400": { "$ref": "#/components/responses/BadRequest" },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "403": { "$ref": "#/components/responses/Forbidden" },
+          "413": { "$ref": "#/components/responses/PayloadTooLarge" },
+          "500": { "$ref": "#/components/responses/InternalError" }
+        }
+      }
+    }
+  },
+  "components": {
+    "securitySchemes": {
+      "backendBearerAuth": {
+        "type": "http",
+        "scheme": "bearer",
+        "bearerFormat": "opaque backend API token"
+      }
+    },
+    "parameters": {
+      "OccurredFrom": {
+        "name": "occurredFrom",
+        "in": "query",
+        "schema": { "type": "string", "format": "date-time" }
+      },
+      "OccurredTo": {
+        "name": "occurredTo",
+        "in": "query",
+        "schema": { "type": "string", "format": "date-time" }
+      },
+      "ChatId": {
+        "name": "chatId",
+        "in": "query",
+        "description": "May be repeated or comma-separated.",
+        "schema": {
+          "oneOf": [
+            { "type": "string" },
+            { "type": "array", "items": { "type": "string" } }
+          ]
+        }
+      },
+      "TopicId": {
+        "name": "topicId",
+        "in": "query",
+        "schema": { "type": "string" }
+      },
+      "ActorId": {
+        "name": "actorId",
+        "in": "query",
+        "schema": { "type": "string" }
+      },
+      "EventType": {
+        "name": "eventType",
+        "in": "query",
+        "description": "May be repeated or comma-separated.",
+        "schema": {
+          "oneOf": [
+            { "type": "string" },
+            { "type": "array", "items": { "type": "string" } }
+          ]
+        }
+      },
+      "Category": {
+        "name": "category",
+        "in": "query",
+        "description": "May be repeated or comma-separated.",
+        "schema": {
+          "oneOf": [
+            { "$ref": "#/components/schemas/EventCategory" },
+            { "type": "array", "items": { "$ref": "#/components/schemas/EventCategory" } }
+          ]
+        }
+      },
+      "ModuleId": {
+        "name": "moduleId",
+        "in": "query",
+        "schema": { "type": "string" }
+      },
+      "Source": {
+        "name": "source",
+        "in": "query",
+        "schema": { "type": "string" }
+      },
+      "Status": {
+        "name": "status",
+        "in": "query",
+        "schema": { "$ref": "#/components/schemas/AuditEventStatus" }
+      },
+      "SubjectType": {
+        "name": "subjectType",
+        "in": "query",
+        "schema": { "type": "string" }
+      },
+      "SubjectId": {
+        "name": "subjectId",
+        "in": "query",
+        "schema": { "type": "string" }
+      },
+      "CorrelationId": {
+        "name": "correlationId",
+        "in": "query",
+        "schema": { "type": "string" }
+      },
+      "Limit": {
+        "name": "limit",
+        "in": "query",
+        "schema": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 100,
+          "default": 50
+        }
+      },
+      "Cursor": {
+        "name": "cursor",
+        "in": "query",
+        "description": "Opaque base64url cursor based on occurredAt and a UUID id. Malformed cursors return 400.",
+        "schema": { "type": "string" }
+      }
+    },
+    "responses": {
+      "BadRequest": {
+        "description": "Invalid request.",
+        "content": {
+          "application/json": {
+            "schema": { "$ref": "#/components/schemas/ErrorResponse" }
+          }
+        }
+      },
+      "Unauthorized": {
+        "description": "Missing or invalid bearer token.",
+        "content": {
+          "application/json": {
+            "schema": { "$ref": "#/components/schemas/ErrorResponse" }
+          }
+        }
+      },
+      "Forbidden": {
+        "description": "The authenticated principal does not have the required permission or export policy blocks the request.",
+        "content": {
+          "application/json": {
+            "schema": { "$ref": "#/components/schemas/ErrorResponse" }
+          }
+        }
+      },
+      "NotFound": {
+        "description": "Resource was not found or is outside the principal scope.",
+        "content": {
+          "application/json": {
+            "schema": { "$ref": "#/components/schemas/ErrorResponse" }
+          }
+        }
+      },
+      "OptimisticLockConflict": {
+        "description": "The supplied expectedLockVersion is stale.",
+        "content": {
+          "application/json": {
+            "schema": { "$ref": "#/components/schemas/ErrorResponse" }
+          }
+        }
+      },
+      "PayloadTooLarge": {
+        "description": "Request body exceeds the backend API body size limit.",
+        "content": {
+          "application/json": {
+            "schema": { "$ref": "#/components/schemas/ErrorResponse" }
+          }
+        }
+      },
+      "InternalError": {
+        "description": "Unexpected server error.",
+        "content": {
+          "application/json": {
+            "schema": { "$ref": "#/components/schemas/ErrorResponse" }
+          }
+        }
+      }
+    },
+    "schemas": {
+      "ErrorResponse": {
+        "type": "object",
+        "required": ["error"],
+        "properties": {
+          "error": {
+            "type": "object",
+            "required": ["code", "message"],
+            "properties": {
+              "code": { "type": "string" },
+              "message": { "type": "string" }
+            },
+            "additionalProperties": false
+          }
+        },
+        "additionalProperties": false
+      },
+      "EventCategory": {
+        "type": "string",
+        "enum": ["module", "chat", "audit", "member", "bot", "moderation", "message", "command", "integration"]
+      },
+      "AuditEventStatus": {
+        "type": "string",
+        "enum": ["recorded", "failed"]
+      },
+      "AuditSeverity": {
+        "type": "string",
+        "enum": ["debug", "info", "notice", "warning", "critical"]
+      },
+      "AuditSnapshotMode": {
+        "type": "string",
+        "enum": ["metadata", "snapshot"]
+      },
+      "AuditEvent": {
+        "type": "object",
+        "required": [
+          "id",
+          "eventType",
+          "eventVersion",
+          "category",
+          "occurredAt",
+          "recordedAt",
+          "source",
+          "status",
+          "tenantId",
+          "subjectType",
+          "subjectId",
+          "subjectSequence",
+          "beforeSnapshotStatus",
+          "afterSnapshotStatus"
+        ],
+        "properties": {
+          "id": { "type": "string", "format": "uuid" },
+          "eventType": { "type": "string" },
+          "eventVersion": { "type": "string" },
+          "category": { "$ref": "#/components/schemas/EventCategory" },
+          "occurredAt": { "type": "string", "format": "date-time" },
+          "recordedAt": { "type": "string", "format": "date-time" },
+          "source": { "type": "string" },
+          "status": { "$ref": "#/components/schemas/AuditEventStatus" },
+          "tenantId": { "type": "string" },
+          "actorId": { "type": ["string", "null"] },
+          "actorType": { "type": ["string", "null"] },
+          "subjectType": { "type": "string" },
+          "subjectId": { "type": "string" },
+          "subjectSequence": { "type": "integer" },
+          "correlationId": { "type": ["string", "null"] },
+          "telegramContext": true,
+          "before": true,
+          "after": true,
+          "beforeSnapshotStatus": { "type": "string" },
+          "afterSnapshotStatus": { "type": "string" },
+          "changes": true,
+          "metadata": true
+        },
+        "additionalProperties": false
+      },
+      "AuditEventsPage": {
+        "type": "object",
+        "required": ["items"],
+        "properties": {
+          "items": {
+            "type": "array",
+            "items": { "$ref": "#/components/schemas/AuditEvent" }
+          },
+          "nextCursor": { "type": "string" }
+        },
+        "additionalProperties": false
+      },
+      "AuditEventType": {
+        "type": "object",
+        "required": [
+          "eventType",
+          "eventVersion",
+          "category",
+          "severity",
+          "siteVisible",
+          "canBeDisabled",
+          "createdAt",
+          "updatedAt"
+        ],
+        "properties": {
+          "eventType": { "type": "string" },
+          "eventVersion": { "type": "string" },
+          "category": { "$ref": "#/components/schemas/EventCategory" },
+          "description": { "type": ["string", "null"] },
+          "severity": { "$ref": "#/components/schemas/AuditSeverity" },
+          "siteVisible": { "type": "boolean" },
+          "canBeDisabled": { "type": "boolean" },
+          "createdAt": { "type": "string", "format": "date-time" },
+          "updatedAt": { "type": "string", "format": "date-time" }
+        },
+        "additionalProperties": false
+      },
+      "AuditPolicy": {
+        "type": "object",
+        "required": [
+          "policyId",
+          "chatId",
+          "eventType",
+          "eventVersion",
+          "moduleId",
+          "required",
+          "retentionDays",
+          "enabled",
+          "siteVisible",
+          "snapshotMode",
+          "allowlist",
+          "masking",
+          "severity",
+          "exportAllowed",
+          "lockVersion",
+          "createdAt",
+          "updatedAt"
+        ],
+        "properties": {
+          "policyId": { "type": "string" },
+          "chatId": { "type": ["string", "null"] },
+          "eventType": { "type": ["string", "null"] },
+          "eventVersion": { "type": ["string", "null"] },
+          "moduleId": { "type": ["string", "null"] },
+          "required": { "type": "boolean" },
+          "retentionDays": { "type": ["integer", "null"], "minimum": 0 },
+          "enabled": { "type": ["boolean", "null"] },
+          "siteVisible": { "type": ["boolean", "null"] },
+          "snapshotMode": {
+            "oneOf": [
+              { "$ref": "#/components/schemas/AuditSnapshotMode" },
+              { "type": "null" }
+            ]
+          },
+          "allowlist": true,
+          "masking": true,
+          "severity": {
+            "oneOf": [
+              { "$ref": "#/components/schemas/AuditSeverity" },
+              { "type": "null" }
+            ]
+          },
+          "exportAllowed": { "type": ["boolean", "null"] },
+          "lockVersion": { "type": "integer", "minimum": 1 },
+          "createdAt": { "type": "string", "format": "date-time" },
+          "updatedAt": { "type": "string", "format": "date-time" }
+        },
+        "additionalProperties": false
+      },
+      "AuditPolicyListResponse": {
+        "type": "object",
+        "required": ["items"],
+        "properties": {
+          "items": {
+            "type": "array",
+            "description": "Raw policy rows visible in the principal scope.",
+            "items": { "$ref": "#/components/schemas/AuditPolicy" }
+          },
+          "effectivePolicy": { "$ref": "#/components/schemas/EffectiveAuditPolicy" }
+        },
+        "additionalProperties": false
+      },
+      "EffectiveAuditPolicy": {
+        "type": "object",
+        "required": ["target", "values", "sources"],
+        "properties": {
+          "target": { "$ref": "#/components/schemas/AuditPolicyResolutionTarget" },
+          "values": { "$ref": "#/components/schemas/AuditPolicyValues" },
+          "sources": { "$ref": "#/components/schemas/AuditPolicyValueSources" }
+        },
+        "additionalProperties": false
+      },
+      "AuditPolicyResolutionTarget": {
+        "type": "object",
+        "required": ["eventType", "eventVersion"],
+        "properties": {
+          "chatId": { "type": "string" },
+          "eventType": { "type": "string" },
+          "eventVersion": { "type": "string", "pattern": "^v[0-9]+$" },
+          "moduleId": { "type": "string" }
+        },
+        "additionalProperties": false
+      },
+      "AuditPolicyValues": {
+        "type": "object",
+        "required": ["enabled", "siteVisible", "snapshotMode", "allowlist", "masking", "retentionDays", "severity", "exportAllowed"],
+        "properties": {
+          "enabled": { "type": "boolean" },
+          "siteVisible": { "type": "boolean" },
+          "snapshotMode": { "$ref": "#/components/schemas/AuditSnapshotMode" },
+          "allowlist": { "type": "array", "items": { "type": "string" } },
+          "masking": { "type": "array", "items": { "type": "string" } },
+          "retentionDays": { "type": ["integer", "null"], "minimum": 1 },
+          "severity": { "$ref": "#/components/schemas/AuditSeverity" },
+          "exportAllowed": { "type": "boolean" }
+        },
+        "additionalProperties": false
+      },
+      "AuditPolicyValueSources": {
+        "type": "object",
+        "required": ["enabled", "siteVisible", "snapshotMode", "allowlist", "masking", "retentionDays", "severity", "exportAllowed"],
+        "properties": {
+          "enabled": { "$ref": "#/components/schemas/AuditPolicyValueSource" },
+          "siteVisible": { "$ref": "#/components/schemas/AuditPolicyValueSource" },
+          "snapshotMode": { "$ref": "#/components/schemas/AuditPolicyValueSource" },
+          "allowlist": { "$ref": "#/components/schemas/AuditPolicyValueSource" },
+          "masking": { "$ref": "#/components/schemas/AuditPolicyValueSource" },
+          "retentionDays": { "$ref": "#/components/schemas/AuditPolicyValueSource" },
+          "severity": { "$ref": "#/components/schemas/AuditPolicyValueSource" },
+          "exportAllowed": { "$ref": "#/components/schemas/AuditPolicyValueSource" }
+        },
+        "additionalProperties": false
+      },
+      "AuditPolicyValueSource": {
+        "type": "object",
+        "required": ["value", "source"],
+        "properties": {
+          "value": true,
+          "source": { "type": "string", "enum": ["default", "policy", "protected_event"] },
+          "policyId": { "type": "string" },
+          "priority": {
+            "type": "string",
+            "enum": ["chat_event_type", "chat_module", "chat", "global_event_type", "global_module", "global"]
+          }
+        },
+        "additionalProperties": false
+      },
+      "AuditPolicyPatchRequest": {
+        "type": "object",
+        "required": ["expectedLockVersion", "idempotencyKey"],
+        "properties": {
+          "expectedLockVersion": { "type": "integer", "minimum": 1 },
+          "idempotencyKey": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 256,
+            "description": "Client retry key. The server namespaces it by actor, policy, lock version, and patch before audit persistence."
+          },
+          "enabled": { "type": ["boolean", "null"] },
+          "siteVisible": { "type": ["boolean", "null"] },
+          "snapshotMode": {
+            "oneOf": [
+              { "$ref": "#/components/schemas/AuditSnapshotMode" },
+              { "type": "null" }
+            ]
+          },
+          "allowlist": {
+            "oneOf": [
+              { "type": "array", "items": { "type": "string", "minLength": 1, "maxLength": 256 } },
+              { "type": "null" }
+            ]
+          },
+          "masking": {
+            "oneOf": [
+              { "type": "array", "items": { "type": "string", "minLength": 1, "maxLength": 256 } },
+              { "type": "null" }
+            ]
+          },
+          "retentionDays": { "type": ["integer", "null"], "minimum": 1 },
+          "severity": {
+            "oneOf": [
+              { "$ref": "#/components/schemas/AuditSeverity" },
+              { "type": "null" }
+            ]
+          },
+          "exportAllowed": { "type": ["boolean", "null"] }
+        },
+        "additionalProperties": false
+      },
+      "AuditPolicyPatchResult": {
+        "type": "object",
+        "required": ["policyId", "lockVersion", "updatedAt", "auditEventId", "duplicate"],
+        "properties": {
+          "policyId": { "type": "string" },
+          "lockVersion": { "type": "integer", "minimum": 1 },
+          "updatedAt": { "type": "string", "format": "date-time" },
+          "auditEventId": { "type": "string" },
+          "duplicate": { "type": "boolean" }
+        },
+        "additionalProperties": false
+      },
+      "AuditExportFilters": {
+        "type": "object",
+        "properties": {
+          "occurredFrom": { "type": "string", "format": "date-time" },
+          "occurredTo": { "type": "string", "format": "date-time" },
+          "chatIds": { "type": "array", "items": { "type": "string", "minLength": 1, "maxLength": 128 } },
+          "topicId": { "type": "string", "minLength": 1, "maxLength": 128 },
+          "actorId": { "type": "string", "minLength": 1, "maxLength": 128 },
+          "eventTypes": { "type": "array", "items": { "type": "string", "minLength": 1, "maxLength": 128 } },
+          "categories": { "type": "array", "items": { "$ref": "#/components/schemas/EventCategory" } },
+          "moduleId": { "type": "string", "minLength": 1, "maxLength": 128 },
+          "source": { "type": "string", "minLength": 1, "maxLength": 128 },
+          "status": { "$ref": "#/components/schemas/AuditEventStatus" },
+          "subjectType": { "type": "string", "minLength": 1, "maxLength": 128 },
+          "subjectId": { "type": "string", "minLength": 1, "maxLength": 256 },
+          "correlationId": { "type": "string", "minLength": 1, "maxLength": 256 }
+        },
+        "additionalProperties": false
+      },
+      "AuditExportRequest": {
+        "type": "object",
+        "properties": {
+          "format": {
+            "type": "string",
+            "enum": ["json", "csv"],
+            "default": "json"
+          },
+          "filters": { "$ref": "#/components/schemas/AuditExportFilters" },
+          "limit": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 100
+          }
+        },
+        "additionalProperties": false
+      },
+      "AuditExportResult": {
+        "type": "object",
+        "required": ["exportId", "format", "contentType", "rowCount", "truncated", "auditEventId", "data"],
+        "properties": {
+          "exportId": { "type": "string", "format": "uuid" },
+          "format": { "type": "string", "enum": ["json", "csv"] },
+          "contentType": { "type": "string" },
+          "rowCount": { "type": "integer", "minimum": 0 },
+          "truncated": { "type": "boolean" },
+          "auditEventId": { "type": "string" },
+          "data": {
+            "oneOf": [
+              {
+                "type": "array",
+                "items": { "$ref": "#/components/schemas/AuditEvent" }
+              },
+              { "type": "string" }
+            ]
+          }
+        },
+        "additionalProperties": false
+      }
+    }
+  }
+}

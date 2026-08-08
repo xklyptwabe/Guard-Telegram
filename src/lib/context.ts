@@ -6,6 +6,7 @@ export interface UpdateContext {
   readonly updateId: string;
   readonly chatId?: string;
   readonly userId?: string;
+  readonly messageThreadId?: string;
 }
 
 const updateContext = new AsyncLocalStorage<UpdateContext>();
