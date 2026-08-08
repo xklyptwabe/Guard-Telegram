@@ -2,6 +2,7 @@ import { randomUUID } from 'node:crypto';
 
 import type { DrizzleDatabase } from '../../db/client.js';
 import type { AuditService } from '../auditService.js';
+import { applyAllowlist, stripForbidden, type AuditPolicyContext } from './masking.js';
 import {
   AUDIT_EVENTS_DEFAULT_LIMIT,
   AUDIT_EVENTS_MAX_LIMIT,
@@ -10,7 +11,9 @@ import {
   type AuditEventsReadFilters,
   type AuditEventsReadScope,
 } from './eventReadRepository.js';
-import { resolveEffectiveAuditPolicy } from './policyResolution.js';
+import { applyAuditPolicyToChanges, requireAuditPersistenceDefinition } from './persistenceValidation.js';
+import { resolveEffectiveAuditPolicy, type EffectiveAuditPolicy } from './policyResolution.js';
+import { auditEventRegistry } from './registry.js';
 import { PLATFORM_TENANT_SENTINEL } from './serviceAdapter.js';
 
 export type AuditExportFormat = 'json' | 'csv';
@@ -55,10 +58,10 @@ export async function createAuditExport(
   });
   const rows = [...page.items];
 
-  await assertExportAllowed(db, rows);
+  const policyProjectedRows = await applyEffectiveExportPolicies(db, rows);
 
   const exportId = randomUUID();
-  const serializedRows = rows.map(serializeEventForExport);
+  const serializedRows = policyProjectedRows.map(serializeEventForExport);
   const exported = input.format === 'csv' ? csvExport(serializedRows) : serializedRows;
   const auditSnapshot = auditExportSnapshot(exportId, input, rows);
   const auditResult = await audit.recordEntityChange(
@@ -105,25 +108,31 @@ function normalizeExportLimit(limit: number | undefined): number {
   return Math.min(limit, AUDIT_EVENTS_MAX_LIMIT);
 }
 
-async function assertExportAllowed(db: AuditExportDatabase, rows: readonly AuditEventReadRow[]): Promise<void> {
-  const cache = new Map<string, boolean>();
+async function applyEffectiveExportPolicies(
+  db: AuditExportDatabase,
+  rows: readonly AuditEventReadRow[],
+): Promise<readonly AuditEventReadRow[]> {
+  const cache = new Map<string, EffectiveAuditPolicy>();
+  const projectedRows: AuditEventReadRow[] = [];
 
   for (const row of rows) {
     const moduleId = moduleIdFor(row);
     const cacheKey = [row.tenantId, row.eventType, row.eventVersion, moduleId ?? ''].join('\0');
-    const cached = cache.get(cacheKey);
-    if (cached === false) throw new AuditExportPolicyError();
-    if (cached === true) continue;
-
-    const policy = await resolveEffectiveAuditPolicy(db, {
-      chatId: row.tenantId,
-      eventType: row.eventType,
-      eventVersion: row.eventVersion,
-      ...(moduleId === undefined ? {} : { moduleId }),
-    });
-    cache.set(cacheKey, policy.values.exportAllowed);
+    let policy = cache.get(cacheKey);
+    if (policy === undefined) {
+      policy = await resolveEffectiveAuditPolicy(db, {
+        chatId: row.tenantId,
+        eventType: row.eventType,
+        eventVersion: row.eventVersion,
+        ...(moduleId === undefined ? {} : { moduleId }),
+      });
+      cache.set(cacheKey, policy);
+    }
     if (!policy.values.exportAllowed) throw new AuditExportPolicyError();
+    projectedRows.push(applyEffectivePolicyToExportRow(row, policy));
   }
+
+  return projectedRows;
 }
 
 function auditExportSnapshot(
@@ -165,6 +174,63 @@ function moduleIdFor(row: AuditEventReadRow): string | undefined {
   );
   if (moduleIds.size > 1) throw new AuditExportPolicyError();
   return moduleIds.values().next().value;
+}
+
+function applyEffectivePolicyToExportRow(
+  row: AuditEventReadRow,
+  policy: EffectiveAuditPolicy,
+): AuditEventReadRow {
+  const definition = requireAuditPersistenceDefinition(row, auditEventRegistry);
+  const policyContext: AuditPolicyContext = {
+    allowMessageTextLogging: policy.values.allowlist.includes('text'),
+    allowlist: policy.values.allowlist,
+    masking: policy.values.masking,
+  };
+
+  return {
+    ...row,
+    before: applyPolicyToSnapshot(row.before, definition.allowlist, policyContext),
+    after: applyPolicyToSnapshot(row.after, definition.allowlist, policyContext),
+    changes: applyPolicyToChanges(row.changes, definition, policyContext),
+    metadata: applyPolicyToMetadata(row.metadata, definition.allowlist, policyContext),
+  };
+}
+
+function applyPolicyToSnapshot(
+  value: unknown,
+  allowlist: Parameters<typeof applyAllowlist<Record<string, unknown>>>[1],
+  policy: AuditPolicyContext,
+): unknown {
+  return isRecord(value) ? applyAllowlist(value, allowlist, policy) : stripForbidden(value);
+}
+
+function applyPolicyToChanges(
+  value: unknown,
+  definition: Parameters<typeof applyAuditPolicyToChanges>[0],
+  policy: AuditPolicyContext,
+): unknown {
+  return isRecord(value) ? applyAuditPolicyToChanges(definition, policy, value) : stripForbidden(value);
+}
+
+function applyPolicyToMetadata(
+  value: unknown,
+  allowlist: Parameters<typeof applyAllowlist<Record<string, unknown>>>[1],
+  policy: AuditPolicyContext,
+): unknown {
+  if (!isRecord(value)) return stripForbidden(value);
+
+  const registryFields = new Set(allowlist.map((entry) => String(typeof entry === 'object' ? entry.field : entry)));
+  const operationalMetadata = Object.fromEntries(
+    Object.entries(value).filter(([field]) => !registryFields.has(field)),
+  );
+  const operationalPolicy: AuditPolicyContext = {
+    allowMessageTextLogging: policy.allowMessageTextLogging,
+    ...(policy.masking === undefined ? {} : { masking: policy.masking }),
+  };
+  return {
+    ...applyAllowlist(operationalMetadata, Object.keys(operationalMetadata), operationalPolicy),
+    ...applyAllowlist(value, allowlist, policy),
+  };
 }
 
 function serializeEventForExport(row: AuditEventReadRow): Record<string, unknown> {
