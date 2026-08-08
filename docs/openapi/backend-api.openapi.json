@@ -128,26 +128,43 @@
       "get": {
         "operationId": "listAuditPolicies",
         "summary": "List audit policies",
-        "description": "Requires audit.events.read. Non-system principals only receive policies scoped to their allowed chat_id values; global policies are visible only to system administrators.",
+        "description": "Requires audit.events.read. Non-system principals only receive raw policies scoped to their allowed chat_id values; global policy rows are visible only to system administrators. When eventType and eventVersion are supplied, the response also contains backend-resolved effective values and their sources for the target context. Non-system principals must supply an allowed chatId.",
+        "parameters": [
+          {
+            "name": "chatId",
+            "in": "query",
+            "description": "Optional for system administrators and required for non-system effective-policy resolution.",
+            "schema": { "type": "string", "minLength": 1, "maxLength": 128 }
+          },
+          {
+            "name": "eventType",
+            "in": "query",
+            "description": "Required together with eventVersion when requesting effective-policy resolution.",
+            "schema": { "type": "string", "minLength": 1, "maxLength": 128 }
+          },
+          {
+            "name": "eventVersion",
+            "in": "query",
+            "description": "Required together with eventType when requesting effective-policy resolution.",
+            "schema": { "type": "string", "pattern": "^v[0-9]+$" }
+          },
+          {
+            "name": "moduleId",
+            "in": "query",
+            "description": "Optional module context for effective-policy resolution.",
+            "schema": { "type": "string", "minLength": 1, "maxLength": 128 }
+          }
+        ],
         "responses": {
           "200": {
             "description": "Audit policies visible to the principal.",
             "content": {
               "application/json": {
-                "schema": {
-                  "type": "object",
-                  "required": ["items"],
-                  "properties": {
-                    "items": {
-                      "type": "array",
-                      "items": { "$ref": "#/components/schemas/AuditPolicy" }
-                    }
-                  },
-                  "additionalProperties": false
-                }
+                "schema": { "$ref": "#/components/schemas/AuditPolicyListResponse" }
               }
             }
           },
+          "400": { "$ref": "#/components/responses/BadRequest" },
           "401": { "$ref": "#/components/responses/Unauthorized" },
           "403": { "$ref": "#/components/responses/Forbidden" },
           "500": { "$ref": "#/components/responses/InternalError" }
@@ -572,6 +589,84 @@
           "lockVersion": { "type": "integer", "minimum": 1 },
           "createdAt": { "type": "string", "format": "date-time" },
           "updatedAt": { "type": "string", "format": "date-time" }
+        },
+        "additionalProperties": false
+      },
+      "AuditPolicyListResponse": {
+        "type": "object",
+        "required": ["items"],
+        "properties": {
+          "items": {
+            "type": "array",
+            "description": "Raw policy rows visible in the principal scope.",
+            "items": { "$ref": "#/components/schemas/AuditPolicy" }
+          },
+          "effectivePolicy": { "$ref": "#/components/schemas/EffectiveAuditPolicy" }
+        },
+        "additionalProperties": false
+      },
+      "EffectiveAuditPolicy": {
+        "type": "object",
+        "required": ["target", "values", "sources"],
+        "properties": {
+          "target": { "$ref": "#/components/schemas/AuditPolicyResolutionTarget" },
+          "values": { "$ref": "#/components/schemas/AuditPolicyValues" },
+          "sources": { "$ref": "#/components/schemas/AuditPolicyValueSources" }
+        },
+        "additionalProperties": false
+      },
+      "AuditPolicyResolutionTarget": {
+        "type": "object",
+        "required": ["eventType", "eventVersion"],
+        "properties": {
+          "chatId": { "type": "string" },
+          "eventType": { "type": "string" },
+          "eventVersion": { "type": "string", "pattern": "^v[0-9]+$" },
+          "moduleId": { "type": "string" }
+        },
+        "additionalProperties": false
+      },
+      "AuditPolicyValues": {
+        "type": "object",
+        "required": ["enabled", "siteVisible", "snapshotMode", "allowlist", "masking", "retentionDays", "severity", "exportAllowed"],
+        "properties": {
+          "enabled": { "type": "boolean" },
+          "siteVisible": { "type": "boolean" },
+          "snapshotMode": { "$ref": "#/components/schemas/AuditSnapshotMode" },
+          "allowlist": { "type": "array", "items": { "type": "string" } },
+          "masking": { "type": "array", "items": { "type": "string" } },
+          "retentionDays": { "type": ["integer", "null"], "minimum": 1 },
+          "severity": { "$ref": "#/components/schemas/AuditSeverity" },
+          "exportAllowed": { "type": "boolean" }
+        },
+        "additionalProperties": false
+      },
+      "AuditPolicyValueSources": {
+        "type": "object",
+        "required": ["enabled", "siteVisible", "snapshotMode", "allowlist", "masking", "retentionDays", "severity", "exportAllowed"],
+        "properties": {
+          "enabled": { "$ref": "#/components/schemas/AuditPolicyValueSource" },
+          "siteVisible": { "$ref": "#/components/schemas/AuditPolicyValueSource" },
+          "snapshotMode": { "$ref": "#/components/schemas/AuditPolicyValueSource" },
+          "allowlist": { "$ref": "#/components/schemas/AuditPolicyValueSource" },
+          "masking": { "$ref": "#/components/schemas/AuditPolicyValueSource" },
+          "retentionDays": { "$ref": "#/components/schemas/AuditPolicyValueSource" },
+          "severity": { "$ref": "#/components/schemas/AuditPolicyValueSource" },
+          "exportAllowed": { "$ref": "#/components/schemas/AuditPolicyValueSource" }
+        },
+        "additionalProperties": false
+      },
+      "AuditPolicyValueSource": {
+        "type": "object",
+        "required": ["value", "source"],
+        "properties": {
+          "value": true,
+          "source": { "type": "string", "enum": ["default", "policy", "protected_event"] },
+          "policyId": { "type": "string" },
+          "priority": {
+            "type": "string",
+            "enum": ["chat_event_type", "chat_module", "chat", "global_event_type", "global_module", "global"]
+          }
         },
         "additionalProperties": false
       },

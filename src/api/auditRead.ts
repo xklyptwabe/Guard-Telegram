@@ -2,6 +2,9 @@ import { z } from 'zod';
 
 import type { DrizzleDatabase } from '../db/client.js';
 import type { EventCategory } from '../lib/audit/enums.js';
+import { resolveEffectiveAuditPolicy, type EffectiveAuditPolicy } from '../lib/audit/policyResolution.js';
+import type { AuditPolicyResolutionTarget } from '../lib/audit/policyPriority.js';
+import { auditEventRegistry } from '../lib/audit/registry.js';
 import {
   AuditEventsCursorError,
   listAuditEventTypes,
@@ -15,7 +18,7 @@ import {
   type AuditPolicyReadRow,
 } from '../lib/audit/eventReadRepository.js';
 import type { BackendApiPrincipal } from './access.js';
-import { hasBackendApiPermission } from './access.js';
+import { canAccessBackendApiChat, hasBackendApiPermission } from './access.js';
 import { badRequest, forbidden, notFound, type ApiResponse } from './responses.js';
 
 const eventCategorySchema = z.enum([
@@ -31,6 +34,12 @@ const eventCategorySchema = z.enum([
 ]);
 const eventStatusSchema = z.enum(['recorded', 'failed']);
 const uuidPathSegmentSchema = z.string().uuid();
+const policyResolutionTargetSchema = z.object({
+  chatId: z.string().trim().min(1).max(128).optional(),
+  eventType: z.string().trim().min(1).max(128),
+  eventVersion: z.string().regex(/^v\d+$/),
+  moduleId: z.string().trim().min(1).max(128).optional(),
+});
 
 export interface AuditReadApiDependencies {
   readonly db: DrizzleDatabase;
@@ -56,7 +65,7 @@ export async function handleAuditReadRequest(
     return { statusCode: 200, body: { items: serializeEventTypes(await listAuditEventTypes(deps.db)) } };
   }
   if (url.pathname === '/api/v1/audit/policies') {
-    return { statusCode: 200, body: { items: serializePolicies(await listAuditPolicies(deps.db, scope)) } };
+    return listPolicies(url, principal, deps, scope);
   }
 
   const eventId = matchEventById(url.pathname);
@@ -64,6 +73,36 @@ export async function handleAuditReadRequest(
     return getEvent(eventId, deps, scope);
   }
   return undefined;
+}
+
+async function listPolicies(
+  url: URL,
+  principal: BackendApiPrincipal,
+  deps: AuditReadApiDependencies,
+  scope: AuditEventsReadScope,
+): Promise<ApiResponse> {
+  const parsedTarget = parsePolicyResolutionTarget(url.searchParams);
+  if (!parsedTarget.success) return badRequest(parsedTarget.error.message);
+  const target = parsedTarget.target;
+  if (
+    target !== undefined &&
+    !principal.systemAdmin &&
+    (target.chatId === undefined || !canAccessBackendApiChat(principal, target.chatId))
+  ) {
+    return forbidden();
+  }
+
+  const items = serializePolicies(await listAuditPolicies(deps.db, scope));
+  if (target === undefined) return { statusCode: 200, body: { items } };
+
+  const effective = await resolveEffectiveAuditPolicy(deps.db, target);
+  return {
+    statusCode: 200,
+    body: {
+      items,
+      effectivePolicy: serializeEffectivePolicy(target, effective),
+    },
+  };
 }
 
 async function listEvents(
@@ -159,6 +198,37 @@ function readScope(principal: BackendApiPrincipal): AuditEventsReadScope {
   return { systemAdmin: principal.systemAdmin, allowedChatIds: principal.allowedChatIds };
 }
 
+function parsePolicyResolutionTarget(searchParams: URLSearchParams):
+  | { readonly success: true; readonly target?: AuditPolicyResolutionTarget }
+  | { readonly success: false; readonly error: Error } {
+  const targetKeys = ['chatId', 'eventType', 'eventVersion', 'moduleId'] as const;
+  if (!targetKeys.some((key) => searchParams.has(key))) return { success: true };
+
+  const parsed = policyResolutionTargetSchema.safeParse({
+    chatId: stringParam(searchParams, 'chatId'),
+    eventType: stringParam(searchParams, 'eventType'),
+    eventVersion: stringParam(searchParams, 'eventVersion'),
+    moduleId: stringParam(searchParams, 'moduleId'),
+  });
+  if (!parsed.success) return { success: false, error: new Error(parsed.error.message) };
+
+  const version = Number(parsed.data.eventVersion.slice(1));
+  try {
+    auditEventRegistry.requireSupportedVersion(parsed.data.eventType, version);
+  } catch (error: unknown) {
+    return { success: false, error: error instanceof Error ? error : new Error(String(error)) };
+  }
+  return {
+    success: true,
+    target: {
+      ...(parsed.data.chatId === undefined ? {} : { chatId: parsed.data.chatId }),
+      eventType: parsed.data.eventType,
+      eventVersion: parsed.data.eventVersion,
+      ...(parsed.data.moduleId === undefined ? {} : { moduleId: parsed.data.moduleId }),
+    },
+  };
+}
+
 function dateParam(searchParams: URLSearchParams, key: string): Date | undefined {
   const value = stringParam(searchParams, key);
   if (value === undefined) return undefined;
@@ -220,4 +290,20 @@ function serializePolicies(rows: readonly AuditPolicyReadRow[]): readonly Record
     createdAt: row.createdAt.toISOString(),
     updatedAt: row.updatedAt.toISOString(),
   }));
+}
+
+function serializeEffectivePolicy(
+  target: AuditPolicyResolutionTarget,
+  effective: EffectiveAuditPolicy,
+): Record<string, unknown> {
+  return {
+    target: {
+      ...(target.chatId === undefined ? {} : { chatId: target.chatId }),
+      eventType: target.eventType,
+      eventVersion: target.eventVersion,
+      ...(target.moduleId === undefined ? {} : { moduleId: target.moduleId }),
+    },
+    values: effective.values,
+    sources: effective.sources,
+  };
 }
