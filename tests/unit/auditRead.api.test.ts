@@ -66,6 +66,41 @@ describe('audit read API', () => {
     });
   });
 
+  it('accepts RFC 3339 occurred-at range filters in combination', async () => {
+    const response = await handleAuditReadRequest(
+      'GET',
+      url(
+        '/api/v1/audit/events?occurredFrom=2026-08-07T10%3A00%3A00Z&occurredTo=2026-08-07T12%3A00%3A00%2B02%3A00',
+      ),
+      readPrincipal,
+      { db: fakeReadDb() as never },
+    );
+
+    expect(response?.statusCode).toBe(200);
+  });
+
+  it.each([
+    ['a year without a date', 'occurredFrom', '2026'],
+    ['an impossible calendar date', 'occurredFrom', '2026-02-30T10:00:00Z'],
+    ['a date-time without a timezone', 'occurredTo', '2026-08-07T10:00:00'],
+  ])('rejects %s as an occurred-at filter before querying the database', async (_description, key, value) => {
+    const db = {
+      select: () => {
+        throw new Error('database must not be queried for an invalid date-time');
+      },
+    };
+
+    const response = await handleAuditReadRequest(
+      'GET',
+      url(`/api/v1/audit/events?${key}=${encodeURIComponent(value)}`),
+      readPrincipal,
+      { db: db as never },
+    );
+
+    expect(response?.statusCode).toBe(400);
+    expect(response?.body).toMatchObject({ error: { code: 'bad_request' } });
+  });
+
   it('returns a single event through the same read permission', async () => {
     const event = auditEventRow('aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa', new Date('2026-08-07T10:00:00.000Z'));
 

@@ -9,6 +9,7 @@ import type { AuditEventsReadFilters, AuditEventsReadScope } from '../lib/audit/
 import type { AuditService } from '../lib/auditService.js';
 import type { BackendApiPrincipal } from './access.js';
 import { hasBackendApiPermission } from './access.js';
+import { auditFilterDateTimeSchema } from './auditFilterValidation.js';
 import { badRequest, forbidden, type ApiResponse } from './responses.js';
 
 const eventCategorySchema = z.enum([
@@ -26,8 +27,8 @@ const eventStatusSchema = z.enum(['recorded', 'failed']);
 const exportFormatSchema = z.enum(['json', 'csv']);
 const exportFiltersSchema = z
   .object({
-    occurredFrom: z.string().datetime().optional(),
-    occurredTo: z.string().datetime().optional(),
+    occurredFrom: auditFilterDateTimeSchema.optional(),
+    occurredTo: auditFilterDateTimeSchema.optional(),
     chatIds: z.array(z.string().trim().min(1).max(128)).optional(),
     topicId: z.string().trim().min(1).max(128).optional(),
     actorId: z.string().trim().min(1).max(128).optional(),
@@ -105,8 +106,8 @@ function exportScope(principal: BackendApiPrincipal): AuditEventsReadScope {
 function toReadFilters(request: ExportRequest): AuditEventsReadFilters {
   const filters = request.filters;
   return {
-    ...(filters.occurredFrom === undefined ? {} : { occurredFrom: new Date(filters.occurredFrom) }),
-    ...(filters.occurredTo === undefined ? {} : { occurredTo: new Date(filters.occurredTo) }),
+    ...(filters.occurredFrom === undefined ? {} : { occurredFrom: filters.occurredFrom }),
+    ...(filters.occurredTo === undefined ? {} : { occurredTo: filters.occurredTo }),
     ...(filters.chatIds === undefined ? {} : { chatIds: filters.chatIds }),
     ...(filters.topicId === undefined ? {} : { topicId: filters.topicId }),
     ...(filters.actorId === undefined ? {} : { actorId: filters.actorId }),

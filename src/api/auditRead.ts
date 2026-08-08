@@ -19,6 +19,7 @@ import {
 } from '../lib/audit/eventReadRepository.js';
 import type { BackendApiPrincipal } from './access.js';
 import { canAccessBackendApiChat, hasBackendApiPermission } from './access.js';
+import { auditFilterDateTimeSchema } from './auditFilterValidation.js';
 import { badRequest, forbidden, notFound, type ApiResponse } from './responses.js';
 
 const eventCategorySchema = z.enum([
@@ -232,9 +233,7 @@ function parsePolicyResolutionTarget(searchParams: URLSearchParams):
 function dateParam(searchParams: URLSearchParams, key: string): Date | undefined {
   const value = stringParam(searchParams, key);
   if (value === undefined) return undefined;
-  const date = new Date(value);
-  if (Number.isNaN(date.getTime())) throw new Error(`${key} must be an ISO date-time.`);
-  return date;
+  return auditFilterDateTimeSchema.parse(value);
 }
 
 function positiveIntParam(searchParams: URLSearchParams, key: string): number | undefined {
