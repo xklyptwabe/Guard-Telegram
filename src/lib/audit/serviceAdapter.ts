@@ -115,6 +115,14 @@ export interface DownstreamAuditEventInput extends DownstreamAuditIdentity {
   readonly category: string;
   readonly source: string;
   readonly idempotencyKey: string;
+  /**
+   * Feeds BOTS-8's hierarchical policy resolution (global → chat → module →
+   * event_type). Without it, a module-level policy override can never
+   * apply to this event — silently falls back to chat/global. Populated
+   * generically below whenever the observed snapshot carries a `moduleId`
+   * field (true for `module.state.changed` and `command.executed` today).
+   */
+  readonly moduleId?: string;
   readonly actorId?: string;
   readonly actorType?: string;
   readonly correlationId?: string;
@@ -377,6 +385,10 @@ export function toDownstreamInput(record: AuditRecord, registry: AuditEventRegis
     // omitted entirely, not set to undefined, when there's no value.
     ...(record.actorId !== undefined ? { actorId: record.actorId, actorType: 'telegram_user' } : {}),
     ...(record.chatId !== undefined ? { telegramContext: { chatId: record.chatId } } : {}),
+    ...(() => {
+      const moduleId = readObservedField(record, 'moduleId');
+      return typeof moduleId === 'string' && moduleId.length > 0 ? { moduleId } : {};
+    })(),
     metadata: buildMetadataBridge(record),
   };
 }

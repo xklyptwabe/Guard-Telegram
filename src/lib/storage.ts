@@ -1,6 +1,8 @@
 import { PutObjectCommand, S3Client } from '@aws-sdk/client-s3';
 
 import type { AppConfig } from '../config.js';
+import { recordIntegrationAction } from './audit/integrationAudit.js';
+import type { AuditService } from './auditService.js';
 import type { Logger } from './logger.js';
 
 export interface ObjectStorage {
@@ -9,7 +11,7 @@ export interface ObjectStorage {
   close(): Promise<void>;
 }
 
-export function createStorage(config: Pick<AppConfig, 's3Enabled' | 's3Endpoint' | 's3Region' | 's3AccessKeyId' | 's3SecretAccessKey' | 's3Bucket'>, logger: Logger): ObjectStorage {
+export function createStorage(config: Pick<AppConfig, 's3Enabled' | 's3Endpoint' | 's3Region' | 's3AccessKeyId' | 's3SecretAccessKey' | 's3Bucket'>, logger: Logger, audit: AuditService): ObjectStorage {
   if (!config.s3Enabled) {
     return {
       enabled: false,
@@ -27,7 +29,22 @@ export function createStorage(config: Pick<AppConfig, 's3Enabled' | 's3Endpoint'
   return {
     enabled: true,
     put: async (key, body, contentType) => {
-      await client.send(new PutObjectCommand({ Bucket: config.s3Bucket, Key: key, Body: body, ContentType: contentType }));
+      let statusCode: number | undefined;
+      try {
+        const result = await client.send(new PutObjectCommand({ Bucket: config.s3Bucket, Key: key, Body: body, ContentType: contentType }));
+        statusCode = result.$metadata.httpStatusCode;
+      } catch (error: unknown) {
+        await recordIntegrationAction(audit, logger, { integrationId: 's3', action: 'put', targetType: 'object', targetId: key, success: false });
+        throw error;
+      }
+      await recordIntegrationAction(audit, logger, {
+        integrationId: 's3',
+        action: 'put',
+        targetType: 'object',
+        targetId: key,
+        ...(statusCode !== undefined ? { statusCode } : {}),
+        success: true,
+      });
     },
     close: () => {
       client.destroy();
