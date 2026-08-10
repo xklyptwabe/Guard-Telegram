@@ -2,7 +2,12 @@ import { randomUUID } from 'node:crypto';
 
 import type { DrizzleDatabase } from '../../db/client.js';
 import type { AuditService } from '../auditService.js';
-import { applyAllowlist, stripForbidden, type AuditPolicyContext } from './masking.js';
+import {
+  AUDIT_OPERATIONAL_METADATA_ALLOWLIST,
+  applyAllowlist,
+  stripForbidden,
+  type AuditPolicyContext,
+} from './masking.js';
 import {
   AUDIT_EVENTS_DEFAULT_LIMIT,
   AUDIT_EVENTS_MAX_LIMIT,
@@ -37,14 +42,6 @@ export interface AuditExportResult {
 }
 
 type AuditExportDatabase = Pick<DrizzleDatabase, 'select'>;
-
-const AUDIT_EXPORT_OPERATIONAL_METADATA_ALLOWLIST = [
-  'moduleId',
-  'operation',
-  'reason',
-  'auditPolicy',
-  'truncated',
-] as const;
 
 export class AuditExportPolicyError extends Error {
   public constructor() {
@@ -232,7 +229,7 @@ function applyPolicyToMetadata(
     ...(policy.masking === undefined ? {} : { masking: policy.masking }),
   };
   return {
-    ...applyAllowlist(value, AUDIT_EXPORT_OPERATIONAL_METADATA_ALLOWLIST, operationalPolicy),
+    ...applyAllowlist(value, AUDIT_OPERATIONAL_METADATA_ALLOWLIST, operationalPolicy),
     ...applyAllowlist(value, allowlist, policy),
   };
 }

@@ -39,7 +39,9 @@ describe('stripForbidden (defense in depth)', () => {
       headers: { authorization: 'Bearer xyz' },
       rawUpdate: { update_id: 1 },
       callbackData: 'payload',
+      callbackPayload: { data: 'full payload' },
       fileId: 'AgAD',
+      files: [{ name: 'attachment' }],
     };
     const result = stripForbidden(data);
     expect(result).toEqual({ chatId: '1' });

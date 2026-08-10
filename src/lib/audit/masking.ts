@@ -14,6 +14,15 @@ export interface AuditPolicyContext {
   readonly masking?: readonly string[];
 }
 
+export const AUDIT_OPERATIONAL_METADATA_ALLOWLIST = [
+  'source',
+  'moduleId',
+  'operation',
+  'reason',
+  'auditPolicy',
+  'truncated',
+] as const;
+
 const DEFAULT_POLICY: AuditPolicyContext = { allowMessageTextLogging: false };
 
 /**
@@ -39,7 +48,7 @@ export type AllowlistField<T> =
  * single event's allowlist.
  */
 const FORBIDDEN_KEY_PATTERN =
-  /(^|_)(password|passwd|secret|token|api_?key|auth(orization)?|headers?|connection_?string|conn_?str|dsn|webhook_?secret|raw_?update|callback_?(data|query)|file_?(id|path|url)|cookie)(_|$)/;
+  /(^|_)(password|passwd|secret|token|api_?key|auth(orization)?|headers?|connection_?string|conn_?str|dsn|webhook_?secret|raw_?update|callback_?(data|query|payload)|files?|file_?(id|path|url)|cookie)(_|$)/;
 
 /**
  * Normalizes camelCase, snake_case and kebab-case alike to `snake_case`

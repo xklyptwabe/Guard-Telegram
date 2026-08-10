@@ -280,6 +280,92 @@ describe.skipIf(!testDatabaseUrl)('Audit transaction integration', () => {
       operation: 'update',
     });
   });
+
+  it('removes forbidden metadata and Telegram payloads before persisting the event', async () => {
+    await audit!.recordEntityChange(
+      {
+        tenantId: '1008',
+        subjectType: 'chat_module_state',
+        subjectId: '1008:module-admin',
+        eventType: 'module.state.changed',
+        eventVersion: 'v1',
+        category: 'module',
+        source: 'telegram.command',
+        moduleId: 'module-admin',
+        idempotencyKey: 'audit:test:1008:module-admin:safety',
+        metadata: {
+          source: 'safe-source',
+          token: 'top-level-token',
+          password: 'top-level-password',
+          headers: { authorization: 'Bearer secret' },
+          connectionString: 'postgres://secret',
+          webhookSecret: 'webhook-secret',
+        },
+        telegramContext: {
+          correlationId: 'correlation-1008',
+          updateId: 'update-1008',
+          chatId: '1008',
+          userId: 'user-1008',
+          messageThreadId: '42',
+          rawUpdate: { token: 'raw-update-token' },
+          callbackPayload: { data: 'full-callback-payload' },
+          files: [{ fileUrl: 'secret-file-url' }],
+        },
+      },
+      async (tx) => {
+        await tx.insert(telegramChats).values({ chatId: '1008', type: 'group', title: 'audit-test' });
+        await tx.insert(chatModuleStates).values({ chatId: '1008', moduleId: 'module-admin', enabled: true });
+        return {
+          before: undefined,
+          after: { enabled: true, source: 'override' },
+          metadata: {
+            operation: 'update',
+            reason: {
+              message: 'safe reason',
+              nested: { password: 'nested-password', callbackPayload: 'nested-callback', files: ['nested-file'] },
+            },
+          },
+          snapshotData: { chatId: '1008', moduleId: 'module-admin', enabled: true, source: 'override' },
+        };
+      },
+    );
+
+    const [event] = await database!.db.select().from(events);
+    const [outboxRow] = await database!.db.select().from(outbox);
+
+    expect(event?.metadata).toMatchObject({
+      source: 'safe-source',
+      operation: 'update',
+      reason: { message: 'safe reason', nested: {} },
+      moduleId: 'module-admin',
+      auditPolicy: expect.any(Object),
+    });
+    expect(event?.telegramContext).toEqual({
+      correlationId: 'correlation-1008',
+      updateId: 'update-1008',
+      chatId: '1008',
+      userId: 'user-1008',
+      messageThreadId: '42',
+    });
+    expect((outboxRow?.payload as { metadata?: unknown } | undefined)?.metadata).toEqual(event?.metadata);
+
+    const persistedJson = JSON.stringify(event);
+    for (const forbidden of [
+      'top-level-token',
+      'top-level-password',
+      'Bearer secret',
+      'postgres://secret',
+      'webhook-secret',
+      'raw-update-token',
+      'full-callback-payload',
+      'secret-file-url',
+      'nested-password',
+      'nested-callback',
+      'nested-file',
+    ]) {
+      expect(persistedJson).not.toContain(forbidden);
+    }
+  });
 });
 
 async function cleanup(): Promise<void> {

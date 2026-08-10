@@ -2,7 +2,11 @@ import { and, eq } from 'drizzle-orm';
 
 import { getUpdateContext } from './context.js';
 import type { SnapshotStatus } from './audit/enums.js';
-import type { AuditPolicyContext } from './audit/masking.js';
+import {
+  AUDIT_OPERATIONAL_METADATA_ALLOWLIST,
+  applyAllowlist,
+  type AuditPolicyContext,
+} from './audit/masking.js';
 import { resolveEffectiveAuditPolicy, type EffectiveAuditPolicy } from './audit/policyResolution.js';
 import {
   normalizeAuditMutationForPersistence,
@@ -139,14 +143,17 @@ export class AuditService {
         ),
         effectivePolicy,
       );
-      const metadata = applyCanonicalModuleId(
-        mergeAuditMetadata(
-          mergeAuditMetadata(input.metadata, mutation.metadata),
-          buildAuditPolicyMetadata(effectivePolicy),
+      const metadata = sanitizeAuditMetadata(
+        applyCanonicalModuleId(
+          mergeAuditMetadata(
+            mergeAuditMetadata(input.metadata, mutation.metadata),
+            buildAuditPolicyMetadata(effectivePolicy),
+          ),
+          input.moduleId,
         ),
-        input.moduleId,
+        effectivePolicy,
       );
-      const telegramContext = input.telegramContext ?? buildTelegramContext(context);
+      const telegramContext = sanitizeTelegramContext(input.telegramContext ?? buildTelegramContext(context));
       const [eventRow] = await tx
         .insert(events)
         .values({
@@ -317,4 +324,33 @@ function applyCanonicalModuleId(
     result.moduleId = moduleId;
   }
   return result;
+}
+
+function sanitizeAuditMetadata(
+  metadata: Record<string, unknown> | undefined,
+  effectivePolicy: EffectiveAuditPolicy,
+): Record<string, unknown> | undefined {
+  if (metadata === undefined) return undefined;
+  const sanitized = applyAllowlist(metadata, AUDIT_OPERATIONAL_METADATA_ALLOWLIST, {
+    allowMessageTextLogging: false,
+    ...(effectivePolicy.values.masking.length === 0 ? {} : { masking: effectivePolicy.values.masking }),
+  });
+  return Object.keys(sanitized).length === 0 ? undefined : sanitized;
+}
+
+const AUDIT_TELEGRAM_CONTEXT_ALLOWLIST = [
+  'correlationId',
+  'updateId',
+  'chatId',
+  'userId',
+  'messageThreadId',
+] as const;
+
+function sanitizeTelegramContext(context: Record<string, unknown> | undefined): Record<string, unknown> | undefined {
+  if (context === undefined) return undefined;
+  const projected = applyAllowlist(context, AUDIT_TELEGRAM_CONTEXT_ALLOWLIST);
+  const safeEntries = Object.entries(projected).filter(
+    (entry): entry is [string, string] => typeof entry[1] === 'string' && entry[1].length > 0,
+  );
+  return safeEntries.length === 0 ? undefined : Object.fromEntries(safeEntries);
 }
