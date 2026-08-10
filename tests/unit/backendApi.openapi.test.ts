@@ -68,6 +68,36 @@ describe('backend API OpenAPI document', () => {
     expect(document.components?.schemas?.AuditExportRequest?.properties?.limit?.maximum).toBe(AUDIT_API_MAX_LIMIT);
   });
 
+  it('requires at least one policy field in every AuditPolicyPatchRequest', () => {
+    const document = JSON.parse(readFileSync(openApiPath, 'utf8')) as {
+      readonly components?: {
+        readonly schemas?: {
+          readonly AuditPolicyPatchRequest?: RequiredShapeSchema;
+        };
+      };
+    };
+    const schema = document.components?.schemas?.AuditPolicyPatchRequest;
+    expect(schema).toBeDefined();
+
+    const base = { expectedLockVersion: 2, idempotencyKey: 'openapi-policy-patch' };
+    expect(matchesRequiredShape(schema!, base)).toBe(false);
+
+    const individualFields = [
+      { enabled: false },
+      { siteVisible: true },
+      { snapshotMode: 'snapshot' },
+      { allowlist: ['chatId'] },
+      { masking: ['userId'] },
+      { retentionDays: 30 },
+      { severity: 'warning' },
+      { exportAllowed: true },
+    ] as const;
+    for (const field of individualFields) {
+      expect(matchesRequiredShape(schema!, { ...base, ...field })).toBe(true);
+    }
+    expect(matchesRequiredShape(schema!, { ...base, enabled: true, retentionDays: 90, exportAllowed: false })).toBe(true);
+  });
+
   it('documents optional backend effective-policy resolution without changing raw items', () => {
     const document = JSON.parse(readFileSync(openApiPath, 'utf8')) as {
       readonly paths: Record<string, Record<string, {
@@ -93,3 +123,16 @@ describe('backend API OpenAPI document', () => {
     expect(document.components?.schemas).toHaveProperty('AuditPolicyValueSources');
   });
 });
+
+interface RequiredShapeSchema {
+  readonly required?: readonly string[];
+  readonly anyOf?: readonly { readonly required?: readonly string[] }[];
+}
+
+function matchesRequiredShape(schema: RequiredShapeSchema, value: Record<string, unknown>): boolean {
+  if (!(schema.required ?? []).every((field) => Object.hasOwn(value, field))) return false;
+  if (schema.anyOf === undefined) return true;
+  return schema.anyOf.some((alternative) =>
+    (alternative.required ?? []).every((field) => Object.hasOwn(value, field)),
+  );
+}

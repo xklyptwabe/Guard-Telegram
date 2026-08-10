@@ -673,6 +673,16 @@
       "AuditPolicyPatchRequest": {
         "type": "object",
         "required": ["expectedLockVersion", "idempotencyKey"],
+        "anyOf": [
+          { "required": ["enabled"] },
+          { "required": ["siteVisible"] },
+          { "required": ["snapshotMode"] },
+          { "required": ["allowlist"] },
+          { "required": ["masking"] },
+          { "required": ["retentionDays"] },
+          { "required": ["severity"] },
+          { "required": ["exportAllowed"] }
+        ],
         "properties": {
           "expectedLockVersion": { "type": "integer", "minimum": 1 },
           "idempotencyKey": {
