@@ -125,14 +125,16 @@ describe('audit export service', () => {
         metadata: {
           moduleId: 'moderation',
           deletedBy: '[redacted]',
-          policySensitive: '[redacted]',
         },
       }),
     ]);
+    expect((result.data as readonly Record<string, unknown>[])[0]?.metadata).not.toHaveProperty('innocentLabel');
+    expect((result.data as readonly Record<string, unknown>[])[0]?.metadata).not.toHaveProperty('policySensitive');
     expect(JSON.stringify(result.data)).not.toContain('historical-sensitive-value');
     expect(JSON.stringify(result.data)).not.toContain('historical message text');
     expect(JSON.stringify(result.data)).not.toContain('historical-secret-token');
     expect(JSON.stringify(result.data)).not.toContain('historical-policy-sensitive');
+    expect(JSON.stringify(result.data)).not.toContain('historical-innocent-label');
   });
 
   it('reapplies the current effective allowlist and masking before CSV serialization', async () => {
@@ -163,6 +165,9 @@ describe('audit export service', () => {
     expect(result.data).not.toContain('historical message text');
     expect(result.data).not.toContain('historical-secret-token');
     expect(result.data).not.toContain('historical-policy-sensitive');
+    expect(result.data).not.toContain('innocentLabel');
+    expect(result.data).not.toContain('historical-innocent-label');
+    expect(result.data).not.toContain('policySensitive');
   });
 
   it('applies each row policy using its own tenant context', async () => {
@@ -397,6 +402,7 @@ function historicalEventRow(id: string, tenantId = 'chat-1'): AuditEventReadRow 
       moduleId: 'moderation',
       deletedBy: 'historical-sensitive-value',
       policySensitive: 'historical-policy-sensitive',
+      innocentLabel: 'historical-innocent-label',
       secretToken: 'historical-secret-token',
     },
     beforeSnapshotStatus: 'observed',

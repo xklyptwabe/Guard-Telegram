@@ -38,6 +38,14 @@ export interface AuditExportResult {
 
 type AuditExportDatabase = Pick<DrizzleDatabase, 'select'>;
 
+const AUDIT_EXPORT_OPERATIONAL_METADATA_ALLOWLIST = [
+  'moduleId',
+  'operation',
+  'reason',
+  'auditPolicy',
+  'truncated',
+] as const;
+
 export class AuditExportPolicyError extends Error {
   public constructor() {
     super('Audit export is not allowed by policy.');
@@ -219,16 +227,12 @@ function applyPolicyToMetadata(
 ): unknown {
   if (!isRecord(value)) return stripForbidden(value);
 
-  const registryFields = new Set(allowlist.map((entry) => String(typeof entry === 'object' ? entry.field : entry)));
-  const operationalMetadata = Object.fromEntries(
-    Object.entries(value).filter(([field]) => !registryFields.has(field)),
-  );
   const operationalPolicy: AuditPolicyContext = {
     allowMessageTextLogging: policy.allowMessageTextLogging,
     ...(policy.masking === undefined ? {} : { masking: policy.masking }),
   };
   return {
-    ...applyAllowlist(operationalMetadata, Object.keys(operationalMetadata), operationalPolicy),
+    ...applyAllowlist(value, AUDIT_EXPORT_OPERATIONAL_METADATA_ALLOWLIST, operationalPolicy),
     ...applyAllowlist(value, allowlist, policy),
   };
 }
