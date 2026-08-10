@@ -134,6 +134,37 @@ describe('audit policy write API', () => {
     expect(response?.body).toMatchObject({ error: { code: 'optimistic_lock_conflict' } });
   });
 
+  it('rejects disabling a protected event and keeps the attempted change audited', async () => {
+    const protectedPolicy = policySnapshot({
+      policyId: 'global:event:module.state.changed:v1',
+      chatId: null,
+      eventType: 'module.state.changed',
+      eventVersion: 'v1',
+      lockVersion: 2,
+    });
+    const tx = fakePolicyTx({ selectedPolicy: protectedPolicy });
+    const audit = fakeAuditService(tx);
+    const response = await handleAuditPolicyWriteRequest(
+      'PATCH',
+      url('/api/v1/audit/policies/global%3Aevent%3Amodule.state.changed%3Av1'),
+      { expectedLockVersion: 2, idempotencyKey: 'backend-api-protected-policy', enabled: false },
+      { ...managerPrincipal, systemAdmin: true },
+      {
+        db: fakePolicyApiDb({ policies: [policyRow(protectedPolicy)] }) as never,
+        audit: audit as unknown as AuditService,
+      },
+    );
+
+    expect(response).toMatchObject({ statusCode: 400, body: { error: { code: 'bad_request' } } });
+    expect(audit.calls.mutation).toMatchObject({
+      before: { enabled: true },
+      after: { enabled: false },
+      changes: { status: 'rejected' },
+      metadata: { operation: 'failed', reason: 'protected_event_disable' },
+    });
+    expect(tx.calls.set).toBeUndefined();
+  });
+
   it('rejects empty patches', async () => {
     const response = await handleAuditPolicyWriteRequest(
       'PATCH',

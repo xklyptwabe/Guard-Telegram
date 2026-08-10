@@ -9,7 +9,7 @@ import type { AuditEventsReadFilters, AuditEventsReadScope } from '../lib/audit/
 import type { AuditService } from '../lib/auditService.js';
 import type { BackendApiPrincipal } from './access.js';
 import { hasBackendApiPermission } from './access.js';
-import { auditFilterDateTimeSchema } from './auditFilterValidation.js';
+import { auditFilterDateTimeSchema, auditLimitSchema } from './auditFilterValidation.js';
 import { badRequest, forbidden, type ApiResponse } from './responses.js';
 
 const eventCategorySchema = z.enum([
@@ -46,7 +46,7 @@ const exportRequestSchema = z
   .object({
     format: exportFormatSchema.default('json'),
     filters: exportFiltersSchema.default({}),
-    limit: z.number().int().positive().optional(),
+    limit: auditLimitSchema.optional(),
   })
   .strict();
 

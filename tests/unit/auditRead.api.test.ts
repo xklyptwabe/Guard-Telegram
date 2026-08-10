@@ -79,6 +79,40 @@ describe('audit read API', () => {
     expect(response?.statusCode).toBe(200);
   });
 
+  it.each([1, 100])('accepts the documented audit event limit boundary %i', async (limit) => {
+    const response = await handleAuditReadRequest(
+      'GET',
+      url(`/api/v1/audit/events?limit=${limit}`),
+      readPrincipal,
+      { db: fakeReadDb() as never },
+    );
+
+    expect(response?.statusCode).toBe(200);
+  });
+
+  it.each(['101', '0', '-1', '1.5', 'not-a-number'])(
+    'rejects audit event limit %s before querying the database',
+    async (limit) => {
+      const db = {
+        select: () => {
+          throw new Error('database must not be queried for an invalid limit');
+        },
+      };
+
+      const response = await handleAuditReadRequest(
+        'GET',
+        url(`/api/v1/audit/events?limit=${encodeURIComponent(limit)}`),
+        readPrincipal,
+        { db: db as never },
+      );
+
+      expect(response).toMatchObject({
+        statusCode: 400,
+        body: { error: { code: 'bad_request' } },
+      });
+    },
+  );
+
   it.each([
     ['a year without a date', 'occurredFrom', '2026'],
     ['an impossible calendar date', 'occurredFrom', '2026-02-30T10:00:00Z'],

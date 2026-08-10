@@ -94,6 +94,42 @@ describe('audit export API', () => {
 
     expect(response?.statusCode).toBe(400);
   });
+
+  it.each([1, 100])('accepts the documented audit export limit boundary %i', async (limit) => {
+    const response = await handleAuditExportRequest(
+      'POST',
+      url('/api/v1/audit/exports'),
+      { format: 'json', filters: {}, limit },
+      exportPrincipal,
+      {
+        db: fakeExportDb({ events: [], policies: [] }) as never,
+        audit: fakeAuditService() as unknown as AuditService,
+      },
+    );
+
+    expect(response?.statusCode).toBe(201);
+  });
+
+  it.each([101, 0, -1, 1.5, 'not-a-number'])(
+    'rejects audit export limit %s with the validation error contract',
+    async (limit) => {
+      const response = await handleAuditExportRequest(
+        'POST',
+        url('/api/v1/audit/exports'),
+        { format: 'json', filters: {}, limit },
+        exportPrincipal,
+        {
+          db: fakeExportDb({ events: [], policies: [] }) as never,
+          audit: fakeAuditService() as unknown as AuditService,
+        },
+      );
+
+      expect(response).toMatchObject({
+        statusCode: 400,
+        body: { error: { code: 'bad_request' } },
+      });
+    },
+  );
 });
 
 function url(path: string): URL {

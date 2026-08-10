@@ -77,6 +77,7 @@ describe.skipIf(!testDatabaseUrl)('Audit export effective policy integration', (
             moduleId: 'moderation',
             deletedBy: 'historical-sensitive-value',
             policySensitive: 'historical-policy-sensitive',
+            innocentLabel: 'historical-innocent-label',
             secretToken: 'historical-secret-token',
           },
         });
@@ -102,6 +103,9 @@ describe.skipIf(!testDatabaseUrl)('Audit export effective policy integration', (
     expect(json).not.toContain('historical message text');
     expect(json).not.toContain('historical-secret-token');
     expect(json).not.toContain('historical-policy-sensitive');
+    expect(json).not.toContain('innocentLabel');
+    expect(json).not.toContain('historical-innocent-label');
+    expect(json).not.toContain('policySensitive');
 
     expect(csvData).toEqual(expect.any(String));
     const csv = String(csvData);
@@ -110,6 +114,9 @@ describe.skipIf(!testDatabaseUrl)('Audit export effective policy integration', (
     expect(csv).not.toContain('historical message text');
     expect(csv).not.toContain('historical-secret-token');
     expect(csv).not.toContain('historical-policy-sensitive');
+    expect(csv).not.toContain('innocentLabel');
+    expect(csv).not.toContain('historical-innocent-label');
+    expect(csv).not.toContain('policySensitive');
   });
 });
 

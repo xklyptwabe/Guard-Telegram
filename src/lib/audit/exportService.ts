@@ -2,7 +2,12 @@ import { randomUUID } from 'node:crypto';
 
 import type { DrizzleDatabase } from '../../db/client.js';
 import type { AuditService } from '../auditService.js';
-import { applyAllowlist, stripForbidden, type AuditPolicyContext } from './masking.js';
+import {
+  AUDIT_OPERATIONAL_METADATA_ALLOWLIST,
+  applyAllowlist,
+  stripForbidden,
+  type AuditPolicyContext,
+} from './masking.js';
 import {
   AUDIT_EVENTS_DEFAULT_LIMIT,
   AUDIT_EVENTS_MAX_LIMIT,
@@ -219,16 +224,12 @@ function applyPolicyToMetadata(
 ): unknown {
   if (!isRecord(value)) return stripForbidden(value);
 
-  const registryFields = new Set(allowlist.map((entry) => String(typeof entry === 'object' ? entry.field : entry)));
-  const operationalMetadata = Object.fromEntries(
-    Object.entries(value).filter(([field]) => !registryFields.has(field)),
-  );
   const operationalPolicy: AuditPolicyContext = {
     allowMessageTextLogging: policy.allowMessageTextLogging,
     ...(policy.masking === undefined ? {} : { masking: policy.masking }),
   };
   return {
-    ...applyAllowlist(operationalMetadata, Object.keys(operationalMetadata), operationalPolicy),
+    ...applyAllowlist(value, AUDIT_OPERATIONAL_METADATA_ALLOWLIST, operationalPolicy),
     ...applyAllowlist(value, allowlist, policy),
   };
 }
