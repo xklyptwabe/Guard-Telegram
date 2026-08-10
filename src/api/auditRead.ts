@@ -19,7 +19,7 @@ import {
 } from '../lib/audit/eventReadRepository.js';
 import type { BackendApiPrincipal } from './access.js';
 import { canAccessBackendApiChat, hasBackendApiPermission } from './access.js';
-import { auditFilterDateTimeSchema } from './auditFilterValidation.js';
+import { auditFilterDateTimeSchema, auditLimitSchema } from './auditFilterValidation.js';
 import { badRequest, forbidden, notFound, type ApiResponse } from './responses.js';
 
 const eventCategorySchema = z.enum([
@@ -239,9 +239,7 @@ function dateParam(searchParams: URLSearchParams, key: string): Date | undefined
 function positiveIntParam(searchParams: URLSearchParams, key: string): number | undefined {
   const value = stringParam(searchParams, key);
   if (value === undefined) return undefined;
-  const parsed = Number(value);
-  if (!Number.isInteger(parsed) || parsed <= 0) throw new Error(`${key} must be a positive integer.`);
-  return parsed;
+  return auditLimitSchema.parse(Number(value));
 }
 
 function eventStatus(searchParams: URLSearchParams) {

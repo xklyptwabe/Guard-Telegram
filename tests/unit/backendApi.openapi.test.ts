@@ -2,6 +2,7 @@ import { readFileSync } from 'node:fs';
 
 import { describe, expect, it } from 'vitest';
 
+import { AUDIT_API_MAX_LIMIT } from '../../src/api/auditFilterValidation.js';
 import { validateConfig } from '../../src/config.js';
 
 const openApiPath = 'docs/openapi/backend-api.openapi.json';
@@ -49,6 +50,22 @@ describe('backend API OpenAPI document', () => {
     }).backendApiPort;
 
     expect(document.servers?.[0]?.url).toBe(`http://localhost:${runtimeDefaultPort}`);
+  });
+
+  it('uses the runtime audit limit maximum for read and export contracts', () => {
+    const document = JSON.parse(readFileSync(openApiPath, 'utf8')) as {
+      readonly components?: {
+        readonly parameters?: { readonly Limit?: { readonly schema?: { readonly maximum?: number } } };
+        readonly schemas?: {
+          readonly AuditExportRequest?: {
+            readonly properties?: { readonly limit?: { readonly maximum?: number } };
+          };
+        };
+      };
+    };
+
+    expect(document.components?.parameters?.Limit?.schema?.maximum).toBe(AUDIT_API_MAX_LIMIT);
+    expect(document.components?.schemas?.AuditExportRequest?.properties?.limit?.maximum).toBe(AUDIT_API_MAX_LIMIT);
   });
 
   it('documents optional backend effective-policy resolution without changing raw items', () => {
