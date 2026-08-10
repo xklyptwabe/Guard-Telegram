@@ -50,6 +50,18 @@ export type AllowlistField<T> =
 const FORBIDDEN_KEY_PATTERN =
   /(^|_)(password|passwd|secret|token|api_?key|auth(orization)?|headers?|connection_?string|conn_?str|dsn|webhook_?secret|raw_?update|callback_?(data|query|payload)|files?|file_?(id|path|url)|cookie)(_|$)/;
 
+const FORBIDDEN_VALUE_PATTERNS = [
+  /\b(?:Bearer|Basic)\s+[A-Za-z0-9+/=_-]{4,}/i,
+  /\b(?:postgres(?:ql)?|mysql|mariadb|mongodb(?:\+srv)?|redis|amqps?):\/\/[^\s"']+/i,
+  /(?:^|[?&;\s])(?:password|passwd|pwd|token|api_?key|secret|authorization|webhook_?secret)\s*[=:]\s*[^\s;&]+/i,
+  /\bwhsec_[A-Za-z0-9_-]+\b/i,
+  /\b\d{6,}:[A-Za-z0-9_-]{20,}\b/,
+  /\beyJ[A-Za-z0-9_-]*\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\b/,
+  /-----BEGIN [A-Z ]*PRIVATE KEY-----/,
+] as const;
+
+const REDACTED_VALUE = '[redacted]';
+
 /**
  * Normalizes camelCase, snake_case and kebab-case alike to `snake_case`
  * before matching. Field names in this codebase are camelCase
@@ -68,12 +80,19 @@ function isForbiddenKey(key: string): boolean {
   return FORBIDDEN_KEY_PATTERN.test(normalizeKey(key));
 }
 
+export function isForbiddenAuditString(value: string): boolean {
+  return FORBIDDEN_VALUE_PATTERNS.some((pattern) => pattern.test(value));
+}
+
 /**
- * Recursively strips any key matching {@link FORBIDDEN_KEY_PATTERN} from a
- * plain-data value (objects/arrays only — this never needs to walk class
- * instances, DB rows are always plain JSON by the time they get here).
+ * Recursively strips forbidden keys and redacts recognizable credential
+ * values from plain data. This never needs to walk class instances: DB rows
+ * are always plain JSON by the time they get here.
  */
 export function stripForbidden<T>(value: T): T {
+  if (typeof value === 'string' && isForbiddenAuditString(value)) {
+    return REDACTED_VALUE as T;
+  }
   if (Array.isArray(value)) {
     return value.map((item: unknown) => stripForbidden(item)) as unknown as T;
   }
