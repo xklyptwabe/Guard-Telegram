@@ -2,7 +2,12 @@ import { and, eq } from 'drizzle-orm';
 
 import { getUpdateContext } from './context.js';
 import type { SnapshotStatus } from './audit/enums.js';
-import type { AuditPolicyContext } from './audit/masking.js';
+import {
+  AUDIT_OPERATIONAL_METADATA_ALLOWLIST,
+  applyAllowlist,
+  isForbiddenAuditString,
+  type AuditPolicyContext,
+} from './audit/masking.js';
 import { resolveEffectiveAuditPolicy, type EffectiveAuditPolicy } from './audit/policyResolution.js';
 import {
   normalizeAuditMutationForPersistence,
@@ -51,6 +56,20 @@ export type AuditMutationResult<TSnapshot extends Record<string, unknown>> = Aud
 
 type AuditTransaction = Pick<DrizzleDatabase, 'select' | 'insert' | 'update' | 'delete' | 'execute'>;
 
+export class AuditIdempotencyConflictError extends Error {
+  public constructor() {
+    super('Audit idempotency key is already associated with another operation.');
+    this.name = 'AuditIdempotencyConflictError';
+  }
+}
+
+export class ForbiddenAuditValueError extends Error {
+  public constructor(field: string) {
+    super(`Audit field "${field}" contains forbidden credential data.`);
+    this.name = 'ForbiddenAuditValueError';
+  }
+}
+
 export class AuditService {
   public constructor(private readonly db: DrizzleDatabase) {}
 
@@ -59,15 +78,33 @@ export class AuditService {
     mutate: (tx: AuditTransaction, nextSubjectSequence: number) => Promise<AuditMutationResult<TSnapshot>>,
   ): Promise<{ readonly eventId: string; readonly subjectSequence: number; readonly duplicate: boolean }> {
     const context = getUpdateContext();
+    const correlationId = input.correlationId ?? context?.correlationId;
+    assertSafeAuditEnvelope(input, correlationId);
     const auditDefinition = requireAuditPersistenceDefinition(input);
     return this.db.transaction(async (tx) => {
       const existing = await tx
-        .select({ id: events.id, subjectSequence: events.subjectSequence })
+        .select({
+          id: events.id,
+          subjectSequence: events.subjectSequence,
+          tenantId: events.tenantId,
+          eventType: events.eventType,
+          eventVersion: events.eventVersion,
+          category: events.category,
+          source: events.source,
+          actorId: events.actorId,
+          actorType: events.actorType,
+          subjectType: events.subjectType,
+          subjectId: events.subjectId,
+        })
         .from(events)
         .where(eq(events.idempotencyKey, input.idempotencyKey))
         .limit(1);
-      if (existing[0]) {
-        return { eventId: existing[0].id, subjectSequence: existing[0].subjectSequence, duplicate: true };
+      const existingEvent = existing[0];
+      if (existingEvent !== undefined) {
+        if (!sameIdempotentOperation(existingEvent, input)) {
+          throw new AuditIdempotencyConflictError();
+        }
+        return { eventId: existingEvent.id, subjectSequence: existingEvent.subjectSequence, duplicate: true };
       }
 
       const effectivePolicy = await resolveEffectiveAuditPolicy(tx, {
@@ -116,11 +153,17 @@ export class AuditService {
         ),
         effectivePolicy,
       );
-      const metadata = mergeAuditMetadata(
-        mergeAuditMetadata(input.metadata, mutation.metadata),
-        buildAuditPolicyMetadata(effectivePolicy),
+      const metadata = sanitizeAuditMetadata(
+        applyCanonicalModuleId(
+          mergeAuditMetadata(
+            mergeAuditMetadata(input.metadata, mutation.metadata),
+            buildAuditPolicyMetadata(effectivePolicy),
+          ),
+          input.moduleId,
+        ),
+        effectivePolicy,
       );
-      const telegramContext = input.telegramContext ?? buildTelegramContext(context);
+      const telegramContext = sanitizeTelegramContext(input.telegramContext ?? buildTelegramContext(context));
       const [eventRow] = await tx
         .insert(events)
         .values({
@@ -135,7 +178,7 @@ export class AuditService {
           subjectType: input.subjectType,
           subjectId: input.subjectId,
           subjectSequence: nextSubjectSequence,
-          correlationId: input.correlationId ?? context?.correlationId,
+          correlationId,
           telegramContext,
           idempotencyKey: input.idempotencyKey,
           before: normalizedMutation.before,
@@ -184,6 +227,33 @@ export class AuditService {
       return { eventId: eventRow.id, subjectSequence: eventRow.subjectSequence, duplicate: false };
     });
   }
+}
+
+function sameIdempotentOperation(
+  existing: {
+    readonly tenantId: string;
+    readonly eventType: string;
+    readonly eventVersion: string;
+    readonly category: string;
+    readonly source: string;
+    readonly actorId: string | null;
+    readonly actorType: string | null;
+    readonly subjectType: string;
+    readonly subjectId: string;
+  },
+  input: AuditEventInput,
+): boolean {
+  return (
+    existing.tenantId === input.tenantId &&
+    existing.eventType === input.eventType &&
+    existing.eventVersion === input.eventVersion &&
+    existing.category === input.category &&
+    existing.source === input.source &&
+    existing.actorId === (input.actorId ?? null) &&
+    existing.actorType === (input.actorType ?? null) &&
+    existing.subjectType === input.subjectType &&
+    existing.subjectId === input.subjectId
+  );
 }
 
 function buildPersistencePolicy(
@@ -239,6 +309,7 @@ function buildTelegramContext(context: ReturnType<typeof getUpdateContext>): Rec
     updateId: context.updateId,
     ...(context.chatId ? { chatId: context.chatId } : {}),
     ...(context.userId ? { userId: context.userId } : {}),
+    ...(context.messageThreadId ? { messageThreadId: context.messageThreadId } : {}),
   };
 }
 
@@ -249,4 +320,68 @@ function mergeAuditMetadata(
   if (inputMetadata === undefined) return mutationMetadata;
   if (mutationMetadata === undefined) return inputMetadata;
   return { ...inputMetadata, ...mutationMetadata };
+}
+
+function applyCanonicalModuleId(
+  metadata: Record<string, unknown> | undefined,
+  moduleId: string | undefined,
+): Record<string, unknown> | undefined {
+  if (metadata === undefined) return moduleId === undefined ? undefined : { moduleId };
+  const result = { ...metadata };
+  if (moduleId === undefined) {
+    Reflect.deleteProperty(result, 'moduleId');
+  } else {
+    result.moduleId = moduleId;
+  }
+  return result;
+}
+
+function sanitizeAuditMetadata(
+  metadata: Record<string, unknown> | undefined,
+  effectivePolicy: EffectiveAuditPolicy,
+): Record<string, unknown> | undefined {
+  if (metadata === undefined) return undefined;
+  const sanitized = applyAllowlist(metadata, AUDIT_OPERATIONAL_METADATA_ALLOWLIST, {
+    allowMessageTextLogging: false,
+    ...(effectivePolicy.values.masking.length === 0 ? {} : { masking: effectivePolicy.values.masking }),
+  });
+  return Object.keys(sanitized).length === 0 ? undefined : sanitized;
+}
+
+const AUDIT_TELEGRAM_CONTEXT_ALLOWLIST = [
+  'correlationId',
+  'updateId',
+  'chatId',
+  'userId',
+  'messageThreadId',
+] as const;
+
+function sanitizeTelegramContext(context: Record<string, unknown> | undefined): Record<string, unknown> | undefined {
+  if (context === undefined) return undefined;
+  const projected = applyAllowlist(context, AUDIT_TELEGRAM_CONTEXT_ALLOWLIST);
+  const safeEntries = Object.entries(projected).filter(
+    (entry): entry is [string, string] =>
+      typeof entry[1] === 'string' && entry[1].length > 0 && entry[1] !== '[redacted]',
+  );
+  return safeEntries.length === 0 ? undefined : Object.fromEntries(safeEntries);
+}
+
+function assertSafeAuditEnvelope(input: AuditEventInput, correlationId: string | undefined): void {
+  const values = {
+    tenantId: input.tenantId,
+    eventType: input.eventType,
+    eventVersion: input.eventVersion,
+    category: input.category,
+    source: input.source,
+    actorId: input.actorId,
+    actorType: input.actorType,
+    subjectType: input.subjectType,
+    subjectId: input.subjectId,
+    correlationId,
+    idempotencyKey: input.idempotencyKey,
+    moduleId: input.moduleId,
+  };
+  for (const [field, value] of Object.entries(values)) {
+    if (value !== undefined && isForbiddenAuditString(value)) throw new ForbiddenAuditValueError(field);
+  }
 }

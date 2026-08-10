@@ -5,7 +5,7 @@ import { and, eq } from 'drizzle-orm';
 import { validateConfig } from '../../src/config.js';
 import { createDatabase, type DatabaseClient } from '../../src/db/client.js';
 import { chatModuleStates, telegramChats } from '../../src/db/schema/core.js';
-import { AuditService } from '../../src/lib/auditService.js';
+import { AuditService, ForbiddenAuditValueError } from '../../src/lib/auditService.js';
 import { events, entitySnapshots, eventPolicies, outbox } from '../../src/db/schema/audit.js';
 
 const testDatabaseUrl = process.env.TEST_DATABASE_URL;
@@ -18,22 +18,17 @@ describe.skipIf(!testDatabaseUrl)('Audit transaction integration', () => {
       TELEGRAM_BOT_TOKEN: 'test-token',
       DATABASE_URL: testDatabaseUrl,
       NODE_ENV: 'test',
-      DATABASE_TLS_REJECT_UNAUTHORIZED: 'true',
+      DATABASE_TLS_REJECT_UNAUTHORIZED: process.env.DATABASE_TLS_REJECT_UNAUTHORIZED ?? 'true',
     });
     database = createDatabase(config);
     await migrate(database.db, { migrationsFolder: 'src/db/migrations' });
     audit = new AuditService(database.db);
   });
 
-  beforeEach(async () => {
-    await database!.db.delete(telegramChats);
-    await database!.db.delete(chatModuleStates);
-    await database!.db.delete(outbox);
-    await database!.db.delete(events);
-    await database!.db.delete(entitySnapshots);
-  });
+  beforeEach(cleanup);
 
   afterAll(async () => {
+    await cleanup();
     await database?.close();
   });
 
@@ -249,4 +244,181 @@ describe.skipIf(!testDatabaseUrl)('Audit transaction integration', () => {
       operation: 'update',
     });
   });
+
+  it('keeps input.moduleId canonical in event and outbox metadata', async () => {
+    await audit!.recordEntityChange(
+      {
+        tenantId: '1007',
+        subjectType: 'chat_module_state',
+        subjectId: '1007:module-admin',
+        eventType: 'module.state.changed',
+        eventVersion: 'v1',
+        category: 'module',
+        source: 'telegram.command',
+        moduleId: 'module-admin',
+        idempotencyKey: 'audit:test:1007:module-admin:canonical-metadata',
+        metadata: { moduleId: 'input-metadata-module' },
+      },
+      async (tx) => {
+        await tx.insert(telegramChats).values({ chatId: '1007', type: 'group', title: 'audit-test' });
+        await tx.insert(chatModuleStates).values({ chatId: '1007', moduleId: 'module-admin', enabled: true });
+        return {
+          before: undefined,
+          after: { enabled: true, source: 'override' },
+          metadata: { moduleId: 'mutation-metadata-module', operation: 'update' },
+          snapshotData: { chatId: '1007', moduleId: 'module-admin', enabled: true, source: 'override' },
+        };
+      },
+    );
+
+    const [event] = await database!.db.select().from(events);
+    const [outboxRow] = await database!.db.select().from(outbox);
+
+    expect(event?.metadata).toMatchObject({ moduleId: 'module-admin', operation: 'update' });
+    expect((outboxRow?.payload as { metadata?: unknown } | undefined)?.metadata).toMatchObject({
+      moduleId: 'module-admin',
+      operation: 'update',
+    });
+  });
+
+  it('removes forbidden metadata and Telegram payloads before persisting the event', async () => {
+    await audit!.recordEntityChange(
+      {
+        tenantId: '1008',
+        subjectType: 'chat_module_state',
+        subjectId: '1008:module-admin',
+        eventType: 'module.state.changed',
+        eventVersion: 'v1',
+        category: 'module',
+        source: 'telegram.command',
+        moduleId: 'module-admin',
+        idempotencyKey: 'audit:test:1008:module-admin:safety',
+        metadata: {
+          source: 'safe-source',
+          token: 'top-level-token',
+          password: 'top-level-password',
+          headers: { authorization: 'Bearer secret' },
+          connectionString: 'postgres://secret',
+          webhookSecret: 'webhook-secret',
+        },
+        telegramContext: {
+          correlationId: 'correlation-1008',
+          updateId: 'Bearer telegram-update-secret',
+          chatId: '1008',
+          userId: 'user-1008',
+          messageThreadId: '42',
+          rawUpdate: { token: 'raw-update-token' },
+          callbackPayload: { data: 'full-callback-payload' },
+          files: [{ fileUrl: 'secret-file-url' }],
+        },
+      },
+      async (tx) => {
+        await tx.insert(telegramChats).values({ chatId: '1008', type: 'group', title: 'audit-test' });
+        await tx.insert(chatModuleStates).values({ chatId: '1008', moduleId: 'module-admin', enabled: true });
+        return {
+          before: undefined,
+          after: { enabled: true, source: 'override' },
+          metadata: {
+            operation: 'update',
+            reason: {
+              message: 'safe reason',
+              database: 'postgresql://audit:password@db.example/audit',
+              credential: 'Bearer nested-access-token',
+              webhook: 'whsec_nested-webhook-secret',
+              nested: { password: 'nested-password', callbackPayload: 'nested-callback', files: ['nested-file'] },
+            },
+          },
+          snapshotData: { chatId: '1008', moduleId: 'module-admin', enabled: true, source: 'override' },
+        };
+      },
+    );
+
+    const [event] = await database!.db.select().from(events);
+    const [outboxRow] = await database!.db.select().from(outbox);
+
+    expect(event?.metadata).toMatchObject({
+      source: 'safe-source',
+      operation: 'update',
+      reason: {
+        message: 'safe reason',
+        database: '[redacted]',
+        credential: '[redacted]',
+        webhook: '[redacted]',
+        nested: {},
+      },
+      moduleId: 'module-admin',
+      auditPolicy: expect.any(Object),
+    });
+    expect(event?.telegramContext).toEqual({
+      correlationId: 'correlation-1008',
+      chatId: '1008',
+      userId: 'user-1008',
+      messageThreadId: '42',
+    });
+    expect((outboxRow?.payload as { metadata?: unknown } | undefined)?.metadata).toEqual(event?.metadata);
+
+    const persistedJson = JSON.stringify(event);
+    for (const forbidden of [
+      'top-level-token',
+      'top-level-password',
+      'Bearer secret',
+      'postgres://secret',
+      'webhook-secret',
+      'raw-update-token',
+      'full-callback-payload',
+      'secret-file-url',
+      'nested-password',
+      'nested-callback',
+      'nested-file',
+      'db.example',
+      'nested-access-token',
+      'nested-webhook-secret',
+      'telegram-update-secret',
+    ]) {
+      expect(persistedJson).not.toContain(forbidden);
+    }
+  });
+
+  it('rejects forbidden values in event envelope fields before the business mutation', async () => {
+    let mutationCalled = false;
+
+    await expect(
+      audit!.recordEntityChange(
+        {
+          tenantId: '1009',
+          subjectType: 'chat_module_state',
+          eventType: 'module.state.changed',
+          eventVersion: 'v1',
+          category: 'module',
+          source: 'postgresql://audit:password@db.example/audit',
+          actorId: 'Bearer actor-access-token',
+          subjectId: 'whsec_subject-webhook-secret',
+          correlationId: 'password=correlation-secret',
+          idempotencyKey: 'Bearer idempotency-secret',
+        },
+        async (tx) => {
+          mutationCalled = true;
+          await tx.insert(telegramChats).values({ chatId: '1009', type: 'group', title: 'must-not-persist' });
+          return {
+            before: undefined,
+            after: { enabled: true, source: 'override' },
+            snapshotData: { chatId: '1009', moduleId: 'module-admin', enabled: true, source: 'override' },
+          };
+        },
+      ),
+    ).rejects.toThrow(ForbiddenAuditValueError);
+
+    expect(mutationCalled).toBe(false);
+    expect(await database!.db.select().from(telegramChats)).toHaveLength(0);
+    expect(await database!.db.select().from(events)).toHaveLength(0);
+  });
 });
+
+async function cleanup(): Promise<void> {
+  if (database === undefined) return;
+  await database.db.delete(telegramChats);
+  await database.db.delete(chatModuleStates);
+  await database.db.delete(outbox);
+  await database.db.delete(events);
+  await database.db.delete(entitySnapshots);
+}

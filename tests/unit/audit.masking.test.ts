@@ -39,7 +39,9 @@ describe('stripForbidden (defense in depth)', () => {
       headers: { authorization: 'Bearer xyz' },
       rawUpdate: { update_id: 1 },
       callbackData: 'payload',
+      callbackPayload: { data: 'full payload' },
       fileId: 'AgAD',
+      files: [{ name: 'attachment' }],
     };
     const result = stripForbidden(data);
     expect(result).toEqual({ chatId: '1' });
@@ -49,5 +51,32 @@ describe('stripForbidden (defense in depth)', () => {
     const data = { items: [{ token: 'x', ok: true }, { password: 'y', ok: false }] };
     const result = stripForbidden(data);
     expect(result).toEqual({ items: [{ ok: true }, { ok: false }] });
+  });
+
+  it('redacts recognizable forbidden values stored under otherwise allowed keys', () => {
+    const data = {
+      reason: {
+        database: 'postgresql://audit:password@db.example/audit',
+        authorization: 'this key is removed before its value is inspected',
+        nested: [
+          { message: 'Bearer audit-api-token' },
+          { message: 'password=hunter2' },
+          { message: 'whsec_webhook-signing-secret' },
+        ],
+      },
+      safe: 'ordinary operational explanation',
+    };
+
+    expect(stripForbidden(data)).toEqual({
+      reason: {
+        database: '[redacted]',
+        nested: [
+          { message: '[redacted]' },
+          { message: '[redacted]' },
+          { message: '[redacted]' },
+        ],
+      },
+      safe: 'ordinary operational explanation',
+    });
   });
 });
