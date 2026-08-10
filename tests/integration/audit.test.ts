@@ -5,7 +5,7 @@ import { and, eq } from 'drizzle-orm';
 import { validateConfig } from '../../src/config.js';
 import { createDatabase, type DatabaseClient } from '../../src/db/client.js';
 import { chatModuleStates, telegramChats } from '../../src/db/schema/core.js';
-import { AuditService } from '../../src/lib/auditService.js';
+import { AuditService, ForbiddenAuditValueError } from '../../src/lib/auditService.js';
 import { events, entitySnapshots, eventPolicies, outbox } from '../../src/db/schema/audit.js';
 
 const testDatabaseUrl = process.env.TEST_DATABASE_URL;
@@ -303,7 +303,7 @@ describe.skipIf(!testDatabaseUrl)('Audit transaction integration', () => {
         },
         telegramContext: {
           correlationId: 'correlation-1008',
-          updateId: 'update-1008',
+          updateId: 'Bearer telegram-update-secret',
           chatId: '1008',
           userId: 'user-1008',
           messageThreadId: '42',
@@ -322,6 +322,9 @@ describe.skipIf(!testDatabaseUrl)('Audit transaction integration', () => {
             operation: 'update',
             reason: {
               message: 'safe reason',
+              database: 'postgresql://audit:password@db.example/audit',
+              credential: 'Bearer nested-access-token',
+              webhook: 'whsec_nested-webhook-secret',
               nested: { password: 'nested-password', callbackPayload: 'nested-callback', files: ['nested-file'] },
             },
           },
@@ -336,13 +339,18 @@ describe.skipIf(!testDatabaseUrl)('Audit transaction integration', () => {
     expect(event?.metadata).toMatchObject({
       source: 'safe-source',
       operation: 'update',
-      reason: { message: 'safe reason', nested: {} },
+      reason: {
+        message: 'safe reason',
+        database: '[redacted]',
+        credential: '[redacted]',
+        webhook: '[redacted]',
+        nested: {},
+      },
       moduleId: 'module-admin',
       auditPolicy: expect.any(Object),
     });
     expect(event?.telegramContext).toEqual({
       correlationId: 'correlation-1008',
-      updateId: 'update-1008',
       chatId: '1008',
       userId: 'user-1008',
       messageThreadId: '42',
@@ -362,9 +370,47 @@ describe.skipIf(!testDatabaseUrl)('Audit transaction integration', () => {
       'nested-password',
       'nested-callback',
       'nested-file',
+      'db.example',
+      'nested-access-token',
+      'nested-webhook-secret',
+      'telegram-update-secret',
     ]) {
       expect(persistedJson).not.toContain(forbidden);
     }
+  });
+
+  it('rejects forbidden values in event envelope fields before the business mutation', async () => {
+    let mutationCalled = false;
+
+    await expect(
+      audit!.recordEntityChange(
+        {
+          tenantId: '1009',
+          subjectType: 'chat_module_state',
+          eventType: 'module.state.changed',
+          eventVersion: 'v1',
+          category: 'module',
+          source: 'postgresql://audit:password@db.example/audit',
+          actorId: 'Bearer actor-access-token',
+          subjectId: 'whsec_subject-webhook-secret',
+          correlationId: 'password=correlation-secret',
+          idempotencyKey: 'Bearer idempotency-secret',
+        },
+        async (tx) => {
+          mutationCalled = true;
+          await tx.insert(telegramChats).values({ chatId: '1009', type: 'group', title: 'must-not-persist' });
+          return {
+            before: undefined,
+            after: { enabled: true, source: 'override' },
+            snapshotData: { chatId: '1009', moduleId: 'module-admin', enabled: true, source: 'override' },
+          };
+        },
+      ),
+    ).rejects.toThrow(ForbiddenAuditValueError);
+
+    expect(mutationCalled).toBe(false);
+    expect(await database!.db.select().from(telegramChats)).toHaveLength(0);
+    expect(await database!.db.select().from(events)).toHaveLength(0);
   });
 });
 

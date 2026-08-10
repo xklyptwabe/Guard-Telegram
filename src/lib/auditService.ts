@@ -5,6 +5,7 @@ import type { SnapshotStatus } from './audit/enums.js';
 import {
   AUDIT_OPERATIONAL_METADATA_ALLOWLIST,
   applyAllowlist,
+  isForbiddenAuditString,
   type AuditPolicyContext,
 } from './audit/masking.js';
 import { resolveEffectiveAuditPolicy, type EffectiveAuditPolicy } from './audit/policyResolution.js';
@@ -62,6 +63,13 @@ export class AuditIdempotencyConflictError extends Error {
   }
 }
 
+export class ForbiddenAuditValueError extends Error {
+  public constructor(field: string) {
+    super(`Audit field "${field}" contains forbidden credential data.`);
+    this.name = 'ForbiddenAuditValueError';
+  }
+}
+
 export class AuditService {
   public constructor(private readonly db: DrizzleDatabase) {}
 
@@ -70,6 +78,8 @@ export class AuditService {
     mutate: (tx: AuditTransaction, nextSubjectSequence: number) => Promise<AuditMutationResult<TSnapshot>>,
   ): Promise<{ readonly eventId: string; readonly subjectSequence: number; readonly duplicate: boolean }> {
     const context = getUpdateContext();
+    const correlationId = input.correlationId ?? context?.correlationId;
+    assertSafeAuditEnvelope(input, correlationId);
     const auditDefinition = requireAuditPersistenceDefinition(input);
     return this.db.transaction(async (tx) => {
       const existing = await tx
@@ -168,7 +178,7 @@ export class AuditService {
           subjectType: input.subjectType,
           subjectId: input.subjectId,
           subjectSequence: nextSubjectSequence,
-          correlationId: input.correlationId ?? context?.correlationId,
+          correlationId,
           telegramContext,
           idempotencyKey: input.idempotencyKey,
           before: normalizedMutation.before,
@@ -350,7 +360,28 @@ function sanitizeTelegramContext(context: Record<string, unknown> | undefined): 
   if (context === undefined) return undefined;
   const projected = applyAllowlist(context, AUDIT_TELEGRAM_CONTEXT_ALLOWLIST);
   const safeEntries = Object.entries(projected).filter(
-    (entry): entry is [string, string] => typeof entry[1] === 'string' && entry[1].length > 0,
+    (entry): entry is [string, string] =>
+      typeof entry[1] === 'string' && entry[1].length > 0 && entry[1] !== '[redacted]',
   );
   return safeEntries.length === 0 ? undefined : Object.fromEntries(safeEntries);
+}
+
+function assertSafeAuditEnvelope(input: AuditEventInput, correlationId: string | undefined): void {
+  const values = {
+    tenantId: input.tenantId,
+    eventType: input.eventType,
+    eventVersion: input.eventVersion,
+    category: input.category,
+    source: input.source,
+    actorId: input.actorId,
+    actorType: input.actorType,
+    subjectType: input.subjectType,
+    subjectId: input.subjectId,
+    correlationId,
+    idempotencyKey: input.idempotencyKey,
+    moduleId: input.moduleId,
+  };
+  for (const [field, value] of Object.entries(values)) {
+    if (value !== undefined && isForbiddenAuditString(value)) throw new ForbiddenAuditValueError(field);
+  }
 }

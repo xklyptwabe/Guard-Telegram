@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 
 import { entitySnapshots, events, outbox } from '../../src/db/schema/audit.js';
-import { AuditService } from '../../src/lib/auditService.js';
+import { AuditService, ForbiddenAuditValueError } from '../../src/lib/auditService.js';
 import type { AuditPolicyResolutionRow } from '../../src/lib/audit/policyResolution.js';
 
 describe('AuditService persistence safety', () => {
@@ -123,6 +123,100 @@ describe('AuditService persistence safety', () => {
 
     expect(database.captured.event?.metadata).toMatchObject({ reason: '[redacted]' });
     expect(JSON.stringify(database.captured.event)).not.toContain('policy-sensitive-reason');
+  });
+
+  it('redacts forbidden values nested below allowed metadata and drops unsafe Telegram identifiers', async () => {
+    const database = fakeAuditDatabase();
+    const audit = new AuditService(database.db as never);
+
+    await audit.recordEntityChange(
+      {
+        tenantId: 'chat-1',
+        subjectType: 'chat_module_state',
+        subjectId: 'chat-1:moderation',
+        eventType: 'module.state.changed',
+        eventVersion: 'v1',
+        category: 'module',
+        source: 'unit-test',
+        idempotencyKey: 'unit:audit-service:secret-values',
+        metadata: {
+          reason: {
+            database: 'postgresql://audit:password@db.example/audit',
+            note: 'Bearer audit-api-token',
+            webhook: 'whsec_webhook-signing-secret',
+            safe: 'ordinary operational explanation',
+          },
+        },
+        telegramContext: {
+          correlationId: 'correlation-1',
+          updateId: 'Bearer telegram-update-secret',
+          chatId: 'chat-1',
+          userId: 'password=telegram-user-secret',
+          messageThreadId: '42',
+        },
+      },
+      async () => ({
+        before: undefined,
+        after: { enabled: true, source: 'override' },
+        snapshotData: { chatId: 'chat-1', moduleId: 'moderation', enabled: true, source: 'override' },
+      }),
+    );
+
+    expect(database.captured.event?.metadata).toMatchObject({
+      reason: {
+        database: '[redacted]',
+        note: '[redacted]',
+        webhook: '[redacted]',
+        safe: 'ordinary operational explanation',
+      },
+    });
+    expect(database.captured.event?.telegramContext).toEqual({
+      correlationId: 'correlation-1',
+      chatId: 'chat-1',
+      messageThreadId: '42',
+    });
+    expect(JSON.stringify(database.captured.event)).not.toMatch(
+      /postgresql:\/\/audit|audit-api-token|webhook-signing-secret|telegram-update-secret|telegram-user-secret/,
+    );
+  });
+
+  it.each([
+    ['source', { source: 'postgresql://audit:password@db.example/audit' }],
+    ['actorId', { actorId: 'Bearer actor-access-token' }],
+    ['subjectId', { subjectId: 'whsec_subject-webhook-secret' }],
+    ['correlationId', { correlationId: 'password=correlation-secret' }],
+    ['idempotencyKey', { idempotencyKey: 'Bearer idempotency-secret' }],
+  ] as const)('rejects a forbidden value in the %s event envelope field before mutation', async (_field, override) => {
+    const database = fakeAuditDatabase();
+    const audit = new AuditService(database.db as never);
+    let mutationCalled = false;
+
+    await expect(
+      audit.recordEntityChange(
+        {
+          tenantId: 'chat-1',
+          subjectType: 'chat_module_state',
+          subjectId: 'chat-1:moderation',
+          eventType: 'module.state.changed',
+          eventVersion: 'v1',
+          category: 'module',
+          source: 'unit-test',
+          idempotencyKey: 'unit:audit-service:unsafe-envelope',
+          ...override,
+        },
+        async () => {
+          mutationCalled = true;
+          return {
+            before: undefined,
+            after: { enabled: true, source: 'override' },
+            snapshotData: { chatId: 'chat-1', moduleId: 'moderation', enabled: true, source: 'override' },
+          };
+        },
+      ),
+    ).rejects.toThrow(ForbiddenAuditValueError);
+
+    expect(mutationCalled).toBe(false);
+    expect(database.captured.event).toBeUndefined();
   });
 });
 
