@@ -4,6 +4,8 @@ import amqp, { type ChannelModel, type ConfirmChannel, type ConsumeMessage } fro
 import { z } from 'zod';
 
 import type { AppConfig } from '../config.js';
+import { recordIntegrationAction } from './audit/integrationAudit.js';
+import type { AuditService } from './auditService.js';
 import type { Logger } from './logger.js';
 
 const actionEnvelopeSchema = z.object({
@@ -52,7 +54,7 @@ async function publishConfirmed(channel: ConfirmChannel, exchange: string, routi
   await channel.waitForConfirms();
 }
 
-export async function createRabbitMq(config: Pick<AppConfig, 'rabbitMqEnabled' | 'rabbitMqUrl' | 'rabbitMqNamespace' | 'rabbitMqProductId' | 'rabbitMqPrefetch' | 'rabbitMqRetryDelayMs' | 'rabbitMqMaxRetries'>, logger: Logger): Promise<RabbitMqBridge> {
+export async function createRabbitMq(config: Pick<AppConfig, 'rabbitMqEnabled' | 'rabbitMqUrl' | 'rabbitMqNamespace' | 'rabbitMqProductId' | 'rabbitMqPrefetch' | 'rabbitMqRetryDelayMs' | 'rabbitMqMaxRetries'>, logger: Logger, audit: AuditService): Promise<RabbitMqBridge> {
   if (!config.rabbitMqEnabled) {
     return {
       enabled: false,
@@ -80,9 +82,33 @@ export async function createRabbitMq(config: Pick<AppConfig, 'rabbitMqEnabled' |
   await channel.prefetch(config.rabbitMqPrefetch);
   logger.info({ event: 'rabbitmq.connected' });
 
-  const publish = async (type: string, payload: unknown): Promise<void> => {
+  const rawPublish = async (type: string, payload: unknown): Promise<void> => {
     const envelope = actionEnvelopeSchema.parse({ id: randomUUID(), type, attempt: 0, payload });
     await publishConfirmed(channel, topology.actionsExchange, topology.routingKey, envelope);
+  };
+
+  const publish = async (type: string, payload: unknown): Promise<void> => {
+    try {
+      await rawPublish(type, payload);
+    } catch (error: unknown) {
+      // Audit recording never throws on its own (see integrationAudit.ts) —
+      // it cannot mask or replace the real failure being rethrown below.
+      await recordIntegrationAction(audit, logger, {
+        integrationId: 'rabbitmq',
+        action: type,
+        targetType: 'queue',
+        targetId: topology.actionQueue,
+        success: false,
+      });
+      throw error;
+    }
+    await recordIntegrationAction(audit, logger, {
+      integrationId: 'rabbitmq',
+      action: type,
+      targetType: 'queue',
+      targetId: topology.actionQueue,
+      success: true,
+    });
   };
 
   const sendToQueue = async (queue: string, envelope: ActionEnvelope): Promise<void> => {

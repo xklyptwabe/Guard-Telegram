@@ -57,14 +57,14 @@ async function bootstrap(): Promise<void> {
     logger.info({ event: 'database.migrations.completed' });
     await purgeExpiredProcessedUpdates(database.db);
     redis = await createRedis(config, logger);
-    storage = createStorage(config, logger);
-    rabbitMq = await createRabbitMq(config, logger);
-    validateModules(modules);
     const audit = new AuditService(database.db);
+    storage = createStorage(config, logger, audit);
+    rabbitMq = await createRabbitMq(config, logger, audit);
+    validateModules(modules);
     const events = new EventBus(logger);
     const registry = new ModuleRegistry(modules, database.db, audit, events, logger);
     const reply = new ReplyService(config, logger);
-    const dispatcher = new CommandDispatcher(collectCommands(modules), registry, new Cooldowns(), reply, events, i18n, logger);
+    const dispatcher = new CommandDispatcher(collectCommands(modules), registry, new Cooldowns(), reply, events, i18n, logger, audit);
     const bot = createTelegramBot(config, logger);
     await bot.init();
     registerPlatformMiddleware(bot, database.db, registry, logger);
