@@ -54,7 +54,7 @@ export interface AuditChange<TSnapshot extends Record<string, unknown>> {
 
 export type AuditMutationResult<TSnapshot extends Record<string, unknown>> = AuditChange<TSnapshot>;
 
-type AuditTransaction = Pick<DrizzleDatabase, 'select' | 'insert' | 'update' | 'delete' | 'execute'>;
+export type AuditTransaction = Pick<DrizzleDatabase, 'select' | 'insert' | 'update' | 'delete' | 'execute'>;
 
 export class AuditIdempotencyConflictError extends Error {
   public constructor() {

@@ -4,8 +4,9 @@ import { Pool } from 'pg';
 import type { AppConfig } from '../config.js';
 import * as coreSchema from './schema/core.js';
 import * as auditSchema from './schema/audit.js';
+import * as moderationSchema from './schema/moderation.js';
 
-const schema = { ...coreSchema, ...auditSchema };
+const schema = { ...coreSchema, ...auditSchema, ...moderationSchema };
 
 export type DrizzleDatabase = ReturnType<typeof drizzle<typeof schema>>;
 

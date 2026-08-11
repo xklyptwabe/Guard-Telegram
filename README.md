@@ -2,7 +2,7 @@
 
 Server-side Telegram bot for private chats, groups, supergroups, and forum topics. It is a TypeScript/ESM, strict-mode foundation for independently deployable bot modules. Settings and module state are isolated by `chat_id`; PostgreSQL is the source of truth.
 
-The project deliberately has no audit log. It does not persist message bodies, edited-message data, reactions, raw update JSON, files, or callback payloads. `core.processed_updates` contains only `(bot_id, update_id, timestamps)` for idempotency and is retained for seven days by default.
+Every state-changing operation — module/chat-settings changes, member and bot membership transitions, moderation actions, message edits, the bot's own message deletions, commands, and external integration calls — is recorded in a structured `audit` schema with per-chat, per-event-type policy control and field-level allowlisting. Message *bodies* are still never stored unless a chat's own policy explicitly opts in (`allowMessageTextLogging`); by default only metadata (who, what, when, how long) is kept. `core.processed_updates` additionally holds `(bot_id, update_id, timestamps)` for idempotency and is retained for seven days by default. See [docs/modules/0009-audit-instrumentation.md](docs/modules/0009-audit-instrumentation.md) for what is and isn't observable through the Bot API, and [docs/modules/0010-external-operation-outbox.md](docs/modules/0010-external-operation-outbox.md) for how moderation actions are made reliable.
 
 ## What is included
 
@@ -53,7 +53,16 @@ The bootstrap includes:
 | `/modules` | `module-admin` | enabled globally, chat-admin only |
 | `/module_enable <id>` | `module-admin` | chat-admin only |
 | `/module_disable <id>` | `module-admin` | chat-admin only |
+| `/setlocale <ru\|en>` | `chat-settings` | enabled globally, chat-admin only |
+| `/ban [reason]` | `moderation` | disabled by default, chat-admin only |
+| `/unban <user_id>` | `moderation` | disabled by default, chat-admin only |
+| `/restrict <seconds> [reason]` | `moderation` | disabled by default, chat-admin only |
+| `/unrestrict` | `moderation` | disabled by default, chat-admin only |
+| `/kick [reason]` | `moderation` | disabled by default, chat-admin only |
+| `/delmsg` (reply to a message) | `moderation` | disabled by default, chat-admin only |
 | `/echo <text>` | `example-tools` | disabled local-module example |
+
+`ban`/`unban`/`restrict`/`unrestrict`/`kick` take their target either as a reply to the target's own message, or (for `/unban`) a leading numeric `user_id`. `moderation` is opt-in per chat (`/module_enable moderation`) since it grants real administrative power.
 
 Telegram’s command menu is a union across modules and is registered in RU and EN. It is a hint, not an authorization system: the dispatcher always rechecks module state, permissions, cooldown, and a Zod schema. grammY handles `/command@bot_username` in groups. The only deep-link entry point is `/start <payload>`; a sensitive module must sign its payload or map it to a one-time database record.
 

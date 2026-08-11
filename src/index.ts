@@ -9,20 +9,23 @@ import { CommandDispatcher } from './core/dispatcher.js';
 import { validateModules } from './core/loader.js';
 import { ModuleRegistry } from './core/registry.js';
 import { createTelegramBot } from './core/telegram.js';
-import { registerModuleUpdateHandlers, registerPlatformMiddleware, startLongPolling, startWebhook, type TransportController } from './core/updates.js';
+import { registerBotMembershipAudit, registerModuleUpdateHandlers, registerPlatformMiddleware, startLongPolling, startWebhook, type TransportController } from './core/updates.js';
 import { createDatabase } from './db/client.js';
 import { purgeExpiredProcessedUpdates } from './db/retention.js';
 import { createRedis } from './db/redis.js';
 import { initializeI18n } from './i18n/index.js';
 import { AuditService } from './lib/auditService.js';
+import { ChatSettingsService } from './lib/chatSettings.js';
 import { Cooldowns } from './lib/cooldowns.js';
 import { EventBus } from './lib/eventBus.js';
 import { healthSnapshot } from './lib/health.js';
 import { Logger } from './lib/logger.js';
+import { ModerationService } from './lib/moderation/moderationService.js';
+import { PendingOperationResolvers, PendingOperationsOutbox } from './lib/moderation/pendingOperationsOutbox.js';
 import { createRabbitMq } from './lib/rabbitmq.js';
 import { ReplyService } from './lib/reply.js';
 import { createStorage } from './lib/storage.js';
-import { modules } from './modules/index.js';
+import { createModules } from './modules/index.js';
 
 async function bootstrap(): Promise<void> {
   const config = validateConfig();
@@ -62,16 +65,30 @@ async function bootstrap(): Promise<void> {
     const audit = new AuditService(database.db);
     storage = createStorage(config, logger, audit);
     rabbitMq = await createRabbitMq(config, logger, audit);
+    const bot = createTelegramBot(config, logger);
+    await bot.init();
+
+    const pendingOperationResolvers = new PendingOperationResolvers();
+    const pendingOperationsOutbox = new PendingOperationsOutbox(database.db, logger, pendingOperationResolvers);
+    const chatSettings = new ChatSettingsService(database.db, audit);
+    const moderation = new ModerationService(bot, audit, pendingOperationsOutbox, pendingOperationResolvers, logger);
+
+    const modules = createModules({ audit, logger, chatSettings, moderation });
     validateModules(modules);
     const events = new EventBus(logger);
     const registry = new ModuleRegistry(modules, database.db, audit, events, logger);
     const reply = new ReplyService(config, logger);
     const dispatcher = new CommandDispatcher(collectCommands(modules), registry, new Cooldowns(), reply, events, i18n, logger, audit);
-    const bot = createTelegramBot(config, logger);
-    await bot.init();
     registerPlatformMiddleware(bot, database.db, registry, logger);
+    registerBotMembershipAudit(bot, audit, logger);
     registerModuleUpdateHandlers(bot, modules, registry, logger);
     await registerCommands(bot, modules, dispatcher, i18n, logger);
+
+    // BOTS-9: resume anything the write-ahead outbox left unresolved before
+    // this process last stopped — before accepting new traffic, so recovery
+    // never races a fresh command for the same target.
+    await moderation.recoverPending();
+
     transport = config.telegramTransport === 'webhook' ? await startWebhook(bot, config, logger) : startLongPolling(bot, config, logger);
     if (config.backendApiEnabled) {
       backendApi = await startBackendApiServer(config, database.db, audit, logger);

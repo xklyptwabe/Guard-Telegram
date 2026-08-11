@@ -7,6 +7,8 @@ import { z } from 'zod';
 import type { AppConfig } from '../config.js';
 import type { DrizzleDatabase } from '../db/client.js';
 import { processedUpdates, telegramUsers } from '../db/schema/core.js';
+import type { AuditService } from '../lib/auditService.js';
+import { recordBotMembershipChanged } from '../lib/audit/botMembershipAudit.js';
 import { runWithUpdateContext } from '../lib/context.js';
 import type { Logger } from '../lib/logger.js';
 import type { ModuleRegistry } from './registry.js';
@@ -83,6 +85,21 @@ export function registerModuleUpdateHandlers(bot: Bot<Context>, modules: readonl
         }
       }
     }
+    await next();
+  });
+}
+
+/**
+ * BOTS-9: registers `bot.membership.changed` auditing directly on the bot
+ * — deliberately not routed through `registerModuleUpdateHandlers` (and
+ * therefore never gated by any module's enabled/disabled state). The
+ * event's definition marks it `canBeDisabled: false`: whether the bot
+ * itself can still act in a chat is core infrastructure, not an optional
+ * feature a chat's admins should be able to silence.
+ */
+export function registerBotMembershipAudit(bot: Bot<Context>, audit: AuditService, logger: Logger): void {
+  bot.use(async (ctx, next) => {
+    await recordBotMembershipChanged(audit, logger, ctx);
     await next();
   });
 }

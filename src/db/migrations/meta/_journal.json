@@ -92,6 +92,13 @@
       "when": 1786025000000,
       "tag": "0012_ensure_audit_retention_role",
       "breakpoints": true
+    },
+    {
+      "idx": 13,
+      "version": "7",
+      "when": 1786026000000,
+      "tag": "0013_add_pending_operations_outbox",
+      "breakpoints": true
     }
   ]
 }

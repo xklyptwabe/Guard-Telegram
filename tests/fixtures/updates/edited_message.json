@@ -1,0 +1,11 @@
+{
+  "update_id": 100007,
+  "edited_message": {
+    "message_id": 503,
+    "date": 1770000500,
+    "edit_date": 1770000560,
+    "chat": { "id": -1001111111111, "type": "supergroup", "title": "Fixture Chat" },
+    "from": { "id": 111111, "is_bot": false, "first_name": "Alice", "username": "alice" },
+    "text": "This message was edited after sending."
+  }
+}
