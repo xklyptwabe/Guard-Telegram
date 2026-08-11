@@ -52,7 +52,7 @@ const configSchema = z
     telegramTransport: z.enum(['long_polling', 'webhook']).default('long_polling'),
     telegramAllowedUpdates: z
       .string()
-      .default('message,callback_query,my_chat_member')
+      .default('message,edited_message,callback_query,my_chat_member,chat_member')
       .transform((value) => value.split(',').map((item) => item.trim()).filter(Boolean))
       .pipe(z.array(z.enum(telegramUpdateTypes)))
       .refine((items) => items.length > 0, 'TELEGRAM_ALLOWED_UPDATES must not be empty'),
