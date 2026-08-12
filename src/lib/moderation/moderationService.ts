@@ -110,17 +110,30 @@ export class ModerationService {
     });
   }
 
-  /** Telegram convention for "remove without a permanent ban": ban, then immediately unban with `only_if_banned`. Modeled as two independent, individually-reliable outbox operations rather than one, so a crash between the two steps is still recoverable per-step. */
+  /**
+   * Telegram has no atomic "kick" primitive — the Bot API idiom is
+   * ban-then-immediately-unban. This is modeled as a **single** outbox
+   * operation whose executor performs both calls, rather than two separate
+   * `pending_operations` rows. That's deliberate: with two rows, a crash
+   * between "ban succeeded" and "the unban row gets written" left nothing
+   * on disk saying an unban was still owed — the target would stay banned
+   * forever with no way for `recoverPending()` to know to finish the job.
+   * With one row, a crash anywhere in the executor just leaves it
+   * `in_progress`/`unknown`; recovery re-invokes the *whole* executor, and
+   * both Telegram calls are naturally idempotent (banning an
+   * already-banned user, or unbanning with `only_if_banned`, are no-ops),
+   * so replaying the pair from the top is always safe.
+   *
+   * The one case this does *not* paper over: a **confirmed** rejection
+   * (`GrammyError`) on the unban half after the ban half already
+   * succeeded. That is terminal by design (see
+   * `pendingOperationsOutbox.ts` — a confirmed failure is never retried),
+   * so it can leave the target banned rather than kicked. That's inherent
+   * to Telegram's own two-call idiom, not a gap in this recovery — an
+   * operator needs to look at it, same as any other confirmed failure.
+   */
   public async kick(input: ModerationActionInput): Promise<ModerationOutcome> {
-    const banResult = await this.dispatch('kick.ban', input, 'telegram.banChatMember', { chat_id: Number(input.chatId), user_id: Number(input.targetUserId) });
-    if (!banResult.isFinal) return { status: 'unknown', willRetry: true };
-    if (banResult.outcome.status !== 'succeeded') {
-      await this.recordModerationAction('kick', input, banResult.row.idempotencyKey, banResult.outcome);
-      return this.toOutcome(banResult.outcome);
-    }
-    const unbanResult = await this.dispatch('kick.unban', input, 'telegram.unbanChatMember', { chat_id: Number(input.chatId), user_id: Number(input.targetUserId), only_if_banned: true });
-    if (unbanResult.isFinal) await this.recordModerationAction('kick', input, unbanResult.row.idempotencyKey, unbanResult.outcome);
-    return unbanResult.isFinal ? this.toOutcome(unbanResult.outcome) : { status: 'unknown', willRetry: true };
+    return this.performAndAudit('kick', input, 'telegram.kick', { chat_id: Number(input.chatId), user_id: Number(input.targetUserId) });
   }
 
   public async deleteMessage(chatId: string, messageId: string, actorUserId: string, knownAuthorUserId?: string): Promise<ModerationOutcome> {
@@ -170,6 +183,12 @@ export class ModerationService {
     this.resolvers.register('telegram.unbanChatMember', async (payload) => {
       await this.bot.api.raw.unbanChatMember({ chat_id: payload.chat_id as number, user_id: payload.user_id as number, only_if_banned: true });
     });
+    this.resolvers.register('telegram.kick', async (payload) => {
+      // Both calls are individually idempotent — safe to replay this whole
+      // executor from the top on recovery, whichever half it died on.
+      await this.bot.api.raw.banChatMember({ chat_id: payload.chat_id as number, user_id: payload.user_id as number });
+      await this.bot.api.raw.unbanChatMember({ chat_id: payload.chat_id as number, user_id: payload.user_id as number, only_if_banned: true });
+    });
     this.resolvers.register('telegram.restrictChatMember.mute', async (payload) => {
       await this.bot.api.raw.restrictChatMember({
         chat_id: payload.chat_id as number,
@@ -186,12 +205,11 @@ export class ModerationService {
     });
   }
 
-  private async dispatch(idempotencySuffix: string, input: ModerationActionInput, kind: string, requestPayload: Record<string, unknown>) {
+  private async dispatch(action: ModerationAction, input: ModerationActionInput, kind: string, requestPayload: Record<string, unknown>) {
     const context = getUpdateContext();
     const idempotencyKey = context
-      ? `moderation.action:telegram-update:${context.updateId}:${input.chatId}:${input.targetUserId}:${idempotencySuffix}`
-      : `moderation.action:${input.chatId}:${input.targetUserId}:${idempotencySuffix}:${Date.now()}`;
-    const action = idempotencySuffix.replace(/^kick\.(ban|unban)$/, 'kick') as ModerationAction;
+      ? `moderation.action:telegram-update:${context.updateId}:${input.chatId}:${input.targetUserId}:${action}`
+      : `moderation.action:${input.chatId}:${input.targetUserId}:${action}:${Date.now()}`;
     const metadata: Record<string, unknown> = { action, actorUserId: input.actorUserId, targetUserId: input.targetUserId, ...(input.reason !== undefined ? { reason: input.reason } : {}) };
     return this.outbox.execute({ kind, chatId: input.chatId, idempotencyKey, requestPayload, metadata }, this.resolvers.get(kind)!);
   }

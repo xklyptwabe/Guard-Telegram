@@ -251,6 +251,42 @@ describe('ModerationService', () => {
     expect(calls).toHaveLength(1);
   });
 
+  it('kick(): a row left in_progress by a crash between the ban and unban Telegram calls still completes both calls on recovery — the atomicity fix', async () => {
+    // Simulates the exact gap the old two-outbox-row design had: the
+    // process died mid-kick. With kick() now a single compound operation,
+    // there is exactly one row, and recovery re-runs the *whole* executor
+    // (both API calls), not just "resume from where it crashed" — which is
+    // what makes replaying it safe (ban on an already-banned user is a
+    // no-op; only the still-outstanding unban has a real effect).
+    db.rows.push({
+      id: 'row-kick-crashed',
+      kind: 'telegram.kick',
+      chatId: '-100111',
+      requestPayload: { chat_id: -100111, user_id: 2 },
+      metadata: { action: 'kick', actorUserId: '9', targetUserId: '2' },
+      idempotencyKey: 'moderation.action:telegram-update:1:-100111:2:kick',
+      status: 'in_progress', // crash happened after this row was claimed, before either Telegram call resolved
+      attemptCount: 1,
+      lastAttemptAt: new Date(),
+      nextAttemptAt: null,
+      result: null,
+      createdAt: new Date(),
+      updatedAt: new Date(),
+    });
+    const bot = fakeBot();
+    const { audit, calls } = fakeAuditService();
+    const service = new ModerationService(bot as never, audit, outbox, resolvers, logger());
+
+    await service.recoverPending();
+
+    expect(bot.api.raw.banChatMember).toHaveBeenCalledTimes(1);
+    expect(bot.api.raw.unbanChatMember).toHaveBeenCalledTimes(1); // the step that would have been silently lost under the old two-row design
+    expect(db.rows[0]?.status).toBe('succeeded');
+    expect(calls).toHaveLength(1);
+    const call = calls[0] as unknown as { result: { after?: Record<string, unknown> } };
+    expect(call.result.after).toMatchObject({ action: 'kick', targetUserId: '2' });
+  });
+
   it('deleteMessage(): on success, records message.deleted (not moderation.action)', async () => {
     const bot = fakeBot();
     const { audit, calls } = fakeAuditService();
