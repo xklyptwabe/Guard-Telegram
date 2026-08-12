@@ -8,7 +8,7 @@ import type { ModerationService } from '../../lib/moderation/moderationService.j
 
 const freeTextArgs = z.string();
 
-interface ResolvedTarget {
+export interface ResolvedTarget {
   readonly userId: string;
   /** Whatever tokens remain in the command's arguments after the target itself was consumed — either all of it (target came from a reply) or everything after a leading numeric user_id. */
   readonly rest: readonly string[];
@@ -20,7 +20,7 @@ interface ResolvedTarget {
  * required) or as a leading numeric user_id (needed for `/unban`, since a
  * banned user's messages may no longer be repliable in some clients).
  */
-function resolveTarget(ctx: Context, rawArgs: string): ResolvedTarget | undefined {
+export function resolveTarget(ctx: Context, rawArgs: string): ResolvedTarget | undefined {
   const tokens = rawArgs.trim().length > 0 ? rawArgs.trim().split(/\s+/) : [];
   const replyFrom = ctx.message?.reply_to_message?.from;
   if (replyFrom) return { userId: String(replyFrom.id), rest: tokens };
