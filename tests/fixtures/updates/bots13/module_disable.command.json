@@ -1,0 +1,11 @@
+{
+  "update_id": 131010,
+  "message": {
+    "message_id": 9200,
+    "date": 1780000010,
+    "chat": { "id": -1003131313, "type": "supergroup", "title": "BOTS-13 E2E Chat A" },
+    "from": { "id": 999001, "is_bot": false, "first_name": "OwnerA", "username": "owner_a" },
+    "text": "/module_disable module-admin",
+    "entities": [{ "offset": 0, "length": 15, "type": "bot_command" }]
+  }
+}

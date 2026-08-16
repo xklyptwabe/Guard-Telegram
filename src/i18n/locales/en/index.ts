@@ -33,6 +33,7 @@ const en = {
     disabled: 'disabled',
     changed: 'Module {{moduleId}} is {{state}}.',
     unknown: 'Module {{moduleId}} was not found.',
+    protected: 'Module {{moduleId}} cannot be disabled: it manages this chat modules.',
   },
   chatSettings: {
     changed: 'Chat language changed to {{locale}}.',

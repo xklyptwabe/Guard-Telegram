@@ -2,6 +2,7 @@ import { z } from 'zod';
 
 import { COMMAND_NAMES, MODULE_IDS } from '../../constants.js';
 import type { TelegramBotModule } from '../../core/contracts.js';
+import { ProtectedModuleDisableError } from '../../core/registry.js';
 
 const moduleIdSchema = z.object({ moduleId: z.string().regex(/^[a-z][a-z0-9-]*$/).max(64) });
 const moduleArgument = z.string().trim().transform((value) => ({ moduleId: value })).pipe(moduleIdSchema);
@@ -16,6 +17,10 @@ export const moduleAdminModule: TelegramBotModule = {
   description: 'Lets chat administrators opt modules in or out for their chat.',
   global: true,
   defaultEnabled: true,
+  // Self-protection: every /modules*, /module_* command belongs to this
+  // module, so allowing its disable would lock the chat's admins out of
+  // module management with no in-band recovery (BOTS-13 bug hunt).
+  protectFromDisable: true,
   commands: [
     {
       id: 'modules.list',
@@ -63,7 +68,15 @@ export const moduleAdminModule: TelegramBotModule = {
           await context.reply.send(context.ctx, context.t('modules.unknown', { moduleId }));
           return;
         }
-        await context.registry.setEnabled(context.chatId, moduleId, false, context.userId);
+        try {
+          await context.registry.setEnabled(context.chatId, moduleId, false, context.userId);
+        } catch (error) {
+          if (error instanceof ProtectedModuleDisableError) {
+            await context.reply.send(context.ctx, context.t('modules.protected', { moduleId }));
+            return;
+          }
+          throw error;
+        }
         await context.reply.send(context.ctx, context.t('modules.changed', { moduleId, state: moduleStateLabel(context, false) }));
       },
     },

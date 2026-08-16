@@ -32,6 +32,21 @@ export class MissingModuleAuditIdempotencyKeyError extends Error {
   }
 }
 
+/**
+ * BOTS-13 bug hunt: disabling the module that owns `/module_enable` (and
+ * `/modules`) leaves a chat with no way to manage its modules — every such
+ * command is itself gated by that module's enabled state. Recovery then
+ * requires a manual `chat_module_states` row delete. Modules flagged
+ * `protectFromDisable` are refused at this layer; the command layer turns
+ * the rejection into a localized reply instead of an internal error.
+ */
+export class ProtectedModuleDisableError extends Error {
+  public constructor(public readonly moduleId: string) {
+    super(`Module "${moduleId}" cannot be disabled: it manages this chat's modules.`);
+    this.name = 'ProtectedModuleDisableError';
+  }
+}
+
 function moduleStateAuditIdempotencyKey(chatId: string, moduleId: string): string {
   const context = getUpdateContext();
   if (!context) throw new MissingModuleAuditIdempotencyKeyError();
@@ -96,6 +111,7 @@ export class ModuleRegistry {
     actorIdOrOptions?: string | SetModuleEnabledOptions,
   ): Promise<void> {
     const module = this.requireModule(moduleId);
+    if (!enabled && module.protectFromDisable) throw new ProtectedModuleDisableError(moduleId);
     const options = typeof actorIdOrOptions === 'string' ? { actorId: actorIdOrOptions } : actorIdOrOptions;
     const actorId = options?.actorId;
     const idempotencyKey = options?.idempotencyKey ?? moduleStateAuditIdempotencyKey(chatId, moduleId);
