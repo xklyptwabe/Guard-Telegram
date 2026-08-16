@@ -17,6 +17,12 @@ HTTP), реальный outbox/inbox на таблицах `moderation.pending_o
 с исправлениями — см. §8). `npm run lint`, `npm run typecheck` и
 `npm run check:locales` — чисто.
 
+Подтверждено в CI (GitLab): pipeline **#25075** на ветке
+`aaxnet/feat/bots-13-integration-e2e-testing` (коммит 9438e72) — **успех,
+103с**, полный набор на штатном контуре `postgres:16-alpine`
+(`.gitlab-ci.yml`); MR → `test`. Два outage-теста, требующие
+`TEST_PG_CONTROL_URL`, в CI корректно пропущены (см. §9).
+
 Контур воспроизводится локально скриптом
 `wip/test-infra-pg/start-pg.mjs` (embedded PostgreSQL 16 + control endpoint
 для сценариев отключения). В CI контур уже настроен
