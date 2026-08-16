@@ -9,7 +9,7 @@ BOTS-7 defined the full audit event registry (`src/lib/audit/definitions.ts`) â€
 | `member.status.changed` | a real `chat_member` update | `src/lib/audit/memberAudit.ts`, via the `membership-audit` module |
 | `bot.membership.changed` | a real `my_chat_member` update | `src/lib/audit/botMembershipAudit.ts`, registered directly in `core/updates.ts` |
 | `moderation.action` | `/ban`, `/unban`, `/restrict`, `/unrestrict`, `/kick` | `src/lib/moderation/moderationService.ts`, via the `moderation` module |
-| `message.edited` | a real `edited_message`/`edited_channel_post` update | `src/lib/audit/messageAudit.ts`, via the `message-audit` module |
+| `message.edited` | a real `edited_message` update only â€” `edited_channel_post` is unsupported (channel posts carry no `from`, so the editor is unknowable without fabricating an actor) | `src/lib/audit/messageAudit.ts`, via the `message-audit` module |
 | `message.deleted` | the bot's own `deleteMessage` call (`/delmsg`) | `src/lib/audit/messageAudit.ts`, called from `ModerationService.deleteMessage` |
 | `chat.settings.changed` | `/setlocale` | `src/lib/chatSettings.ts`, via the `chat-settings` module |
 

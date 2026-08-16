@@ -1,150 +1,15 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { GrammyError } from 'grammy';
 import type { Logger } from '../../src/lib/logger.js';
+import { buildDrizzleOrmMock, FakePendingOperationsDb, fakeLogger } from './testUtils/fakePendingOperationsDb.js';
 
-vi.mock('drizzle-orm', async (importOriginal) => {
-  const actual = await importOriginal<typeof import('drizzle-orm')>();
-  return {
-    ...actual,
-    eq: (col: unknown, val: unknown) => ({ kind: 'eq', col, val }),
-    and: (...conds: unknown[]) => ({ kind: 'and', conds }),
-    or: (...conds: unknown[]) => ({ kind: 'or', conds }),
-    inArray: (col: unknown, vals: unknown[]) => ({ kind: 'inArray', col, vals }),
-    lte: (col: unknown, val: unknown) => ({ kind: 'lte', col, val }),
-    sql: (_strings: TemplateStringsArray, ...values: unknown[]) => ({ kind: 'sqlIncrement', col: values[0] }),
-  };
-});
+vi.mock('drizzle-orm', async (importOriginal) => buildDrizzleOrmMock(await importOriginal<typeof import('drizzle-orm')>()));
 
 const { pendingOperations } = await import('../../src/db/schema/moderation.js');
 const { PendingOperationResolvers, PendingOperationsOutbox } = await import('../../src/lib/moderation/pendingOperationsOutbox.js');
 
-type Row = Record<string, unknown>;
-
-const COLUMN_KEY = new Map<unknown, string>([
-  [pendingOperations.id, 'id'],
-  [pendingOperations.kind, 'kind'],
-  [pendingOperations.chatId, 'chatId'],
-  [pendingOperations.idempotencyKey, 'idempotencyKey'],
-  [pendingOperations.status, 'status'],
-  [pendingOperations.nextAttemptAt, 'nextAttemptAt'],
-  [pendingOperations.attemptCount, 'attemptCount'],
-]);
-
-function keyFor(col: unknown): string {
-  const key = COLUMN_KEY.get(col);
-  if (!key) throw new Error('fake db: unmapped column in test condition');
-  return key;
-}
-
-function evalCond(cond: any, row: Row): boolean {
-  switch (cond.kind) {
-    case 'eq':
-      return row[keyFor(cond.col)] === cond.val;
-    case 'lte': {
-      const value = row[keyFor(cond.col)];
-      return value !== null && value !== undefined && (value as Date) <= cond.val;
-    }
-    case 'inArray':
-      return cond.vals.includes(row[keyFor(cond.col)]);
-    case 'and':
-      return cond.conds.every((c: unknown) => evalCond(c, row));
-    case 'or':
-      return cond.conds.some((c: unknown) => evalCond(c, row));
-    default:
-      throw new Error(`fake db: unknown condition kind ${String(cond.kind)}`);
-  }
-}
-
-function deferredRows(getRows: () => Row[]) {
-  const self = {
-    then(onFulfilled: (rows: Row[]) => unknown, onRejected?: (err: unknown) => unknown) {
-      return Promise.resolve(getRows()).then(onFulfilled, onRejected);
-    },
-    limit(n: number) {
-      return deferredRows(() => getRows().slice(0, n));
-    },
-  };
-  return self;
-}
-
-function deferredMutation(apply: () => Row[]) {
-  return {
-    then(onFulfilled: (value: undefined) => unknown, onRejected?: (err: unknown) => unknown) {
-      return Promise.resolve().then(apply).then(() => undefined).then(onFulfilled, onRejected);
-    },
-    returning() {
-      return Promise.resolve(apply());
-    },
-  };
-}
-
-/** Faithful-enough in-memory fake of the one table PendingOperationsOutbox touches, driven by the actual (mocked) drizzle-orm condition objects it builds — not just canned per-call responses. */
-class FakePendingOperationsDb {
-  public rows: Row[] = [];
-  private nextId = 1;
-
-  public select() {
-    return {
-      from: () => ({
-        where: (cond: unknown) => deferredRows(() => this.rows.filter((row) => evalCond(cond, row))),
-      }),
-    };
-  }
-
-  public insert() {
-    return {
-      values: (values: Row) => ({
-        onConflictDoNothing: (_opts: unknown) => ({
-          returning: () => {
-            const idempotencyKey = values.idempotencyKey as string;
-            if (this.rows.some((row) => row.idempotencyKey === idempotencyKey)) return Promise.resolve([]);
-            const row: Row = {
-              id: `row-${this.nextId++}`,
-              kind: values.kind,
-              chatId: values.chatId,
-              requestPayload: values.requestPayload,
-              metadata: values.metadata ?? {},
-              idempotencyKey,
-              status: values.status ?? 'pending',
-              attemptCount: 0,
-              lastAttemptAt: null,
-              nextAttemptAt: null,
-              result: null,
-              createdAt: new Date(),
-              updatedAt: new Date(),
-            };
-            this.rows.push(row);
-            return Promise.resolve([row]);
-          },
-        }),
-      }),
-    };
-  }
-
-  public update() {
-    return {
-      set: (values: Row) => ({
-        where: (cond: unknown) =>
-          deferredMutation(() => {
-            const matched = this.rows.filter((row) => evalCond(cond, row));
-            for (const row of matched) {
-              for (const [key, value] of Object.entries(values)) {
-                if (value && typeof value === 'object' && (value as { kind?: string }).kind === 'sqlIncrement') {
-                  row[key] = (row[keyFor((value as { col: unknown }).col)] as number) + 1;
-                } else {
-                  row[key] = value;
-                }
-              }
-            }
-            return matched;
-          }),
-      }),
-    };
-  }
-}
-
 function logger(): Logger {
-  return { info: vi.fn(), debug: vi.fn(), warn: vi.fn(), error: vi.fn() } as unknown as Logger;
+  return fakeLogger() as unknown as Logger;
 }
 
 describe('PendingOperationsOutbox', () => {
@@ -152,7 +17,7 @@ describe('PendingOperationsOutbox', () => {
   let resolvers: InstanceType<typeof PendingOperationResolvers>;
 
   beforeEach(() => {
-    db = new FakePendingOperationsDb();
+    db = new FakePendingOperationsDb(pendingOperations);
     resolvers = new PendingOperationResolvers();
   });
 
@@ -257,7 +122,7 @@ describe('PendingOperationsOutbox', () => {
     expect(onFinal.mock.calls[0]?.[1]).toEqual({ status: 'succeeded', result: { ok: true } });
   });
 
-  it('recoverPending() leaves a row alone (and never calls its executor) when no resolver is registered for its kind', async () => {
+  it('recoverPending() with no resolver for a kind: releases the claim with a fresh lease — no tight claim/release loop, self-heals after the lease', async () => {
     db.rows.push({
       id: 'row-orphan',
       kind: 'telegram.someFutureCall',
@@ -269,6 +134,11 @@ describe('PendingOperationsOutbox', () => {
       attemptCount: 0,
       lastAttemptAt: null,
       nextAttemptAt: null,
+      workerId: null,
+      leaseExpiresAt: null,
+      auditStatus: 'pending',
+      auditWorkerId: null,
+      auditLeaseExpiresAt: null,
       result: null,
       createdAt: new Date(),
       updatedAt: new Date(),
@@ -278,8 +148,21 @@ describe('PendingOperationsOutbox', () => {
     const onFinal = vi.fn();
     await outbox.recoverPending(onFinal);
 
-    expect(db.rows[0]?.status).toBe('pending'); // untouched
+    // The claim was made and counted (a genuine attempt to dispatch it
+    // happened), then released with a FUTURE lease — so the same sweep did
+    // not pick it up again (the old null-lease release made this loop
+    // forever: claim → no resolver → release → claim → …).
+    expect(db.rows[0]?.status).toBe('in_progress');
+    expect(db.rows[0]?.attemptCount).toBe(1);
+    expect(db.rows[0]?.workerId).toBeNull();
+    expect((db.rows[0]?.leaseExpiresAt as Date).getTime()).toBeGreaterThan(Date.now());
     expect(onFinal).not.toHaveBeenCalled();
+
+    // Self-healing: once the lease genuinely expires, a later sweep tries
+    // again (e.g. after a deploy that registers the missing resolver).
+    db.rows[0]!.leaseExpiresAt = new Date(Date.now() - 1);
+    await outbox.recoverPending(onFinal);
+    expect(db.rows[0]?.attemptCount).toBe(2);
   });
 
   it('two concurrent calls for the same idempotencyKey never both invoke the executor', async () => {
@@ -305,5 +188,97 @@ describe('PendingOperationsOutbox', () => {
     const [firstResult, secondResult] = await Promise.all([first, second]);
     expect(executor).toHaveBeenCalledTimes(1);
     expect([firstResult.isFinal, secondResult.isFinal].filter(Boolean)).toHaveLength(1);
+  });
+
+  // ---------------------------------------------------------------------
+  // BOTS-9 review HIGH-3: durable audit-finalization
+  // ---------------------------------------------------------------------
+
+  it('a terminal outcome runs onFinal and durably marks audit_status="written"', async () => {
+    const outbox = new PendingOperationsOutbox(db as never, logger(), resolvers);
+    const onFinal = vi.fn(async () => undefined);
+
+    await outbox.execute({ kind: 'telegram.banChatMember', chatId: 'chat-1', idempotencyKey: 'key-a1', requestPayload: {} }, vi.fn(async () => ({ ok: 1 })), onFinal);
+
+    expect(onFinal).toHaveBeenCalledTimes(1);
+    expect(db.rows[0]?.auditStatus).toBe('written');
+  });
+
+  it('HIGH-3: an audit write failure stays owed ("pending") and the worker backfills it WITHOUT re-running the executor', async () => {
+    const outbox = new PendingOperationsOutbox(db as never, logger(), resolvers);
+    const executor = vi.fn(async () => ({ ok: 1 }));
+    const failingFinalizer = vi.fn(async () => {
+      throw new Error('audit db down');
+    });
+
+    await outbox.execute({ kind: 'telegram.banChatMember', chatId: 'chat-1', idempotencyKey: 'key-a2', requestPayload: {} }, executor, failingFinalizer);
+    expect(db.rows[0]?.status).toBe('succeeded');
+    expect(db.rows[0]?.auditStatus).toBe('pending'); // the audit is still owed
+
+    // Later: audit recovered, executor must NOT run again.
+    const recoveredFinalizer = vi.fn(async () => undefined);
+    await outbox.recoverPending(recoveredFinalizer);
+
+    expect(executor).toHaveBeenCalledTimes(1); // the operation itself never re-ran
+    expect(recoveredFinalizer).toHaveBeenCalledTimes(1);
+    expect(db.rows[0]?.auditStatus).toBe('written');
+  });
+
+  it('HIGH-3: a redelivered duplicate (already-terminal row) completes an audit the original call failed to write', async () => {
+    const outbox = new PendingOperationsOutbox(db as never, logger(), resolvers);
+    const executor = vi.fn(async () => ({ ok: 1 }));
+    const failingFinalizer = vi.fn(async () => {
+      throw new Error('audit db down');
+    });
+    const input = { kind: 'telegram.banChatMember', chatId: 'chat-1', idempotencyKey: 'key-a3', requestPayload: {} };
+
+    await outbox.execute(input, executor, failingFinalizer);
+    const second = await outbox.execute(input, executor, vi.fn(async () => undefined));
+
+    expect(executor).toHaveBeenCalledTimes(1); // duplicate never re-executes
+    expect(second.duplicate).toBe(true);
+    expect(db.rows[0]?.auditStatus).toBe('written'); // …but the owed audit got completed
+  });
+
+  // ---------------------------------------------------------------------
+  // BOTS-9 review BLOCKER-2 residual: worker claim eligibility for `unknown`
+  // ---------------------------------------------------------------------
+
+  it('a non-final `unknown` with a future next_attempt_at is NOT re-claimed by the worker before its backoff elapses', async () => {
+    const outbox = new PendingOperationsOutbox(db as never, logger(), resolvers);
+    const executor = vi.fn(async () => {
+      throw new Error('socket hang up');
+    });
+    await outbox.execute({ kind: 'telegram.banChatMember', chatId: 'chat-1', idempotencyKey: 'key-b1', requestPayload: {} }, executor);
+    expect(db.rows[0]?.status).toBe('unknown');
+    expect(db.rows[0]?.nextAttemptAt).not.toBeNull();
+
+    // Worker ticks immediately — nothing is due yet.
+    await outbox.recoverPending();
+    expect(executor).toHaveBeenCalledTimes(1);
+    expect(db.rows[0]?.attemptCount).toBe(1);
+
+    // Backoff elapsed — the retry is due and runs without a restart.
+    db.rows[0]!.nextAttemptAt = new Date(Date.now() - 1);
+    resolvers.register('telegram.banChatMember', vi.fn(async () => ({ ok: 1 })));
+    await outbox.recoverPending();
+    expect(db.rows[0]?.attemptCount).toBe(2); // second attempt happened
+  });
+
+  it('an EXHAUSTED unknown (no next attempt scheduled) is never blindly re-executed by the worker', async () => {
+    const outbox = new PendingOperationsOutbox(db as never, logger(), resolvers, 1, 10); // maxAttempts=1
+    const executor = vi.fn(async () => {
+      throw new Error('socket hang up');
+    });
+    await outbox.execute({ kind: 'telegram.banChatMember', chatId: 'chat-1', idempotencyKey: 'key-b2', requestPayload: {} }, executor, vi.fn(async () => undefined));
+    expect(db.rows[0]?.status).toBe('unknown');
+    expect(db.rows[0]?.nextAttemptAt).toBeNull(); // exhausted
+
+    // Any number of worker sweeps must not re-run a possibly-already-applied
+    // side effect without reconciliation (review BLOCKER-2).
+    await outbox.recoverPending(vi.fn(async () => undefined));
+    await outbox.recoverPending(vi.fn(async () => undefined));
+    expect(executor).toHaveBeenCalledTimes(1);
+    expect(db.rows[0]?.attemptCount).toBe(1);
   });
 });

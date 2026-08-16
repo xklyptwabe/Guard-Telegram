@@ -52,7 +52,7 @@ describe('recordMemberStatusChanged', () => {
     const call = calls[0] as { input: { eventType: string; subjectId: string; idempotencyKey: string }; result: { before?: Record<string, unknown>; after?: Record<string, unknown>; metadata?: Record<string, unknown> } };
     expect(call.input.eventType).toBe('member.status.changed');
     expect(call.input.subjectId).toBe('-1001111111111:222222');
-    expect(call.input.idempotencyKey).toBe('member.status.changed:telegram-update:100003:-1001111111111:222222');
+    expect(call.input.idempotencyKey).toBe('member.status.changed:telegram-update:unscoped-bot:100003:-1001111111111:222222');
     expect(call.result.before).toMatchObject({ status: 'member' });
     expect(call.result.after).toMatchObject({ status: 'administrator' });
     expect(call.result.metadata).toMatchObject({ operation: 'update' });

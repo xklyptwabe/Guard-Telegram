@@ -98,4 +98,24 @@ describe('recordIntegrationAction', () => {
 
     expect(logger.warn).toHaveBeenCalledWith(expect.objectContaining({ event: 'audit.integration_action.failed' }));
   });
+
+  it('BOTS-9 review HIGH-7: without chatId, tenantId is the platform-wide sentinel — unchanged, current behavior for every existing caller', async () => {
+    const { audit, calls } = fakeAuditService();
+    const logger = fakeLogger();
+
+    await recordIntegrationAction(audit, logger, { integrationId: 's3', action: 'put', targetType: 'object', targetId: 'k', success: true });
+
+    const call = calls[0] as { input: { tenantId: string } };
+    expect(call.input.tenantId).toBe('__platform__');
+  });
+
+  it('BOTS-9 review HIGH-7: a caller that DOES have chat context gets tenantId = that chat, enabling chat-scoped policy resolution instead of only the platform-wide one', async () => {
+    const { audit, calls } = fakeAuditService();
+    const logger = fakeLogger();
+
+    await recordIntegrationAction(audit, logger, { integrationId: 's3', action: 'put', targetType: 'object', targetId: 'k', success: true, chatId: '-100555' });
+
+    const call = calls[0] as { input: { tenantId: string } };
+    expect(call.input.tenantId).toBe('-100555');
+  });
 });

@@ -6,11 +6,47 @@ import type { Logger } from '../logger.js';
 import { normalizeError } from '../logger.js';
 import { AuditEventProcessor } from './eventProcessor.js';
 import { readCurrentSnapshotData } from './entitySnapshotLookup.js';
-import { botMembershipChangedSchema } from './shapes.js';
+import { botAdministratorRightsSchema, botMembershipChangedSchema, type BotAdministratorRights } from './shapes.js';
 import { observed, notObserved } from './snapshot.js';
 import { toDownstreamMutationResult } from './serviceAdapter.js';
 
 const auditProcessor = new AuditEventProcessor();
+
+/** Only the fields Telegram's `ChatMemberAdministrator` carries that this schema tracks — see `botAdministratorRightsSchema`'s doc comment for why the rest (custom_title, channel-only fields) are excluded. */
+interface RawChatMember {
+  readonly status?: string;
+  readonly can_manage_chat?: boolean;
+  readonly can_delete_messages?: boolean;
+  readonly can_manage_video_chats?: boolean;
+  readonly can_restrict_members?: boolean;
+  readonly can_promote_members?: boolean;
+  readonly can_change_info?: boolean;
+  readonly can_invite_users?: boolean;
+  readonly can_pin_messages?: boolean;
+  readonly can_manage_topics?: boolean;
+}
+
+/** BOTS-9 review fix (HIGH-2): extracts the bot's own admin rights when it holds them — undefined for any non-administrator status, matching the schema's `rights` field being optional. */
+function extractRights(member: RawChatMember | undefined): BotAdministratorRights | undefined {
+  if (!member || member.status !== 'administrator') return undefined;
+  const parsed = botAdministratorRightsSchema.safeParse({
+    canManageChat: member.can_manage_chat,
+    canDeleteMessages: member.can_delete_messages,
+    canManageVideoChats: member.can_manage_video_chats,
+    canRestrictMembers: member.can_restrict_members,
+    canPromoteMembers: member.can_promote_members,
+    canChangeInfo: member.can_change_info,
+    canInviteUsers: member.can_invite_users,
+    ...(member.can_pin_messages !== undefined ? { canPinMessages: member.can_pin_messages } : {}),
+    ...(member.can_manage_topics !== undefined ? { canManageTopics: member.can_manage_topics } : {}),
+  });
+  return parsed.success ? parsed.data : undefined;
+}
+
+/** Deliberately not a generic deep-equal: `BotAdministratorRights` is always built by `extractRights` above with the same fixed key set/order, so a stringify comparison is exact and cheap here — this is not meant to generalize beyond this one shape. */
+function rightsEqual(a: BotAdministratorRights | undefined, b: BotAdministratorRights | undefined): boolean {
+  return JSON.stringify(a ?? null) === JSON.stringify(b ?? null);
+}
 
 /**
  * BOTS-9: audits Telegram's `my_chat_member` update — the bot's *own*
@@ -21,6 +57,13 @@ const auditProcessor = new AuditEventProcessor();
  * `definitions.ts`) precisely because whether the bot itself can still act
  * in a chat is not an optional feature any chat admin should be able to
  * silence by disabling a module.
+ *
+ * Tracks admin *rights*, not just `status` (BOTS-9 review HIGH-2): a chat
+ * owner revoking `can_restrict_members` from an already-administrator bot
+ * — silently disabling its ability to moderate — previously produced an
+ * identical before/after (`status: 'administrator'` both times) and was
+ * recorded as a no-op. That is exactly the kind of safety-critical change
+ * this event exists to catch.
  */
 export async function recordBotMembershipChanged(audit: AuditService, logger: Logger, ctx: Context): Promise<void> {
   const update = ctx.myChatMember;
@@ -44,9 +87,11 @@ export async function recordBotMembershipChanged(audit: AuditService, logger: Lo
   }
 
   const oldStatusParsed = botMembershipChangedSchema.shape.status.safeParse(update.old_chat_member?.status);
+  const newRights = extractRights(update.new_chat_member);
+  const oldRights = extractRights(update.old_chat_member);
   const actorId = update.from ? String(update.from.id) : undefined;
   const observedAt = new Date(update.date * 1000).toISOString();
-  const idempotencyKey = `bot.membership.changed:telegram-update:${updateContext.updateId}:${chatId}`;
+  const idempotencyKey = `bot.membership.changed:telegram-update:${updateContext.botId ?? 'unscoped-bot'}:${updateContext.updateId}:${chatId}`;
   const subjectType = 'bot_membership';
   const subjectId = chatId;
 
@@ -64,12 +109,15 @@ export async function recordBotMembershipChanged(audit: AuditService, logger: Lo
         ...(actorId !== undefined ? { actorId, actorType: 'telegram_user' } : {}),
       },
       async (tx) => {
-        const current = (await readCurrentSnapshotData(tx, chatId, subjectType, subjectId)) as { status?: string; observedAt?: string } | undefined;
+        const current = (await readCurrentSnapshotData(tx, chatId, subjectType, subjectId)) as { status?: string; rights?: BotAdministratorRights; observedAt?: string } | undefined;
         const isStale = current?.observedAt !== undefined && current.observedAt > observedAt;
 
         const afterStatus = isStale && current?.status !== undefined ? current.status : newStatusParsed.data;
+        const afterRights = isStale ? current?.rights : newRights;
         const effectiveObservedAt = isStale && current?.observedAt !== undefined ? current.observedAt : observedAt;
-        const operation = isStale ? 'noop' : oldStatusParsed.success && oldStatusParsed.data === afterStatus ? 'noop' : 'update';
+        const statusChanged = oldStatusParsed.success ? oldStatusParsed.data !== afterStatus : true;
+        const rightsChanged = !rightsEqual(oldRights, afterRights);
+        const operation = isStale ? 'noop' : statusChanged || rightsChanged ? 'update' : 'noop';
 
         const record = auditProcessor.process({
           name: 'bot.membership.changed',
@@ -77,8 +125,8 @@ export async function recordBotMembershipChanged(audit: AuditService, logger: Lo
           operation,
           chatId,
           ...(actorId !== undefined ? { actorId } : {}),
-          before: oldStatusParsed.success ? observed({ chatId, status: oldStatusParsed.data }) : notObserved(),
-          after: observed({ chatId, status: afterStatus }),
+          before: oldStatusParsed.success ? observed({ chatId, status: oldStatusParsed.data, ...(oldRights ? { rights: oldRights } : {}) }) : notObserved(),
+          after: observed({ chatId, status: afterStatus, ...(afterRights ? { rights: afterRights } : {}) }),
         });
         const mutationResult = toDownstreamMutationResult(record);
 

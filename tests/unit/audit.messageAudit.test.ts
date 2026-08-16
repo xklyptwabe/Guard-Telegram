@@ -64,6 +64,36 @@ describe('recordMessageEdited', () => {
     expect(calls).toHaveLength(0);
     expect(testLogger.warn).toHaveBeenCalledWith(expect.objectContaining({ event: 'audit.message_edited.no_author' }));
   });
+
+  it('BOTS-9 review HIGH-1: an OLDER edit arriving after a newer one is audited as a noop and never regresses the current snapshot', async () => {
+    // Current snapshot already reflects a 2033 edit; the incoming update is
+    // an older 2001 edit with a DIFFERENT update_id (so the idempotency key
+    // does not catch it) — exactly the review's runtime reproduction.
+    const { audit, calls } = fakeAuditService([
+      { snapshotData: { chatId: '-100', messageId: '503', userId: '111111', editedAt: '2033-01-01T00:00:00.000Z', textLength: 12, text: 'newer version' } },
+    ]);
+    const ctx = { editedMessage: { message_id: 503, chat: { id: -100 }, from: { id: 111111 }, edit_date: new Date('2001-01-01T00:00:00Z').getTime() / 1000, text: 'stale older version' } } as never;
+
+    await runWithUpdateContext({ updateId: '777', chatId: '-100', botId: '42' }, () => recordMessageEdited(audit, logger(), ctx));
+
+    expect(calls).toHaveLength(1);
+    const call = calls[0] as { result: { after?: Record<string, unknown>; snapshotData?: Record<string, unknown>; metadata?: Record<string, unknown> } };
+    expect(call.result.metadata).toMatchObject({ operation: 'noop', outOfOrder: true });
+    // The snapshot keeps the NEWER data — the stale edit did not regress it.
+    expect(call.result.snapshotData).toMatchObject({ editedAt: '2033-01-01T00:00:00.000Z', text: 'newer version' });
+    expect(call.result.after).toMatchObject({ editedAt: '2033-01-01T00:00:00.000Z' });
+  });
+
+  it('BOTS-9 review HIGH-1: a genuinely newer edit still updates the snapshot normally', async () => {
+    const { audit, calls } = fakeAuditService([{ snapshotData: { chatId: '-100', messageId: '503', userId: '111111', editedAt: '2001-01-01T00:00:00.000Z', textLength: 5 } }]);
+    const ctx = { editedMessage: { message_id: 503, chat: { id: -100 }, from: { id: 111111 }, edit_date: new Date('2026-05-05T00:00:00Z').getTime() / 1000, text: 'fresh' } } as never;
+
+    await runWithUpdateContext({ updateId: '778', chatId: '-100', botId: '42' }, () => recordMessageEdited(audit, logger(), ctx));
+
+    const call = calls[0] as { result: { snapshotData?: Record<string, unknown>; metadata?: Record<string, unknown> } };
+    expect(call.result.metadata).toMatchObject({ operation: 'update' });
+    expect(call.result.snapshotData).toMatchObject({ editedAt: '2026-05-05T00:00:00.000Z', textLength: 5 });
+  });
 });
 
 describe('recordMessageDeleted', () => {
