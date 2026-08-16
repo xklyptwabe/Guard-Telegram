@@ -10,6 +10,13 @@ export function collectCommands(modules: readonly TelegramBotModule[]): readonly
   return modules.flatMap((module) => module.commands ?? []);
 }
 
+/**
+ * BOTS-9 review finding (HIGH-5) — documented exclusion: `setMyCommands`
+ * is deliberately NOT routed through the write-ahead outbox. It runs once
+ * per bootstrap, is idempotent (same args → same menu), and bootstrap
+ * itself retries it on every restart — retry-by-restart is the recovery
+ * mechanism here, and a DB roundtrip per call would buy nothing.
+ */
 export async function registerCommands(
   bot: Bot<Context>,
   modules: readonly TelegramBotModule[],

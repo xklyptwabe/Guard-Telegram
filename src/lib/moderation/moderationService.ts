@@ -1,0 +1,339 @@
+import type { Bot, Context } from 'grammy';
+import type { ChatPermissions } from '@grammyjs/types';
+
+import { getUpdateContext } from '../context.js';
+import type { Logger } from '../logger.js';
+import { normalizeError } from '../logger.js';
+import type { AuditService } from '../auditService.js';
+import { AuditEventProcessor } from '../audit/eventProcessor.js';
+import { safeDownstreamMutationResult } from '../audit/mutationResult.js';
+import { observed, notApplicable } from '../audit/snapshot.js';
+import { recordMessageDeleted } from '../audit/messageAudit.js';
+import { type AttemptOutcome, type PendingOperationRow, type PendingOperationResolvers, type PendingOperationsOutbox } from './pendingOperationsOutbox.js';
+
+export type ModerationAction = 'ban' | 'kick' | 'mute' | 'unban' | 'unmute';
+
+export interface ModerationActionInput {
+  readonly chatId: string;
+  readonly targetUserId: string;
+  readonly actorUserId: string;
+  readonly reason?: string;
+}
+
+export interface RestrictActionInput extends ModerationActionInput {
+  readonly durationSeconds: number;
+}
+
+/** What a caller (a command handler) needs to tell the admin what happened. */
+export interface ModerationOutcome {
+  readonly status: 'succeeded' | 'failed' | 'unknown';
+  readonly willRetry: boolean;
+  readonly detail?: Record<string, unknown>;
+}
+
+const MUTED_PERMISSIONS: ChatPermissions = {
+  can_send_messages: false,
+  can_send_audios: false,
+  can_send_documents: false,
+  can_send_photos: false,
+  can_send_videos: false,
+  can_send_video_notes: false,
+  can_send_voice_notes: false,
+  can_send_polls: false,
+  can_send_other_messages: false,
+  can_add_web_page_previews: false,
+};
+
+const UNMUTED_PERMISSIONS: ChatPermissions = {
+  can_send_messages: true,
+  can_send_audios: true,
+  can_send_documents: true,
+  can_send_photos: true,
+  can_send_videos: true,
+  can_send_video_notes: true,
+  can_send_voice_notes: true,
+  can_send_polls: true,
+  can_send_other_messages: true,
+  can_add_web_page_previews: true,
+};
+
+/**
+ * BOTS-9: connects ban/unban/restrict(mute)/unrestrict(unmute)/kick to
+ * real Telegram Bot API calls, each made reliable through
+ * `PendingOperationsOutbox` (write-ahead, retry, restart recovery,
+ * confirmed-failure-vs-timeout), and each producing exactly one
+ * `moderation.action` audit record once — and only once — the outcome is
+ * final. See `pendingOperationsOutbox.ts`'s "ONE FINAL RECORD" note.
+ *
+ * Every call into the outbox carries `metadata` (actor/target/action/
+ * reason) alongside the Telegram-bound `requestPayload`. That's what lets
+ * `recoverPending()` write a *correct* audit record for an operation that
+ * only resolves after a restart, when there is no live Update or actor on
+ * the call stack to ask — only what was durably written ahead.
+ */
+export class ModerationService {
+  private readonly auditProcessor = new AuditEventProcessor();
+
+  public constructor(
+    private readonly bot: Bot<Context>,
+    private readonly audit: AuditService,
+    private readonly outbox: PendingOperationsOutbox,
+    private readonly resolvers: PendingOperationResolvers,
+    private readonly logger: Logger,
+  ) {
+    this.registerResolvers();
+  }
+
+  public async ban(input: ModerationActionInput): Promise<ModerationOutcome> {
+    return this.performAndAudit('ban', input, 'telegram.banChatMember', { chat_id: Number(input.chatId), user_id: Number(input.targetUserId) });
+  }
+
+  public async unban(input: ModerationActionInput): Promise<ModerationOutcome> {
+    return this.performAndAudit('unban', input, 'telegram.unbanChatMember', { chat_id: Number(input.chatId), user_id: Number(input.targetUserId), only_if_banned: true });
+  }
+
+  public async restrict(input: RestrictActionInput): Promise<ModerationOutcome> {
+    const untilDate = Math.floor(Date.now() / 1000) + input.durationSeconds;
+    return this.performAndAudit('mute', input, 'telegram.restrictChatMember.mute', {
+      chat_id: Number(input.chatId),
+      user_id: Number(input.targetUserId),
+      permissions: MUTED_PERMISSIONS,
+      until_date: untilDate,
+    });
+  }
+
+  public async unrestrict(input: ModerationActionInput): Promise<ModerationOutcome> {
+    return this.performAndAudit('unmute', input, 'telegram.restrictChatMember.unmute', {
+      chat_id: Number(input.chatId),
+      user_id: Number(input.targetUserId),
+      permissions: UNMUTED_PERMISSIONS,
+    });
+  }
+
+  /**
+   * Telegram has no atomic "kick" primitive — the Bot API idiom is
+   * ban-then-immediately-unban. This is modeled as a **single** outbox
+   * operation whose executor performs both calls, rather than two separate
+   * `pending_operations` rows. That's deliberate: with two rows, a crash
+   * between "ban succeeded" and "the unban row gets written" left nothing
+   * on disk saying an unban was still owed — the target would stay banned
+   * forever with no way for `recoverPending()` to know to finish the job.
+   * With one row, a crash anywhere in the executor just leaves it
+   * `in_progress`/`unknown`; recovery re-invokes the *whole* executor, and
+   * both Telegram calls are naturally idempotent (banning an
+   * already-banned user, or unbanning with `only_if_banned`, are no-ops),
+   * so replaying the pair from the top is always safe.
+   *
+   * The one case this does *not* paper over: a **confirmed** rejection
+   * (`GrammyError`) on the unban half after the ban half already
+   * succeeded. That is terminal by design (see
+   * `pendingOperationsOutbox.ts` — a confirmed failure is never retried),
+   * so it can leave the target banned rather than kicked. That's inherent
+   * to Telegram's own two-call idiom, not a gap in this recovery — an
+   * operator needs to look at it, same as any other confirmed failure.
+   */
+  public async kick(input: ModerationActionInput): Promise<ModerationOutcome> {
+    return this.performAndAudit('kick', input, 'telegram.kick', { chat_id: Number(input.chatId), user_id: Number(input.targetUserId) });
+  }
+
+  public async deleteMessage(chatId: string, messageId: string, actorUserId: string, knownAuthorUserId?: string): Promise<ModerationOutcome> {
+    const context = getUpdateContext();
+    const idempotencyKey = context
+      ? `moderation.delete:telegram-update:${context.botId ?? 'unscoped-bot'}:${context.updateId}:${chatId}:${messageId}`
+      : `moderation.delete:${chatId}:${messageId}:${Date.now()}`;
+    const kind = 'telegram.deleteMessage';
+    const result = await this.outbox.execute(
+      {
+        kind,
+        chatId,
+        idempotencyKey,
+        requestPayload: { chat_id: Number(chatId), message_id: Number(messageId) },
+        metadata: { deletedBy: actorUserId, ...(knownAuthorUserId !== undefined ? { knownAuthorUserId } : {}) },
+      },
+      this.resolvers.get(kind)!,
+      // HIGH-3: the outbox owns audit-finalization durability — on success it
+      // marks audit_status='written'; a throw here leaves the audit owed and
+      // the worker backfills it later without re-invoking the executor.
+      async (row, outcome) => this.auditRecoveredOperation(row, outcome),
+    );
+    return result.isFinal ? this.toOutcome(result.outcome) : { status: 'unknown', willRetry: true };
+  }
+
+  /**
+   * Resumes anything left `pending`/`in_progress` (interrupted by a crash)
+   * or `unknown`-with-retries-remaining from before this process started —
+   * a single synchronous sweep. Reconstructs and writes the audit record
+   * for anything that resolves here — the *only* place a recovered
+   * operation's audit trail gets completed for a genuinely finished
+   * process, since the original command's request/response cycle is long
+   * gone. Kept as a direct method (rather than folded only into
+   * `startWorker`) for tests and for the very first pass at boot.
+   */
+  public async recoverPending(): Promise<void> {
+    await this.outbox.recoverPending(async (row, outcome) => {
+      await this.auditRecoveredOperation(row, outcome);
+    });
+  }
+
+  /**
+   * BOTS-9 review fix (BLOCKER-2): starts the outbox's persistent polling
+   * worker so retries happen throughout the process's uptime, not only
+   * once at bootstrap. Call once at startup, after `bot.init()` — the
+   * first poll tick performs the same initial sweep `recoverPending()`
+   * used to do alone, then continues polling on an interval for as long
+   * as the process runs. Call `stopWorker()` during graceful shutdown.
+   */
+  public startWorker(): void {
+    this.outbox.startWorker(async (row, outcome) => {
+      await this.auditRecoveredOperation(row, outcome);
+    });
+  }
+
+  public stopWorker(): void {
+    this.outbox.stopWorker();
+  }
+
+  private registerResolvers(): void {
+    this.resolvers.register('telegram.banChatMember', async (payload) => {
+      await this.bot.api.raw.banChatMember({ chat_id: payload.chat_id as number, user_id: payload.user_id as number });
+    });
+    this.resolvers.register('telegram.unbanChatMember', async (payload) => {
+      await this.bot.api.raw.unbanChatMember({ chat_id: payload.chat_id as number, user_id: payload.user_id as number, only_if_banned: true });
+    });
+    this.resolvers.register('telegram.kick', async (payload) => {
+      // Both calls are individually idempotent — safe to replay this whole
+      // executor from the top on recovery, whichever half it died on.
+      await this.bot.api.raw.banChatMember({ chat_id: payload.chat_id as number, user_id: payload.user_id as number });
+      try {
+        await this.bot.api.raw.unbanChatMember({ chat_id: payload.chat_id as number, user_id: payload.user_id as number, only_if_banned: true });
+      } catch (error) {
+        // BOTS-9 review finding (HIGH-8): the ban half already landed —
+        // tag the error so the outbox/audit layer can record that the
+        // target is left banned, not kicked, rather than an outcome
+        // indistinguishable from "kick simply failed, target unaffected".
+        // Attached to the SAME error object (not wrapped) so `instanceof
+        // GrammyError` still holds for the confirmed-vs-unknown check.
+        if (error && typeof error === 'object') (error as Record<string, unknown>).partialOutcome = 'banned_not_kicked';
+        throw error;
+      }
+    });
+    this.resolvers.register('telegram.restrictChatMember.mute', async (payload) => {
+      await this.bot.api.raw.restrictChatMember({
+        chat_id: payload.chat_id as number,
+        user_id: payload.user_id as number,
+        permissions: payload.permissions as ChatPermissions,
+        until_date: payload.until_date as number,
+      });
+    });
+    this.resolvers.register('telegram.restrictChatMember.unmute', async (payload) => {
+      await this.bot.api.raw.restrictChatMember({ chat_id: payload.chat_id as number, user_id: payload.user_id as number, permissions: payload.permissions as ChatPermissions });
+    });
+    this.resolvers.register('telegram.deleteMessage', async (payload) => {
+      await this.bot.api.raw.deleteMessage({ chat_id: payload.chat_id as number, message_id: payload.message_id as number });
+    });
+  }
+
+  private async dispatch(action: ModerationAction, input: ModerationActionInput, kind: string, requestPayload: Record<string, unknown>) {
+    const context = getUpdateContext();
+    const idempotencyKey = context
+      ? `moderation.action:telegram-update:${context.botId ?? 'unscoped-bot'}:${context.updateId}:${input.chatId}:${input.targetUserId}:${action}`
+      : `moderation.action:${input.chatId}:${input.targetUserId}:${action}:${Date.now()}`;
+    const metadata: Record<string, unknown> = { action, actorUserId: input.actorUserId, targetUserId: input.targetUserId, ...(input.reason !== undefined ? { reason: input.reason } : {}) };
+    return this.outbox.execute(
+      { kind, chatId: input.chatId, idempotencyKey, requestPayload, metadata },
+      this.resolvers.get(kind)!,
+      // HIGH-3: audit-finalization is the outbox's durable responsibility —
+      // see deleteMessage's note. auditRecoveredOperation dispatches on
+      // row.kind, so this same callback serves both recovery and live calls.
+      async (row, outcome) => this.auditRecoveredOperation(row, outcome),
+    );
+  }
+
+  private async performAndAudit(action: ModerationAction, input: ModerationActionInput, kind: string, requestPayload: Record<string, unknown>): Promise<ModerationOutcome> {
+    const result = await this.dispatch(action, input, kind, requestPayload);
+    return result.isFinal ? this.toOutcome(result.outcome) : { status: 'unknown', willRetry: true };
+  }
+
+  private toOutcome(outcome: AttemptOutcome): ModerationOutcome {
+    return { status: outcome.status, willRetry: false, ...(outcome.result !== undefined ? { detail: outcome.result } : {}) };
+  }
+
+  /** A row resolving during `recoverPending()` has no live command/actor on the call stack — everything needed comes from what was written ahead in `row.metadata` and `row.chatId`. `telegram.deleteMessage` and the moderation-action kinds need different audit events, so this dispatches on `row.kind`. Public so the shared outbox finalizer router (see core wiring / the integration gateway) can delegate `telegram.*` kinds here. */
+  public async auditRecoveredOperation(row: PendingOperationRow, outcome: AttemptOutcome): Promise<void> {
+    if (row.kind === 'telegram.deleteMessage') {
+      const messageId = String(row.requestPayload.message_id);
+      const deletedBy = typeof row.metadata.deletedBy === 'string' ? row.metadata.deletedBy : undefined;
+      const knownAuthorUserId = typeof row.metadata.knownAuthorUserId === 'string' ? row.metadata.knownAuthorUserId : undefined;
+      await recordMessageDeleted(this.audit, this.logger, {
+        chatId: row.chatId,
+        messageId,
+        idempotencyKey: `${row.idempotencyKey}:audit`,
+        outcome: outcome.status,
+        ...(deletedBy !== undefined ? { deletedBy } : {}),
+        ...(knownAuthorUserId !== undefined ? { knownAuthorUserId } : {}),
+      });
+      return;
+    }
+
+    const action = typeof row.metadata.action === 'string' ? (row.metadata.action as ModerationAction) : undefined;
+    const targetUserId = typeof row.metadata.targetUserId === 'string' ? row.metadata.targetUserId : undefined;
+    const actorUserId = typeof row.metadata.actorUserId === 'string' ? row.metadata.actorUserId : undefined;
+    if (!action || !targetUserId || !actorUserId) {
+      this.logger.warn({ event: 'audit.moderation_action.recovered_without_metadata', chatId: row.chatId, details: { kind: row.kind, id: row.id } });
+      return;
+    }
+    const reason = typeof row.metadata.reason === 'string' ? row.metadata.reason : undefined;
+    await this.recordModerationAction(action, { chatId: row.chatId, targetUserId, actorUserId, ...(reason !== undefined ? { reason } : {}) }, row.idempotencyKey, outcome);
+  }
+
+  /** Writes the one-and-only `moderation.action` audit record for this operation. `outcome.status` maps directly onto BOTS-7's `AuditOperation`: a confirmed Telegram-side error is `'failed'`, an unresolved timeout is `'unknown'` — both first-class, not shoehorned into `'update'`. `pendingOperationIdempotencyKey` is the stable key already on the `pending_operations` row — reused (with an `:audit` suffix) rather than re-derived, so this works identically whether called from a live command or from `recoverPending()`. */
+  private async recordModerationAction(action: ModerationAction, input: ModerationActionInput, pendingOperationIdempotencyKey: string, outcome: AttemptOutcome): Promise<void> {
+    const idempotencyKey = `${pendingOperationIdempotencyKey}:audit`;
+    const subjectType = 'chat_member_moderation';
+    const subjectId = `${input.chatId}:${input.targetUserId}`;
+    const operation = outcome.status === 'succeeded' ? 'create' : outcome.status;
+
+    try {
+      await this.audit.recordEntityChange(
+        {
+          tenantId: input.chatId,
+          subjectType,
+          subjectId,
+          eventType: 'moderation.action',
+          eventVersion: 'v1',
+          category: 'moderation',
+          source: 'telegram.moderation_command',
+          idempotencyKey,
+          actorId: input.actorUserId,
+          actorType: 'telegram_user',
+        },
+        () => {
+          const outcomeResult = outcome.result;
+          const partialOutcome = outcomeResult?.partialOutcome === 'banned_not_kicked' ? 'banned_not_kicked' : undefined;
+          const record = this.auditProcessor.process({
+            name: 'moderation.action',
+            version: 1,
+            operation,
+            chatId: input.chatId,
+            actorId: input.actorUserId,
+            before: notApplicable(),
+            after:
+              outcome.status === 'succeeded'
+                ? observed({ chatId: input.chatId, targetUserId: input.targetUserId, actorUserId: input.actorUserId, action, ...(input.reason !== undefined ? { reason: input.reason } : {}) })
+                : partialOutcome !== undefined
+                  ? // HIGH-8: a confirmed-failed kick whose ban half already
+                    // landed is NOT the same as "nothing happened" — surface
+                    // that directly in `after`, not just buried in
+                    // metadata.result where it's easy to miss.
+                    observed({ chatId: input.chatId, targetUserId: input.targetUserId, actorUserId: input.actorUserId, action, partialOutcome })
+                  : notApplicable(),
+          });
+          const mutationResult = safeDownstreamMutationResult(record, { chatId: input.chatId, targetUserId: input.targetUserId, actorUserId: input.actorUserId, action });
+          return Promise.resolve({ ...mutationResult, metadata: { operation, ...(outcome.result !== undefined ? { result: outcome.result } : {}) } });
+        },
+      );
+    } catch (error) {
+      this.logger.warn({ event: 'audit.moderation_action.failed', chatId: input.chatId, details: { action }, error: normalizeError(error) });
+    }
+  }
+}

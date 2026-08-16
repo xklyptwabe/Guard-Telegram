@@ -18,7 +18,7 @@ describe.skipIf(!testDatabaseUrl)('Audit transaction integration', () => {
       TELEGRAM_BOT_TOKEN: 'test-token',
       DATABASE_URL: testDatabaseUrl,
       NODE_ENV: 'test',
-      DATABASE_TLS_REJECT_UNAUTHORIZED: 'true',
+      DATABASE_TLS_REJECT_UNAUTHORIZED: process.env.TEST_DATABASE_TLS_REJECT_UNAUTHORIZED ?? 'true',
     });
     database = createDatabase(config);
     await migrate(database.db, { migrationsFolder: 'src/db/migrations' });

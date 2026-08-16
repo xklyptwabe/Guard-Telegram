@@ -302,6 +302,16 @@ function subjectMappingFor(record: AuditRecord): SubjectMapping {
 export function tenantIdFor(record: AuditRecord): string {
   const eventName = record.eventName as AuditEventName;
   if (isChatScopedEvent(eventName)) return chatIdFor(record);
+  if (eventName === 'integration.action') {
+    // BOTS-9 review finding (HIGH-7): optionally chat-scoped, not
+    // mandatorily — unlike isChatScopedEvent's list (which throws when a
+    // chatId is missing), most integration.action calls today
+    // (storage.put, rabbitmq publish) have no chat context at all and
+    // that must keep working exactly as before. A future chat-scoped
+    // caller can still opt in by passing chatId to raiseAuditEvent().
+    if (record.chatId !== undefined && record.chatId.length > 0) return record.chatId;
+    return PLATFORM_TENANT_SENTINEL;
+  }
   if (record.eventName === 'audit.policy.changed') {
     const scope = readObservedField(record, 'scope');
     if (typeof scope === 'string' && scope.length > 0 && scope !== 'global') return scope;

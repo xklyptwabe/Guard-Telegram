@@ -42,6 +42,41 @@ const FORBIDDEN_KEY_PATTERN =
   /(^|_)(password|passwd|secret|token|api_?key|auth(orization)?|headers?|connection_?string|conn_?str|dsn|webhook_?secret|raw_?update|callback_?(data|query)|file_?(id|path|url)|cookie)(_|$)/;
 
 /**
+ * BOTS-9 review finding (BLOCKER-4): key-based stripping alone misses
+ * secrets that show up inside the *value* of an otherwise-legitimate
+ * field — a moderation `reason` is free text an admin typed and is
+ * correctly allowlisted (that's the whole point of the field), but
+ * nothing stops someone from pasting a token into it. Likewise an
+ * unstructured `Error.message` (e.g. from a network/timeout failure in
+ * `pendingOperationsOutbox.ts`) has no key to match at all. These patterns
+ * are deliberately narrow, high-confidence shapes — not a general secret
+ * detector — to keep false positives on ordinary admin-written text rare.
+ */
+const SECRET_LIKE_VALUE_PATTERNS: readonly RegExp[] = [
+  // scheme://user:password@host — credentials embedded in a URL or DSN
+  // (Postgres, AMQP, MongoDB, etc.), the exact shape a raw connection
+  // error's message can leak.
+  /\b[a-z][a-z0-9+.-]*:\/\/[^\s:@/]+:[^\s@/]+@\S*/gi,
+  // "Bearer <token>" / "Authorization: <token>"-style credentials that
+  // ended up in free text rather than a header field.
+  /\b(?:Bearer|Token|ApiKey|Api-Key)\s+[A-Za-z0-9\-_.]{12,}/gi,
+  // JWT-shaped three-part base64url strings.
+  /\beyJ[A-Za-z0-9_-]{5,}\.[A-Za-z0-9_-]{5,}\.[A-Za-z0-9_-]{5,}\b/g,
+  // Common vendor-specific API key prefixes (OpenAI-style sk-/pk-, GitHub
+  // ghp_, Slack xox*, AWS AKIA...).
+  /\b(?:sk|pk)-[A-Za-z0-9]{16,}\b/gi,
+  /\bghp_[A-Za-z0-9]{20,}\b/g,
+  /\bxox[baprs]-[A-Za-z0-9-]{10,}\b/gi,
+  /\bAKIA[0-9A-Z]{16}\b/g,
+];
+
+function redactSecretLikeSubstrings(value: string): string {
+  let result = value;
+  for (const pattern of SECRET_LIKE_VALUE_PATTERNS) result = result.replace(pattern, '[redacted]');
+  return result;
+}
+
+/**
  * Normalizes camelCase, snake_case and kebab-case alike to `snake_case`
  * before matching. Field names in this codebase are camelCase
  * (`webhookSecret`, `connectionString`, `rawUpdate`, ...), so matching only
@@ -75,6 +110,9 @@ export function stripForbidden<T>(value: T): T {
       result[key] = stripForbidden(nested);
     }
     return result as unknown as T;
+  }
+  if (typeof value === 'string') {
+    return redactSecretLikeSubstrings(value) as unknown as T;
   }
   return value;
 }

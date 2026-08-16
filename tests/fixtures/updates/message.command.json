@@ -1,0 +1,11 @@
+{
+  "update_id": 100001,
+  "message": {
+    "message_id": 501,
+    "date": 1770000000,
+    "chat": { "id": -1001111111111, "type": "supergroup", "title": "Fixture Chat" },
+    "from": { "id": 111111, "is_bot": false, "first_name": "Alice", "username": "alice" },
+    "text": "/ban spamming again",
+    "entities": [{ "type": "bot_command", "offset": 0, "length": 4 }]
+  }
+}

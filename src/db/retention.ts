@@ -1,4 +1,4 @@
-import { lt, sql } from 'drizzle-orm';
+import { and, eq, lt, sql } from 'drizzle-orm';
 import { randomUUID } from 'node:crypto';
 
 import { PROCESSED_UPDATE_RETENTION_DAYS } from '../constants.js';
@@ -9,7 +9,11 @@ import { processedUpdates } from './schema/core.js';
 
 export async function purgeExpiredProcessedUpdates(database: DrizzleDatabase, retentionDays = PROCESSED_UPDATE_RETENTION_DAYS): Promise<void> {
   const cutoff = new Date(Date.now() - retentionDays * 24 * 60 * 60 * 1000);
-  await database.delete(processedUpdates).where(lt(processedUpdates.processedAt, cutoff));
+  // BOTS-9 review fix (BLOCKER-5): only `completed` rows are safe to purge —
+  // a `received`/`failed`/`processing` row is still owed reprocessing on
+  // redelivery; deleting it would re-enable the very at-most-once loss the
+  // inbox state machine exists to prevent.
+  await database.delete(processedUpdates).where(and(eq(processedUpdates.status, 'completed'), lt(processedUpdates.processedAt, cutoff)));
 }
 
 export const AUDIT_RETENTION_DEFAULT_BATCH_SIZE = 500;

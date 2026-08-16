@@ -2,7 +2,7 @@ import { and, eq } from 'drizzle-orm';
 
 import { getUpdateContext } from './context.js';
 import type { SnapshotStatus } from './audit/enums.js';
-import type { AuditPolicyContext } from './audit/masking.js';
+import { stripForbidden, type AuditPolicyContext } from './audit/masking.js';
 import { resolveEffectiveAuditPolicy, type EffectiveAuditPolicy } from './audit/policyResolution.js';
 import {
   normalizeAuditMutationForPersistence,
@@ -49,7 +49,7 @@ export interface AuditChange<TSnapshot extends Record<string, unknown>> {
 
 export type AuditMutationResult<TSnapshot extends Record<string, unknown>> = AuditChange<TSnapshot>;
 
-type AuditTransaction = Pick<DrizzleDatabase, 'select' | 'insert' | 'update' | 'delete' | 'execute'>;
+export type AuditTransaction = Pick<DrizzleDatabase, 'select' | 'insert' | 'update' | 'delete' | 'execute'>;
 
 export class AuditService {
   public constructor(private readonly db: DrizzleDatabase) {}
@@ -116,11 +116,21 @@ export class AuditService {
         ),
         effectivePolicy,
       );
-      const metadata = mergeAuditMetadata(
-        mergeAuditMetadata(input.metadata, mutation.metadata),
-        buildAuditPolicyMetadata(effectivePolicy),
+      // BOTS-9 review finding (BLOCKER-4, residual): `metadata` and
+      // `telegramContext` are the two unstructured JSONB bags on this table
+      // that never pass through `normalizeAuditMutationForPersistence`
+      // (which covers before/after/changes/snapshotData via applyAllowlist).
+      // stripForbidden here is the repository-boundary defense-in-depth for
+      // exactly those two — a future caller passing a forbidden key or a
+      // secret-shaped value inside `input.metadata` must not reach the
+      // database just because snapshots happen to be clean.
+      const metadata = stripForbidden(
+        mergeAuditMetadata(
+          mergeAuditMetadata(input.metadata, mutation.metadata),
+          buildAuditPolicyMetadata(effectivePolicy),
+        ),
       );
-      const telegramContext = input.telegramContext ?? buildTelegramContext(context);
+      const telegramContext = stripForbidden(input.telegramContext ?? buildTelegramContext(context));
       const [eventRow] = await tx
         .insert(events)
         .values({
