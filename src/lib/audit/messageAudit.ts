@@ -58,9 +58,17 @@ function raiseTextCapableEvent(input: Omit<RaiseAuditEventInput<'message.edited'
   return auditProcessor.process({ ...input, policy: TEXT_CAPABLE_POLICY });
 }
 
-/** BOTS-9: audits Telegram's `edited_message`/`edited_channel_post` update as `message.edited`. Requires `edited_message` in `TELEGRAM_ALLOWED_UPDATES`. */
+/**
+ * BOTS-9 review finding (MEDIUM-1/MEDIUM-2): audits Telegram's
+ * `edited_message` update as `message.edited`. `edited_channel_post` is
+ * deliberately NOT claimed: channel posts carry no `from`, so the editor's
+ * identity is unknowable without fabricating an actor — exactly what the
+ * snapshot contract forbids. Operators enabling that update type get an
+ * explicit `no_author` warning per update rather than silently wrong
+ * audits. Requires `edited_message` in `TELEGRAM_ALLOWED_UPDATES`.
+ */
 export async function recordMessageEdited(audit: AuditService, logger: Logger, ctx: Context): Promise<void> {
-  const message = ctx.editedMessage ?? ctx.editedChannelPost;
+  const message = ctx.editedMessage;
   if (!message) return;
   if (message.edit_date === undefined) {
     logger.warn({ event: 'audit.message_edited.incomplete_update', details: { hasMessage: true } });
@@ -86,7 +94,7 @@ export async function recordMessageEdited(audit: AuditService, logger: Logger, c
 
   const text = message.text ?? message.caption;
   const editedAt = new Date(message.edit_date * 1000).toISOString();
-  const idempotencyKey = `message.edited:telegram-update:${updateContext.updateId}:${chatId}:${messageId}`;
+  const idempotencyKey = `message.edited:telegram-update:${updateContext.botId ?? 'unscoped-bot'}:${updateContext.updateId}:${chatId}:${messageId}`;
   const subjectType = 'message';
   const subjectId = `${chatId}:${messageId}`;
 
@@ -111,18 +119,30 @@ export async function recordMessageEdited(audit: AuditService, logger: Logger, c
         // this message has ever been seen.
         const previous = await readCurrentSnapshotData(tx, chatId, subjectType, subjectId);
 
+        // BOTS-9 review finding (HIGH-1, residual): Telegram updates are
+        // not guaranteed to arrive in order. A genuinely *different*, older
+        // edit (different update_id, so the idempotency key does not catch
+        // it) must never regress the current snapshot — same isStale guard
+        // as memberAudit/botMembershipAudit, keyed on the snapshot's own
+        // editedAt instead of observedAt. A stale edit is still audited
+        // (complete history) but as a noop that leaves the snapshot alone.
+        const previousEditedAt = typeof previous?.editedAt === 'string' ? previous.editedAt : undefined;
+        const isStale = previousEditedAt !== undefined && previousEditedAt > editedAt;
+        const afterData = isStale ? previous : { chatId, messageId, userId, editedAt, textLength: text?.length ?? 0, ...(text !== undefined ? { text } : {}) };
+        const operation = isStale ? 'noop' : previous ? 'update' : 'create';
+
         const record = raiseTextCapableEvent({
           name: 'message.edited',
           version: 1,
-          operation: previous ? 'update' : 'create',
+          operation,
           chatId,
           actorId: userId,
           before: previous ? observed(previous) : notObserved(),
-          after: observed({ chatId, messageId, userId, editedAt, textLength: text?.length ?? 0, ...(text !== undefined ? { text } : {}) }),
+          after: observed(afterData),
         });
         const mutationResult = toDownstreamMutationResult(record);
 
-        return { ...mutationResult, metadata: { operation: record.operation } };
+        return { ...mutationResult, metadata: { operation, ...(isStale ? { outOfOrder: true } : {}) } };
       },
     );
   } catch (error) {
@@ -156,6 +176,8 @@ export interface RecordMessageDeletedInput {
    * `not_observed` and no author is recorded at all.
    */
   readonly knownAuthorUserId?: string;
+  /** Defaults to 'succeeded' for backward-compat call sites; ModerationService.deleteMessage passes the real outcome explicitly so failed/unknown attempts are audited too, not silently dropped. */
+  readonly outcome?: 'succeeded' | 'failed' | 'unknown';
 }
 
 /**
@@ -167,6 +189,13 @@ export interface RecordMessageDeletedInput {
 export async function recordMessageDeleted(audit: AuditService, logger: Logger, input: RecordMessageDeletedInput): Promise<void> {
   const subjectType = 'message';
   const subjectId = `${input.chatId}:${input.messageId}`;
+  const outcome = input.outcome ?? 'succeeded';
+  // BOTS-9 review finding (BLOCKER-1): this used to hardcode operation:
+  // 'delete' and was only ever called on a confirmed success — a
+  // confirmed-failed or exhausted-unknown deleteMessage attempt produced
+  // no audit record at all, the same class of bug as moderation.action's
+  // missing terminal record. `outcome` now drives the real operation.
+  const operation = outcome === 'succeeded' ? ('delete' as const) : outcome;
 
   try {
     await audit.recordEntityChange(
@@ -189,9 +218,13 @@ export async function recordMessageDeleted(audit: AuditService, logger: Logger, 
         const record = raiseTextCapableEvent({
           name: 'message.deleted',
           version: 1,
-          operation: 'delete',
+          operation,
           chatId: input.chatId,
           ...(input.deletedBy !== undefined ? { actorId: input.deletedBy } : {}),
+          // A failed/unknown delete attempt means the message likely still
+          // exists (or we genuinely don't know) — either way we have no
+          // fresh content to report, same as a confirmed delete: the Bot
+          // API never gives us anything to re-fetch.
           before: previous ? observed(previous) : notObserved(),
           after: notApplicable(),
         });
@@ -202,7 +235,7 @@ export async function recordMessageDeleted(audit: AuditService, logger: Logger, 
         // the legitimate "deleted a message we never saw before" case this
         // producer exists to handle gracefully (`before_status =
         // not_observed`). See `mutationResult.ts`.
-        const mutationResult = safeDownstreamMutationResult(record, { chatId: input.chatId, messageId: input.messageId, deleted: true });
+        const mutationResult = safeDownstreamMutationResult(record, { chatId: input.chatId, messageId: input.messageId, deleted: outcome === 'succeeded' });
         return { ...mutationResult, metadata: { operation: record.operation, ...(userId !== undefined ? { userId } : {}) } };
       },
     );

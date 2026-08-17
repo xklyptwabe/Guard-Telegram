@@ -41,7 +41,7 @@ export class ChatSettingsService {
 
   public async setLocale(chatId: string, locale: string, actorId?: string, idempotencyKeyOverride?: string): Promise<void> {
     const context = getUpdateContext();
-    const idempotencyKey = idempotencyKeyOverride ?? (context ? `chat.settings.changed:telegram-update:${context.updateId}:${chatId}` : undefined);
+    const idempotencyKey = idempotencyKeyOverride ?? (context ? `chat.settings.changed:telegram-update:${context.botId ?? 'unscoped-bot'}:${context.updateId}:${chatId}` : undefined);
     if (!idempotencyKey) throw new MissingChatSettingsAuditIdempotencyKeyError();
 
     const result = await this.audit.recordEntityChange(

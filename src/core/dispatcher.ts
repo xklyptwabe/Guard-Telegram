@@ -151,7 +151,7 @@ export class CommandDispatcher {
         this.logger.warn({ event: 'audit.command_executed.missing_update_context', module: command.moduleId, chatId: identity.chatId, userId: identity.userId, commandName });
         return;
       }
-      const idempotencyKey = `command.executed:telegram-update:${context.updateId}:${identity.chatId}:${identity.userId}:${commandName}`;
+      const idempotencyKey = `command.executed:telegram-update:${context.botId ?? 'unscoped-bot'}:${context.updateId}:${identity.chatId}:${identity.userId}:${commandName}`;
       const record = this.auditProcessor.process({
         name: 'command.executed',
         version: 1,
@@ -199,6 +199,11 @@ export class CommandDispatcher {
       }
       await this.dispatchCommand(ctx, envelope.commandName, envelope.rawArguments);
     } finally {
+      // BOTS-9 review finding (HIGH-5) — documented exclusion:
+      // answerCallbackQuery only dismisses the client-side loading spinner
+      // on the button the user just pressed; it expires within seconds and
+      // has no lasting state. A write-ahead/retry would be pure overhead
+      // with a stale-ack as its only possible outcome.
       await ctx.answerCallbackQuery({ text: t('common.callbackDone') }).catch((error: unknown) => {
         this.logger.error({ event: 'callback.answer_failed', ...(ctx.chat ? { chatId: String(ctx.chat.id) } : {}), ...(ctx.from ? { userId: String(ctx.from.id) } : {}), error: { name: error instanceof Error ? error.name : 'UnknownError', message: error instanceof Error ? error.message : String(error) } });
       });

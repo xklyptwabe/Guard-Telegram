@@ -55,7 +55,7 @@ export async function recordMemberStatusChanged(audit: AuditService, logger: Log
   const oldStatusParsed = memberStatusSchema.safeParse(update.old_chat_member?.status);
   const actorId = update.from ? String(update.from.id) : undefined;
   const observedAt = new Date(update.date * 1000).toISOString();
-  const idempotencyKey = `member.status.changed:telegram-update:${updateContext.updateId}:${chatId}:${userId}`;
+  const idempotencyKey = `member.status.changed:telegram-update:${updateContext.botId ?? 'unscoped-bot'}:${updateContext.updateId}:${chatId}:${userId}`;
   const subjectType = 'chat_member';
   const subjectId = `${chatId}:${userId}`;
 

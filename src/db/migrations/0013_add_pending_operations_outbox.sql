@@ -2,7 +2,7 @@
 -- Telegram Bot API moderation calls: ban, unban, restrict, unrestrict,
 -- kick, and the bot's own message deletions). See
 -- src/db/schema/moderation.ts and
--- docs/modules/0009-external-operation-outbox.md for the full contract.
+-- docs/modules/0010-external-operation-outbox.md for the full contract.
 --
 -- This is intentionally a separate schema/table from "audit"."outbox"
 -- (BOTS-6/7), which delivers an *already-recorded* audit event onward to a

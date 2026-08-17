@@ -54,7 +54,7 @@ describe('ChatSettingsService.setLocale', () => {
     expect(calls).toHaveLength(1);
     const call = calls[0] as { input: { eventType: string; idempotencyKey: string }; result: { before?: Record<string, unknown>; after?: Record<string, unknown>; metadata?: Record<string, unknown> } };
     expect(call.input.eventType).toBe('chat.settings.changed');
-    expect(call.input.idempotencyKey).toBe('chat.settings.changed:telegram-update:1:chat-1');
+    expect(call.input.idempotencyKey).toBe('chat.settings.changed:telegram-update:unscoped-bot:1:chat-1');
     expect(call.result.before).toMatchObject({ locale: 'ru' });
     expect(call.result.after).toMatchObject({ locale: 'en' });
     expect(call.result.metadata).toMatchObject({ operation: 'update' });

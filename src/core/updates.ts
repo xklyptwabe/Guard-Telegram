@@ -6,13 +6,14 @@ import { z } from 'zod';
 
 import type { AppConfig } from '../config.js';
 import type { DrizzleDatabase } from '../db/client.js';
-import { processedUpdates, telegramUsers } from '../db/schema/core.js';
+import { telegramUsers } from '../db/schema/core.js';
 import type { AuditService } from '../lib/auditService.js';
 import { recordBotMembershipChanged } from '../lib/audit/botMembershipAudit.js';
 import { runWithUpdateContext } from '../lib/context.js';
 import type { Logger } from '../lib/logger.js';
 import type { ModuleRegistry } from './registry.js';
 import type { TelegramBotModule } from './contracts.js';
+import { UpdateInbox } from './updateInbox.js';
 
 const webhookUpdateSchema = z.object({ update_id: z.number().int() }).passthrough();
 
@@ -35,13 +36,23 @@ function messageThreadId(ctx: Context): string | undefined {
 }
 
 export function registerPlatformMiddleware(bot: Bot<Context>, database: DrizzleDatabase, registry: ModuleRegistry, logger: Logger): void {
+  // BOTS-9 review fix (BLOCKER-5): the old code inserted the
+  // processed_updates marker BEFORE `await next()` — any crash or handler
+  // exception after that insert permanently lost the update, because
+  // redelivery found the marker and skipped. UpdateInbox turns the marker
+  // into a durable received→processing→completed state machine: only a
+  // `completed` row dedups; anything else is reprocessed on redelivery.
+  // The raw update is never stored (BLOCKER-4) — Telegram's own
+  // redelivery drives the retry.
+  const inbox = new UpdateInbox(database, logger);
   bot.use(async (ctx, next) => {
     const updateId = String(ctx.update.update_id);
+    const botId = ctx.me ? String(ctx.me.id) : undefined;
     const chatId = ctx.chat ? String(ctx.chat.id) : undefined;
     const userId = ctx.from ? String(ctx.from.id) : undefined;
     const threadId = messageThreadId(ctx);
     await runWithUpdateContext(
-      { updateId, ...(chatId ? { chatId } : {}), ...(userId ? { userId } : {}), ...(threadId ? { messageThreadId: threadId } : {}) },
+      { updateId, ...(botId ? { botId } : {}), ...(chatId ? { chatId } : {}), ...(userId ? { userId } : {}), ...(threadId ? { messageThreadId: threadId } : {}) },
       async () => {
         if (ctx.chat) await registry.ensureChat(chatId!, ctx.chat.type, chatTitle(ctx));
         if (ctx.from) {
@@ -54,17 +65,25 @@ export function registerPlatformMiddleware(bot: Bot<Context>, database: DrizzleD
               set: { ...(ctx.from.language_code ? { languageCode: ctx.from.language_code } : {}), updatedAt: now },
             });
         }
-        const inserted = await database
-          .insert(processedUpdates)
-          .values({ botId: String(ctx.me.id), updateId })
-          .onConflictDoNothing({ target: [processedUpdates.botId, processedUpdates.updateId] })
-          .returning({ updateId: processedUpdates.updateId });
-        if (inserted.length === 0) {
+        const { claim, attemptCount } = await inbox.begin(String(ctx.me.id), updateId);
+        if (claim === 'completed') {
           logger.info({ event: 'update.duplicate_skipped' });
           return;
         }
+        if (claim === 'busy') {
+          // Live lease elsewhere or attempts exhausted — do not reprocess
+          // now; redelivery (after lease expiry / backoff) decides.
+          logger.info({ event: 'update.inbox.busy_skipped', details: { updateId, attemptCount } });
+          return;
+        }
         logger.debug({ event: 'update.received' });
-        await next();
+        try {
+          await next();
+          await inbox.complete(String(ctx.me.id), updateId);
+        } catch (error: unknown) {
+          await inbox.fail(String(ctx.me.id), updateId, attemptCount, error);
+          throw error;
+        }
       },
     );
   });
@@ -135,6 +154,14 @@ function closeServer(server: Server): Promise<void> {
   return new Promise((resolve, reject) => server.close((error) => (error ? reject(error) : resolve())));
 }
 
+/**
+ * BOTS-9 review finding (HIGH-5) — documented exclusion: `setWebhook` is
+ * deliberately NOT routed through the write-ahead outbox. Same reasoning
+ * as `setMyCommands`: bootstrap-only, idempotent (same URL/secret/allowed
+ * updates → same state), and retried by the next restart. The webhook
+ * secret never leaves this process for the outbox (BLOCKER-4) — storing it
+ * in a write-ahead row would be a new leak, not a reliability gain.
+ */
 export async function startWebhook(bot: Bot<Context>, config: AppConfig, logger: Logger): Promise<TransportController> {
   if (!config.telegramWebhookUrl || !config.telegramWebhookSecret) throw new Error('Webhook configuration is incomplete');
   const webhookUrl = new URL(config.telegramWebhookUrl);

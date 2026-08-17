@@ -71,7 +71,7 @@ describe('CommandDispatcher — command.executed audit wiring', () => {
     expect(calls).toHaveLength(1);
     const call = calls[0] as { input: { idempotencyKey: string }; result: { after: Record<string, unknown> } };
     expect(call.result.after).toMatchObject({ commandId: 'test', success: true, argsRedacted: true });
-    expect(call.input.idempotencyKey).toBe('command.executed:telegram-update:upd-1:1:2:test');
+    expect(call.input.idempotencyKey).toBe('command.executed:telegram-update:unscoped-bot:upd-1:1:2:test');
   });
 
   it('records success:false when the command throws, and still sends the error reply', async () => {

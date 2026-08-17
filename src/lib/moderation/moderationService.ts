@@ -138,7 +138,9 @@ export class ModerationService {
 
   public async deleteMessage(chatId: string, messageId: string, actorUserId: string, knownAuthorUserId?: string): Promise<ModerationOutcome> {
     const context = getUpdateContext();
-    const idempotencyKey = context ? `moderation.delete:telegram-update:${context.updateId}:${chatId}:${messageId}` : `moderation.delete:${chatId}:${messageId}:${Date.now()}`;
+    const idempotencyKey = context
+      ? `moderation.delete:telegram-update:${context.botId ?? 'unscoped-bot'}:${context.updateId}:${chatId}:${messageId}`
+      : `moderation.delete:${chatId}:${messageId}:${Date.now()}`;
     const kind = 'telegram.deleteMessage';
     const result = await this.outbox.execute(
       {
@@ -149,31 +151,46 @@ export class ModerationService {
         metadata: { deletedBy: actorUserId, ...(knownAuthorUserId !== undefined ? { knownAuthorUserId } : {}) },
       },
       this.resolvers.get(kind)!,
+      // HIGH-3: the outbox owns audit-finalization durability — on success it
+      // marks audit_status='written'; a throw here leaves the audit owed and
+      // the worker backfills it later without re-invoking the executor.
+      async (row, outcome) => this.auditRecoveredOperation(row, outcome),
     );
-    if (result.isFinal && result.outcome.status === 'succeeded') {
-      await recordMessageDeleted(this.audit, this.logger, {
-        chatId,
-        messageId,
-        idempotencyKey: `${result.row.idempotencyKey}:audit`,
-        deletedBy: actorUserId,
-        ...(knownAuthorUserId !== undefined ? { knownAuthorUserId } : {}),
-      });
-    }
     return result.isFinal ? this.toOutcome(result.outcome) : { status: 'unknown', willRetry: true };
   }
 
   /**
    * Resumes anything left `pending`/`in_progress` (interrupted by a crash)
-   * or `unknown`-with-retries-remaining from before this process started.
-   * Call once at startup, after `bot.init()`. Reconstructs and writes the
-   * audit record for anything that resolves here — the *only* place a
-   * recovered operation's audit trail gets completed, since the original
-   * command's request/response cycle is long gone.
+   * or `unknown`-with-retries-remaining from before this process started —
+   * a single synchronous sweep. Reconstructs and writes the audit record
+   * for anything that resolves here — the *only* place a recovered
+   * operation's audit trail gets completed for a genuinely finished
+   * process, since the original command's request/response cycle is long
+   * gone. Kept as a direct method (rather than folded only into
+   * `startWorker`) for tests and for the very first pass at boot.
    */
   public async recoverPending(): Promise<void> {
     await this.outbox.recoverPending(async (row, outcome) => {
       await this.auditRecoveredOperation(row, outcome);
     });
+  }
+
+  /**
+   * BOTS-9 review fix (BLOCKER-2): starts the outbox's persistent polling
+   * worker so retries happen throughout the process's uptime, not only
+   * once at bootstrap. Call once at startup, after `bot.init()` — the
+   * first poll tick performs the same initial sweep `recoverPending()`
+   * used to do alone, then continues polling on an interval for as long
+   * as the process runs. Call `stopWorker()` during graceful shutdown.
+   */
+  public startWorker(): void {
+    this.outbox.startWorker(async (row, outcome) => {
+      await this.auditRecoveredOperation(row, outcome);
+    });
+  }
+
+  public stopWorker(): void {
+    this.outbox.stopWorker();
   }
 
   private registerResolvers(): void {
@@ -187,7 +204,18 @@ export class ModerationService {
       // Both calls are individually idempotent — safe to replay this whole
       // executor from the top on recovery, whichever half it died on.
       await this.bot.api.raw.banChatMember({ chat_id: payload.chat_id as number, user_id: payload.user_id as number });
-      await this.bot.api.raw.unbanChatMember({ chat_id: payload.chat_id as number, user_id: payload.user_id as number, only_if_banned: true });
+      try {
+        await this.bot.api.raw.unbanChatMember({ chat_id: payload.chat_id as number, user_id: payload.user_id as number, only_if_banned: true });
+      } catch (error) {
+        // BOTS-9 review finding (HIGH-8): the ban half already landed —
+        // tag the error so the outbox/audit layer can record that the
+        // target is left banned, not kicked, rather than an outcome
+        // indistinguishable from "kick simply failed, target unaffected".
+        // Attached to the SAME error object (not wrapped) so `instanceof
+        // GrammyError` still holds for the confirmed-vs-unknown check.
+        if (error && typeof error === 'object') (error as Record<string, unknown>).partialOutcome = 'banned_not_kicked';
+        throw error;
+      }
     });
     this.resolvers.register('telegram.restrictChatMember.mute', async (payload) => {
       await this.bot.api.raw.restrictChatMember({
@@ -208,15 +236,21 @@ export class ModerationService {
   private async dispatch(action: ModerationAction, input: ModerationActionInput, kind: string, requestPayload: Record<string, unknown>) {
     const context = getUpdateContext();
     const idempotencyKey = context
-      ? `moderation.action:telegram-update:${context.updateId}:${input.chatId}:${input.targetUserId}:${action}`
+      ? `moderation.action:telegram-update:${context.botId ?? 'unscoped-bot'}:${context.updateId}:${input.chatId}:${input.targetUserId}:${action}`
       : `moderation.action:${input.chatId}:${input.targetUserId}:${action}:${Date.now()}`;
     const metadata: Record<string, unknown> = { action, actorUserId: input.actorUserId, targetUserId: input.targetUserId, ...(input.reason !== undefined ? { reason: input.reason } : {}) };
-    return this.outbox.execute({ kind, chatId: input.chatId, idempotencyKey, requestPayload, metadata }, this.resolvers.get(kind)!);
+    return this.outbox.execute(
+      { kind, chatId: input.chatId, idempotencyKey, requestPayload, metadata },
+      this.resolvers.get(kind)!,
+      // HIGH-3: audit-finalization is the outbox's durable responsibility —
+      // see deleteMessage's note. auditRecoveredOperation dispatches on
+      // row.kind, so this same callback serves both recovery and live calls.
+      async (row, outcome) => this.auditRecoveredOperation(row, outcome),
+    );
   }
 
   private async performAndAudit(action: ModerationAction, input: ModerationActionInput, kind: string, requestPayload: Record<string, unknown>): Promise<ModerationOutcome> {
     const result = await this.dispatch(action, input, kind, requestPayload);
-    if (result.isFinal) await this.recordModerationAction(action, input, result.row.idempotencyKey, result.outcome);
     return result.isFinal ? this.toOutcome(result.outcome) : { status: 'unknown', willRetry: true };
   }
 
@@ -224,10 +258,9 @@ export class ModerationService {
     return { status: outcome.status, willRetry: false, ...(outcome.result !== undefined ? { detail: outcome.result } : {}) };
   }
 
-  /** A row resolving during `recoverPending()` has no live command/actor on the call stack — everything needed comes from what was written ahead in `row.metadata` and `row.chatId`. `telegram.deleteMessage` and the moderation-action kinds need different audit events, so this dispatches on `row.kind`. */
-  private async auditRecoveredOperation(row: PendingOperationRow, outcome: AttemptOutcome): Promise<void> {
+  /** A row resolving during `recoverPending()` has no live command/actor on the call stack — everything needed comes from what was written ahead in `row.metadata` and `row.chatId`. `telegram.deleteMessage` and the moderation-action kinds need different audit events, so this dispatches on `row.kind`. Public so the shared outbox finalizer router (see core wiring / the integration gateway) can delegate `telegram.*` kinds here. */
+  public async auditRecoveredOperation(row: PendingOperationRow, outcome: AttemptOutcome): Promise<void> {
     if (row.kind === 'telegram.deleteMessage') {
-      if (outcome.status !== 'succeeded') return; // only a successful deletion is auditable as message.deleted
       const messageId = String(row.requestPayload.message_id);
       const deletedBy = typeof row.metadata.deletedBy === 'string' ? row.metadata.deletedBy : undefined;
       const knownAuthorUserId = typeof row.metadata.knownAuthorUserId === 'string' ? row.metadata.knownAuthorUserId : undefined;
@@ -235,6 +268,7 @@ export class ModerationService {
         chatId: row.chatId,
         messageId,
         idempotencyKey: `${row.idempotencyKey}:audit`,
+        outcome: outcome.status,
         ...(deletedBy !== undefined ? { deletedBy } : {}),
         ...(knownAuthorUserId !== undefined ? { knownAuthorUserId } : {}),
       });
@@ -274,6 +308,8 @@ export class ModerationService {
           actorType: 'telegram_user',
         },
         () => {
+          const outcomeResult = outcome.result;
+          const partialOutcome = outcomeResult?.partialOutcome === 'banned_not_kicked' ? 'banned_not_kicked' : undefined;
           const record = this.auditProcessor.process({
             name: 'moderation.action',
             version: 1,
@@ -284,9 +320,15 @@ export class ModerationService {
             after:
               outcome.status === 'succeeded'
                 ? observed({ chatId: input.chatId, targetUserId: input.targetUserId, actorUserId: input.actorUserId, action, ...(input.reason !== undefined ? { reason: input.reason } : {}) })
-                : notApplicable(),
+                : partialOutcome !== undefined
+                  ? // HIGH-8: a confirmed-failed kick whose ban half already
+                    // landed is NOT the same as "nothing happened" — surface
+                    // that directly in `after`, not just buried in
+                    // metadata.result where it's easy to miss.
+                    observed({ chatId: input.chatId, targetUserId: input.targetUserId, actorUserId: input.actorUserId, action, partialOutcome })
+                  : notApplicable(),
           });
-          const mutationResult = safeDownstreamMutationResult(record, { chatId: input.chatId, targetUserId: input.targetUserId, action, outcome: outcome.status });
+          const mutationResult = safeDownstreamMutationResult(record, { chatId: input.chatId, targetUserId: input.targetUserId, actorUserId: input.actorUserId, action });
           return Promise.resolve({ ...mutationResult, metadata: { operation, ...(outcome.result !== undefined ? { result: outcome.result } : {}) } });
         },
       );

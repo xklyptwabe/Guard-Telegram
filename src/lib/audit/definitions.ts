@@ -5,10 +5,12 @@ import {
   auditPolicyChangedSchema,
   auditRetentionCompletedSchema,
   botMembershipChangedSchema,
+  botMembershipSnapshotSchema,
   chatSettingsChangedSchema,
   commandExecutedSchema,
   integrationActionSchema,
   memberStatusChangedSchema,
+  memberStatusSnapshotSchema,
   messageDeletedSchema,
   messageEditedSchema,
   moderationActionSchema,
@@ -99,7 +101,11 @@ export const AUDIT_EVENT_DEFINITIONS: AuditEventDefinitions = {
     siteVisible: true,
     canBeDisabled: true,
     snapshotSchema: memberStatusChangedSchema,
-    allowlist: ['chatId', 'userId', 'status'],
+    sparseSnapshotSchema: memberStatusSnapshotSchema,
+    // 'observedAt' (Telegram's own `date` for the update) is what makes
+    // the out-of-order/staleness guard in memberAudit.ts actually work —
+    // see memberStatusSnapshotSchema's doc comment.
+    allowlist: ['chatId', 'userId', 'status', 'observedAt'],
   }),
 
   'bot.membership.changed': defineAuditEvent('bot.membership.changed', {
@@ -111,7 +117,8 @@ export const AUDIT_EVENT_DEFINITIONS: AuditEventDefinitions = {
     // Whether the bot itself is still in a chat is safety-critical operational data.
     canBeDisabled: false,
     snapshotSchema: botMembershipChangedSchema,
-    allowlist: ['chatId', 'status'],
+    sparseSnapshotSchema: botMembershipSnapshotSchema,
+    allowlist: ['chatId', 'status', 'observedAt', 'rights'],
   }),
 
   'moderation.action': defineAuditEvent('moderation.action', {
@@ -123,7 +130,7 @@ export const AUDIT_EVENT_DEFINITIONS: AuditEventDefinitions = {
     // Accountability for moderation actions must not be switchable off.
     canBeDisabled: false,
     snapshotSchema: moderationActionSchema,
-    allowlist: ['chatId', 'targetUserId', 'actorUserId', 'action', 'reason', 'durationSeconds'],
+    allowlist: ['chatId', 'targetUserId', 'actorUserId', 'action', 'reason', 'durationSeconds', 'partialOutcome'],
   }),
 
   'message.edited': defineAuditEvent('message.edited', {

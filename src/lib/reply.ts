@@ -18,6 +18,14 @@ function isTopicError(error: unknown): boolean {
   return /TOPIC_CLOSED|message thread not found/i.test(error.message);
 }
 
+/**
+ * BOTS-9 review finding (HIGH-5) — documented exclusion: `sendMessage` is
+ * deliberately NOT routed through the write-ahead outbox. It is
+ * user-facing UX feedback whose value decays in seconds; a post-restart
+ * retry would deliver stale replies hours later, which is worse than the
+ * rare lost reply. The command's own outcome (and its `command.executed`
+ * audit) is recorded independently of whether its reply was delivered.
+ */
 export class ReplyService {
   public constructor(private readonly config: Pick<AppConfig, 'telegramTopicFallbackToChat'>, private readonly logger: Logger) {}
 

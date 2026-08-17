@@ -15,6 +15,23 @@ export interface IntegrationActionInput {
   readonly targetId: string;
   readonly statusCode?: number;
   readonly success: boolean;
+  /**
+   * BOTS-9 review finding (HIGH-7): optional, forward-compatible. No
+   * current caller (`storage.put`, `rabbitmq` publish) has chat context to
+   * give, so omitting it is the common case and behaves exactly as before
+   * (platform-wide policy applies). A future chat-scoped integration call
+   * can pass it to get that chat's own audit policy instead.
+   */
+  readonly chatId?: string;
+  /**
+   * BOTS-9 review finding (BLOCKER-3): when the audit is the terminal
+   * record of a write-ahead outbox operation, the key is the operation's
+   * stable `${idempotencyKey}:audit` — NOT a fresh UUID — so a retry or
+   * post-restart backfill of the same operation collapses to exactly one
+   * audit event. Omit for standalone (non-outbox) integration calls, where
+   * a per-call UUID remains correct (see the class doc).
+   */
+  readonly idempotencyKey?: string;
 }
 
 /**
@@ -38,12 +55,13 @@ export interface IntegrationActionInput {
  */
 export async function recordIntegrationAction(audit: AuditService, logger: Logger, input: IntegrationActionInput): Promise<void> {
   try {
-    const idempotencyKey = `integration.action:${input.integrationId}:${input.action}:${randomUUID()}`;
+    const idempotencyKey = input.idempotencyKey ?? `integration.action:${input.integrationId}:${input.action}:${randomUUID()}`;
     const record = auditProcessor.process({
       name: 'integration.action',
       version: 1,
       operation: 'create',
       idempotencyKey,
+      ...(input.chatId !== undefined ? { chatId: input.chatId } : {}),
       before: notApplicable(),
       after: observed({
         integrationId: input.integrationId,

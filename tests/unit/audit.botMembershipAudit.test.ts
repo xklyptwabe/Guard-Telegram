@@ -59,6 +59,19 @@ describe('recordBotMembershipChanged', () => {
     expect(call.result.after).toMatchObject({ status: 'kicked' });
   });
 
+  it('BOTS-9 review HIGH-2: a rights-only change (status stays "administrator") is operation "update", not "noop" — losing can_restrict_members must not look like nothing happened', async () => {
+    const fixture = loadFixture('my_chat_member.rights_changed.json');
+    const { audit, calls } = fakeAuditService();
+    const ctx = { myChatMember: fixture.my_chat_member } as never;
+
+    await runWithUpdateContext({ updateId: String(fixture.update_id), chatId: '-1001111111111' }, () => recordBotMembershipChanged(audit, logger(), ctx));
+
+    const call = calls[0] as { result: { before?: Record<string, unknown>; after?: Record<string, unknown>; metadata?: Record<string, unknown> } };
+    expect(call.result.metadata).toMatchObject({ operation: 'update' });
+    expect((call.result.before as { rights?: { canRestrictMembers?: boolean } })?.rights?.canRestrictMembers).toBe(true);
+    expect((call.result.after as { rights?: { canRestrictMembers?: boolean } })?.rights?.canRestrictMembers).toBe(false);
+  });
+
   it('is never gated by any module — this test calls it directly, matching how it is wired in core/updates.ts (registerBotMembershipAudit), not through registerModuleUpdateHandlers', async () => {
     // Documentation-as-test: there is no `enabled` check anywhere in this
     // producer's own logic, unlike module-gated producers.

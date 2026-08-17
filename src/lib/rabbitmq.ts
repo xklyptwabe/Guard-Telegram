@@ -7,6 +7,8 @@ import type { AppConfig } from '../config.js';
 import { recordIntegrationAction } from './audit/integrationAudit.js';
 import type { AuditService } from './auditService.js';
 import type { Logger } from './logger.js';
+import type { PendingOperationResolvers, PendingOperationsOutbox } from './moderation/pendingOperationsOutbox.js';
+import { integrationOperationMetadata } from './integrations/externalOperationGateway.js';
 
 const actionEnvelopeSchema = z.object({
   id: z.string().uuid(),
@@ -54,7 +56,13 @@ async function publishConfirmed(channel: ConfirmChannel, exchange: string, routi
   await channel.waitForConfirms();
 }
 
-export async function createRabbitMq(config: Pick<AppConfig, 'rabbitMqEnabled' | 'rabbitMqUrl' | 'rabbitMqNamespace' | 'rabbitMqProductId' | 'rabbitMqPrefetch' | 'rabbitMqRetryDelayMs' | 'rabbitMqMaxRetries'>, logger: Logger, audit: AuditService): Promise<RabbitMqBridge> {
+export async function createRabbitMq(
+  config: Pick<AppConfig, 'rabbitMqEnabled' | 'rabbitMqUrl' | 'rabbitMqNamespace' | 'rabbitMqProductId' | 'rabbitMqPrefetch' | 'rabbitMqRetryDelayMs' | 'rabbitMqMaxRetries'>,
+  logger: Logger,
+  audit: AuditService,
+  outbox?: PendingOperationsOutbox,
+  resolvers?: PendingOperationResolvers,
+): Promise<RabbitMqBridge> {
   if (!config.rabbitMqEnabled) {
     return {
       enabled: false,
@@ -87,29 +95,56 @@ export async function createRabbitMq(config: Pick<AppConfig, 'rabbitMqEnabled' |
     await publishConfirmed(channel, topology.actionsExchange, topology.routingKey, envelope);
   };
 
-  const publish = async (type: string, payload: unknown): Promise<void> => {
-    try {
-      await rawPublish(type, payload);
-    } catch (error: unknown) {
-      // Audit recording never throws on its own (see integrationAudit.ts) —
-      // it cannot mask or replace the real failure being rethrown below.
-      await recordIntegrationAction(audit, logger, {
-        integrationId: 'rabbitmq',
-        action: type,
-        targetType: 'queue',
-        targetId: topology.actionQueue,
-        success: false,
-      });
-      throw error;
+  const publishViaOutbox = async (type: string, payload: unknown): Promise<void> => {
+    // BOTS-9 review fix (BLOCKER-3): durable intent BEFORE the external
+    // call. The envelope — including its id — is created here and stored in
+    // the write-ahead row, so every retry (this process or a post-restart
+    // recovery) republishes the SAME envelope id and consumers can dedupe
+    // redeliveries. All publish failures here are unconfirmed from our
+    // side (waitForConfirms rejects on channel errors/timeouts too), so
+    // they stay `unknown` and retry with the identical envelope — safe by
+    // construction, no blind non-idempotent replay.
+    const envelope = actionEnvelopeSchema.parse({ id: randomUUID(), type, attempt: 0, payload });
+    const kind = 'rabbitmq.publish';
+    const result = await outbox!.execute(
+      {
+        kind,
+        chatId: 'platform',
+        idempotencyKey: `rabbitmq.publish:${envelope.id}`,
+        requestPayload: { envelope },
+        metadata: integrationOperationMetadata({ integrationId: 'rabbitmq', action: type, targetType: 'queue', targetId: topology.actionQueue }),
+      },
+      async () => {
+        await publishConfirmed(channel, topology.actionsExchange, topology.routingKey, envelope);
+        return { messageId: envelope.id };
+      },
+    );
+    if (result.outcome.status === 'failed') {
+      throw new Error(`RabbitMQ publish failed: ${JSON.stringify(result.outcome.result ?? {})}`);
     }
-    await recordIntegrationAction(audit, logger, {
-      integrationId: 'rabbitmq',
-      action: type,
-      targetType: 'queue',
-      targetId: topology.actionQueue,
-      success: true,
-    });
   };
+
+  const publish = outbox
+    ? publishViaOutbox
+    : // Outbox unavailable (early bootstrap/tests) — the pre-BLOCKER-3
+      // direct path, still post-call audited.
+      async (type: string, payload: unknown): Promise<void> => {
+        try {
+          await rawPublish(type, payload);
+        } catch (error: unknown) {
+          await recordIntegrationAction(audit, logger, { integrationId: 'rabbitmq', action: type, targetType: 'queue', targetId: topology.actionQueue, success: false });
+          throw error;
+        }
+        await recordIntegrationAction(audit, logger, { integrationId: 'rabbitmq', action: type, targetType: 'queue', targetId: topology.actionQueue, success: true });
+      };
+
+  // Recovery executor for `rabbitmq.publish` rows found after a restart:
+  // republish the STORED envelope — same id, so broker/consumer dedup holds.
+  resolvers?.register('rabbitmq.publish', async (stored) => {
+    const envelope = actionEnvelopeSchema.parse((stored as { envelope: unknown }).envelope);
+    await publishConfirmed(channel, topology.actionsExchange, topology.routingKey, envelope);
+    return { messageId: envelope.id };
+  });
 
   const sendToQueue = async (queue: string, envelope: ActionEnvelope): Promise<void> => {
     const accepted = channel.sendToQueue(queue, Buffer.from(JSON.stringify(envelope)), {
@@ -121,21 +156,43 @@ export async function createRabbitMq(config: Pick<AppConfig, 'rabbitMqEnabled' |
     await channel.waitForConfirms();
   };
 
+  /**
+   * DLQ/retry rerouting gets a post-call `integration.action` record but
+   * deliberately NOT a write-ahead row (BOTS-9 review HIGH-5, documented
+   * exclusion): the source message stays unacked until the reroute is
+   * confirmed, and on any reroute failure it is nacked back to the ORIGINAL
+   * queue — RabbitMQ's own redelivery is the durable retry mechanism here,
+   * and interleaving a DB roundtrip into that ack/nack window would change
+   * consumer ordering semantics for no reliability gain. `channel.ack` /
+   * `channel.nack` themselves are protocol-level and stay unaudited for the
+   * same reason.
+   */
+  const rerouteWithAudit = async (queue: string, envelope: ActionEnvelope, action: string): Promise<void> => {
+    try {
+      await sendToQueue(queue, envelope);
+      await recordIntegrationAction(audit, logger, { integrationId: 'rabbitmq', action, targetType: 'queue', targetId: queue, success: true });
+    } catch (error: unknown) {
+      await recordIntegrationAction(audit, logger, { integrationId: 'rabbitmq', action, targetType: 'queue', targetId: queue, success: false });
+      throw error;
+    }
+  };
+
   const handlers = new Map<string, ActionHandler>();
   const handleMessage = async (message: ConsumeMessage): Promise<void> => {
     let action: ActionEnvelope;
     try {
       action = actionEnvelopeSchema.parse(JSON.parse(message.content.toString('utf8')));
     } catch (error: unknown) {
-      try {
-        await sendToQueue(topology.deadLetterQueue, { id: randomUUID(), type: 'invalid', attempt: 0, payload: { reason: 'invalid_message' } });
-        channel.ack(message);
-        logger.warn({ event: 'rabbitmq.invalid_to_dlq', error: { name: error instanceof Error ? error.name : 'UnknownError', message: error instanceof Error ? error.message : String(error) } });
-      } catch {
-        channel.nack(message, false, true);
-      }
-      return;
+    try {
+      await sendToQueue(topology.deadLetterQueue, { id: randomUUID(), type: 'invalid', attempt: 0, payload: { reason: 'invalid_message' } });
+      await recordIntegrationAction(audit, logger, { integrationId: 'rabbitmq', action: 'dlq', targetType: 'queue', targetId: topology.deadLetterQueue, success: true });
+      channel.ack(message);
+      logger.warn({ event: 'rabbitmq.invalid_to_dlq', error: { name: error instanceof Error ? error.name : 'UnknownError', message: error instanceof Error ? error.message : String(error) } });
+    } catch {
+      channel.nack(message, false, true);
     }
+    return;
+  }
     try {
       const handler = handlers.get(action.type);
       if (!handler) throw new Error('No consumer registered for action type');
@@ -146,10 +203,10 @@ export async function createRabbitMq(config: Pick<AppConfig, 'rabbitMqEnabled' |
       logger.warn({ event: 'rabbitmq.handler_failed', details: { actionType: action.type, attempt: next.attempt }, error: { name: error instanceof Error ? error.name : 'UnknownError', message: error instanceof Error ? error.message : String(error) } });
       try {
         if (next.attempt > config.rabbitMqMaxRetries) {
-          await sendToQueue(topology.deadLetterQueue, next);
+          await rerouteWithAudit(topology.deadLetterQueue, next, 'dlq');
           logger.warn({ event: 'rabbitmq.exhausted_to_dlq', details: { actionType: action.type, attempt: next.attempt } });
         } else {
-          await sendToQueue(topology.retryQueue, next);
+          await rerouteWithAudit(topology.retryQueue, next, 'retry');
           logger.warn({ event: 'rabbitmq.retry_scheduled', details: { actionType: action.type, attempt: next.attempt } });
         }
         channel.ack(message);
