@@ -33,6 +33,7 @@ const ru = {
     disabled: 'выключен',
     changed: 'Модуль {{moduleId}} {{state}}.',
     unknown: 'Модуль {{moduleId}} не найден.',
+    protected: 'Модуль {{moduleId}} нельзя выключить: через него управляются модули этого чата.',
   },
   chatSettings: {
     changed: 'Язык чата изменён на {{locale}}.',

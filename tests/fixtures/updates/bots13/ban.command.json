@@ -1,0 +1,18 @@
+{
+  "update_id": 131004,
+  "message": {
+    "message_id": 9100,
+    "date": 1780000004,
+    "chat": { "id": -1003131313, "type": "supergroup", "title": "BOTS-13 E2E Chat A" },
+    "from": { "id": 999001, "is_bot": false, "first_name": "OwnerA", "username": "owner_a" },
+    "reply_to_message": {
+      "message_id": 9099,
+      "date": 1780000000,
+      "chat": { "id": -1003131313, "type": "supergroup" },
+      "from": { "id": 555001, "is_bot": false, "first_name": "Spammer", "username": "spammer13" },
+      "text": "buy cheap things now"
+    },
+    "text": "/ban spam",
+    "entities": [{ "offset": 0, "length": 4, "type": "bot_command" }]
+  }
+}
