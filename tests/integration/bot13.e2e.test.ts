@@ -84,6 +84,9 @@ describe.skipIf(!testDatabaseUrl)('BOT-13: full integration scenarios', () => {
     await client.db.execute(sql`DELETE FROM moderation.pending_operations`);
     await client.db.execute(sql`DELETE FROM core.processed_updates`);
     await client.db.execute(sql`DELETE FROM audit.event_policies WHERE chat_id IS NOT NULL`);
+    // Parallel suites (bots9.fixes) may flip a global policy; restore defaults
+    // so a GrammyError ban still has a writable mandatory moderation.action.
+    await client.db.execute(sql`UPDATE audit.event_policies SET enabled = true WHERE chat_id IS NULL`);
     await client.db.execute(sql`DELETE FROM core.chat_module_states`);
     await client.db.execute(sql`DELETE FROM public.telegram_chats`);
   });
