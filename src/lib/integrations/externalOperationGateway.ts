@@ -56,17 +56,20 @@ export function makeIntegrationAuditFinalizer(audit: AuditService, logger: Logge
     const targetType = typeof row.metadata.targetType === 'string' ? row.metadata.targetType : undefined;
     const targetId = typeof row.metadata.targetId === 'string' ? row.metadata.targetId : undefined;
     if (!integrationId || !action || !targetType || !targetId) {
-      logger.warn({ event: 'audit.integration_action.recovered_without_metadata', details: { kind: row.kind, id: row.id } });
-      return;
+      // BLOCKER-1: missing metadata must never finalize as 'written'.
+      logger.error({ event: 'audit.integration_action.recovered_without_metadata', details: { kind: row.kind, id: row.id } });
+      throw new Error(`pending_operations row ${row.id} (${row.kind}) reached terminal state without the integration metadata needed to finalize its audit record`);
     }
     const statusCode = typeof outcome.result?.statusCode === 'number' ? outcome.result.statusCode : undefined;
     const chatId = typeof row.metadata.chatId === 'string' ? row.metadata.chatId : undefined;
-    await recordIntegrationAction(audit, logger, {
+    return recordIntegrationAction(audit, logger, {
       integrationId,
       action,
       targetType,
       targetId,
-      success: outcome.status === 'succeeded',
+      // Round-2 (HIGH-2): the operation's first-class outcome — failed and
+      // unknown stay distinguishable in the audit record.
+      outcome: outcome.status,
       ...(statusCode !== undefined ? { statusCode } : {}),
       ...(chatId !== undefined ? { chatId } : {}),
       idempotencyKey: `${row.idempotencyKey}:audit`,
@@ -84,9 +87,8 @@ export function makeIntegrationAuditFinalizer(audit: AuditService, logger: Logge
 export function buildOutboxFinalizer(moderation: ModerationService, integration: PendingOperationFinalizer): PendingOperationFinalizer {
   return async (row, outcome) => {
     if (row.kind.startsWith('telegram.')) {
-      await moderation.auditRecoveredOperation(row, outcome);
-      return;
+      return moderation.auditRecoveredOperation(row, outcome);
     }
-    await integration(row, outcome);
+    return integration(row, outcome);
   };
 }

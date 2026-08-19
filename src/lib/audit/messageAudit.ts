@@ -1,6 +1,7 @@
 import type { Context } from 'grammy';
 
-import type { AuditService } from '../auditService.js';
+import { MODULE_IDS } from '../../constants.js';
+import { AuditPolicyDisabledError, type AuditService } from '../auditService.js';
 import { getUpdateContext } from '../context.js';
 import type { Logger } from '../logger.js';
 import { normalizeError } from '../logger.js';
@@ -111,6 +112,8 @@ export async function recordMessageEdited(audit: AuditService, logger: Logger, c
         idempotencyKey,
         actorId: userId,
         actorType: 'telegram_user',
+        // Round-2 (HIGH): canonical module id so BOTS-8 module policy applies.
+        moduleId: MODULE_IDS.messageAudit,
       },
       async (tx) => {
         // The "last allowed version" requirement: whatever was recorded
@@ -126,9 +129,18 @@ export async function recordMessageEdited(audit: AuditService, logger: Logger, c
         // as memberAudit/botMembershipAudit, keyed on the snapshot's own
         // editedAt instead of observedAt. A stale edit is still audited
         // (complete history) but as a noop that leaves the snapshot alone.
+        // Round-2 (HIGH): edit_date has second precision — an EQUAL
+        // timestamp must not let a second update overwrite either, so the
+        // update_id is the tie-breaker order marker (Telegram's update_id
+        // is strictly increasing per bot).
         const previousEditedAt = typeof previous?.editedAt === 'string' ? previous.editedAt : undefined;
-        const isStale = previousEditedAt !== undefined && previousEditedAt > editedAt;
-        const afterData = isStale ? previous : { chatId, messageId, userId, editedAt, textLength: text?.length ?? 0, ...(text !== undefined ? { text } : {}) };
+        const previousUpdateId = typeof previous?.observedUpdateId === 'number' ? previous.observedUpdateId : undefined;
+        const rawIncomingUpdateId = updateContext.updateId !== undefined ? Number(updateContext.updateId) : 0;
+        const incomingUpdateId = Number.isFinite(rawIncomingUpdateId) ? rawIncomingUpdateId : 0;
+        const isStale =
+          previousEditedAt !== undefined &&
+          (previousEditedAt > editedAt || (previousEditedAt === editedAt && (previousUpdateId ?? 0) >= incomingUpdateId));
+        const afterData = isStale ? previous : { chatId, messageId, userId, editedAt, observedUpdateId: incomingUpdateId, textLength: text?.length ?? 0, ...(text !== undefined ? { text } : {}) };
         const operation = isStale ? 'noop' : previous ? 'update' : 'create';
 
         const record = raiseTextCapableEvent({
@@ -186,7 +198,11 @@ export interface RecordMessageDeletedInput {
  * this must never be called for a deletion the bot merely infers or is told
  * about after the fact; only for one it directly executed.
  */
-export async function recordMessageDeleted(audit: AuditService, logger: Logger, input: RecordMessageDeletedInput): Promise<void> {
+export async function recordMessageDeleted(
+  audit: AuditService,
+  logger: Logger,
+  input: RecordMessageDeletedInput,
+): Promise<{ readonly status: 'recorded' } | { readonly status: 'policy_skipped' }> {
   const subjectType = 'message';
   const subjectId = `${input.chatId}:${input.messageId}`;
   const outcome = input.outcome ?? 'succeeded';
@@ -209,6 +225,9 @@ export async function recordMessageDeleted(audit: AuditService, logger: Logger, 
         source: 'telegram.moderation_delete',
         idempotencyKey: input.idempotencyKey,
         ...(input.deletedBy !== undefined ? { actorId: input.deletedBy, actorType: 'telegram_user' } : {}),
+        // Round-2 (HIGH): the bot's own deleteMessage is a moderation
+        // action — canonical module id for BOTS-8 module policy.
+        moduleId: MODULE_IDS.moderation,
       },
       async (tx) => {
         const previous = await readCurrentSnapshotData(tx, input.chatId, subjectType, subjectId);
@@ -229,17 +248,46 @@ export async function recordMessageDeleted(audit: AuditService, logger: Logger, 
           after: notApplicable(),
         });
 
-        // Deliberately not `toDownstreamMutationResult(record)` here: that
-        // helper throws `MissingAuditSnapshotDataError` when `after` is
-        // `not_applicable` *and* `before` is also non-observed — exactly
-        // the legitimate "deleted a message we never saw before" case this
-        // producer exists to handle gracefully (`before_status =
-        // not_observed`). See `mutationResult.ts`.
-        const mutationResult = safeDownstreamMutationResult(record, { chatId: input.chatId, messageId: input.messageId, deleted: outcome === 'succeeded' });
-        return { ...mutationResult, metadata: { operation: record.operation, ...(userId !== undefined ? { userId } : {}) } };
+        if (outcome === 'succeeded') {
+          // Deliberately not `toDownstreamMutationResult(record)` here: that
+          // helper throws `MissingAuditSnapshotDataError` when `after` is
+          // `not_applicable` *and* `before` is also non-observed — exactly
+          // the legitimate "deleted a message we never saw before" case this
+          // producer exists to handle gracefully (`before_status =
+          // not_observed`). See `mutationResult.ts`.
+          const mutationResult = safeDownstreamMutationResult(record, { chatId: input.chatId, messageId: input.messageId, deleted: true });
+          return { ...mutationResult, metadata: { operation: record.operation, ...(userId !== undefined ? { userId } : {}) } };
+        }
+
+        // Round-2 (HIGH-3): a failed/unknown delete must NOT archive the
+        // snapshot — Telegram never confirmed the deletion, so the message
+        // likely still exists and the DB must keep saying so. The audit
+        // event still records the attempt (before=observed, after=not
+        // applicable), but the entity snapshot stays exactly as it was.
+        // `before` is the RAW snapshot data (the `observed(...)` wrapper is
+        // only used inside AuditRecord; `normalizeAuditMutationForPersistence`
+        // expects the plain data alongside `beforeSnapshotStatus`).
+        return {
+          before: previous,
+          after: undefined,
+          beforeSnapshotStatus: record.before.status,
+          afterSnapshotStatus: record.after.status,
+          changes: record.changes,
+          snapshotStatus: 'current',
+          snapshotData: previous ?? {},
+          metadata: { operation: record.operation, ...(userId !== undefined ? { userId } : {}) },
+        };
       },
     );
+    return { status: 'recorded' };
   } catch (error) {
+    if (error instanceof AuditPolicyDisabledError) {
+      logger.info({ event: 'audit.message_deleted.policy_skipped', chatId: input.chatId, details: { messageId: input.messageId } });
+      return { status: 'policy_skipped' };
+    }
+    // BLOCKER-1/4: infrastructure failure — do NOT swallow; the outbox
+    // keeps `audit_status='pending'` and the caller fails the update chain.
     logger.warn({ event: 'audit.message_deleted.failed', chatId: input.chatId, details: { messageId: input.messageId }, error: normalizeError(error) });
+    throw error;
   }
 }

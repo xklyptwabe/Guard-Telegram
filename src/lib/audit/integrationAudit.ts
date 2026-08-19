@@ -1,9 +1,9 @@
 import { randomUUID } from 'node:crypto';
 
+import { AuditPolicyDisabledError, type AuditService } from '../auditService.js';
 import { AuditEventProcessor } from './eventProcessor.js';
 import { toDownstreamInput, toDownstreamMutationResult } from './serviceAdapter.js';
 import { notApplicable, observed } from './snapshot.js';
-import type { AuditService } from '../auditService.js';
 import type { Logger } from '../logger.js';
 
 const auditProcessor = new AuditEventProcessor();
@@ -14,7 +14,15 @@ export interface IntegrationActionInput {
   readonly targetType: string;
   readonly targetId: string;
   readonly statusCode?: number;
-  readonly success: boolean;
+  /**
+   * BOTS-9 review round-2 (HIGH-2): the first-class outcome of the external
+   * call — `succeeded` (provider confirmed), `failed` (provider confirmed
+   * rejection), `unknown` (no confirmed answer: timeout/transport). Stored
+   * directly on the audit record; `success` is derived from it for
+   * backward-compatible readers. `failed` and `unknown` are no longer
+   * collapsed into the same boolean.
+   */
+  readonly outcome: 'succeeded' | 'failed' | 'unknown';
   /**
    * BOTS-9 review finding (HIGH-7): optional, forward-compatible. No
    * current caller (`storage.put`, `rabbitmq` publish) has chat context to
@@ -49,13 +57,22 @@ export interface IntegrationActionInput {
  * identical fields (e.g. publishing the same action type twice on purpose)
  * would be wrongly collapsed into one record.
  *
- * Never throws — auditing an integration call must not affect whether that
- * call's own result reaches its caller. Any failure here (policy disabled,
- * transient DB issue) is logged and swallowed.
+ * BOTS-9 review round-2 (BLOCKER-1): this function does NOT swallow
+ * failures any more. When used as an outbox finalizer the throw is what
+ * keeps `audit_status='pending'` (retried by the backfill pass); a
+ * `policy_skipped` return marks the row terminal for audit purposes.
+ * Callers that audit best-effort (post-call records that must not break
+ * the call's own result) must wrap the call in their own try/catch —
+ * see `lib/rabbitmq.ts`.
  */
-export async function recordIntegrationAction(audit: AuditService, logger: Logger, input: IntegrationActionInput): Promise<void> {
+export async function recordIntegrationAction(
+  audit: AuditService,
+  logger: Logger,
+  input: IntegrationActionInput,
+): Promise<{ readonly status: 'recorded' } | { readonly status: 'policy_skipped' }> {
   try {
     const idempotencyKey = input.idempotencyKey ?? `integration.action:${input.integrationId}:${input.action}:${randomUUID()}`;
+    const success = input.outcome === 'succeeded';
     const record = auditProcessor.process({
       name: 'integration.action',
       version: 1,
@@ -69,17 +86,27 @@ export async function recordIntegrationAction(audit: AuditService, logger: Logge
         targetType: input.targetType,
         targetId: input.targetId,
         ...(input.statusCode !== undefined ? { statusCode: input.statusCode } : {}),
-        success: input.success,
+        outcome: input.outcome,
+        success,
       }),
     });
     const downstreamInput = toDownstreamInput(record);
     const mutationResult = toDownstreamMutationResult(record);
     await audit.recordEntityChange(downstreamInput, () => Promise.resolve(mutationResult));
+    return { status: 'recorded' };
   } catch (error: unknown) {
+    if (error instanceof AuditPolicyDisabledError) {
+      logger.info({
+        event: 'audit.integration_action.policy_skipped',
+        details: { integrationId: input.integrationId, action: input.action, targetType: input.targetType, targetId: input.targetId },
+      });
+      return { status: 'policy_skipped' };
+    }
     logger.warn({
       event: 'audit.integration_action.failed',
       details: { integrationId: input.integrationId, action: input.action, targetType: input.targetType, targetId: input.targetId },
       error: { name: error instanceof Error ? error.name : 'UnknownError', message: error instanceof Error ? error.message : String(error) },
     });
+    throw error;
   }
 }

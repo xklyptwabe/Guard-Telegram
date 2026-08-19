@@ -28,6 +28,8 @@ export interface PendingOperationRow {
   readonly status: PendingOperationStatus;
   readonly attemptCount: number;
   readonly result: Record<string, unknown> | null;
+  /** 'pending' | 'written' | 'policy_skipped' — see the schema column doc. */
+  readonly auditStatus: string;
 }
 
 /**
@@ -55,6 +57,17 @@ export interface PendingOperationResult {
   readonly isFinal: boolean;
   /** True when a prior call with the same idempotencyKey already resolved this operation (or another worker currently holds/held the lease) — the executor was not invoked, or its result could not be authoritatively recorded by this worker. */
   readonly duplicate: boolean;
+  /**
+   * BOTS-9 review round-2 (BLOCKER-1/BLOCKER-4): true when the terminal
+   * audit is durably done (`recorded`/`policy_skipped`, or the row was
+   * already marked written/skipped before — the retention-tombstone case),
+   * or when no audit is owed yet (non-final outcome). False ONLY when this
+   * outcome is terminal AND the audit is still owed but could not be
+   * finalized — the caller (e.g. `ModerationService`) must then treat the
+   * operation as incomplete so the update chain retries until the audit
+   * lands.
+   */
+  readonly auditFinalized: boolean;
 }
 
 export type PendingOperationExecutor = (payload: Record<string, unknown>) => Promise<Record<string, unknown> | void>;
@@ -63,16 +76,56 @@ export type PendingOperationExecutor = (payload: Record<string, unknown>) => Pro
  * BOTS-9 review finding (HIGH-3): writes the one-and-only terminal audit
  * record for an operation. Supplied per `execute()` call and to the worker;
  * must be idempotent (the audit layer's `...:audit` idempotency key makes a
- * repeated call a no-op). A throw means the audit is still owed — the row's
- * `audit_status` stays 'pending' and the worker's backfill pass retries it
- * later, WITHOUT re-invoking the executor.
+ * repeated call a no-op).
+ *
+ * BOTS-9 review round-2 (BLOCKER-1): the contract now has an explicit
+ * result instead of `Promise<void>`:
+ *
+ *   - `{ status: 'recorded' }`       → event durably written → outbox marks
+ *                                      `audit_status='written'`
+ *   - `{ status: 'policy_skipped' }` → a *deliberate* policy decision (the
+ *                                      resolved audit policy disabled the
+ *                                      event) → outbox marks
+ *                                      `audit_status='policy_skipped'`, no
+ *                                      record owed, backfill stops retrying
+ *   - throw                          → infrastructure failure → audit is
+ *                                      still owed: `audit_status` stays
+ *                                      'pending' and the worker's backfill
+ *                                      pass retries it later WITHOUT
+ *                                      re-invoking the executor.
+ *
+ * A swallowed error (finalizer returning normally without recording) is now
+ * impossible by construction: returning anything other than the two legal
+ * statuses is a type error, and `markAuditWritten()` is only ever called
+ * after a `recorded` result.
  */
-export type PendingOperationFinalizer = (row: PendingOperationRow, outcome: AttemptOutcome) => Promise<void>;
+export type PendingOperationFinalizer = (
+  row: PendingOperationRow,
+  outcome: AttemptOutcome,
+) => Promise<{ readonly status: 'recorded' } | { readonly status: 'policy_skipped' }>;
+
+/** How {@link PendingOperationsOutbox.finalizeAudit} resolved for a row. */
+export type AuditFinalizeStatus = 'recorded' | 'policy_skipped' | 'failed';
 
 class OperationTimeoutError extends Error {
   public constructor(ms: number) {
     super(`Operation timed out after ${ms}ms — no confirmed response from Telegram`);
     this.name = 'OperationTimeoutError';
+  }
+}
+
+/**
+ * BOTS-9 review round-2 (BLOCKER-4): base class for "the side effect is
+ * done but its MANDATORY audit record is still owed". The update-processing
+ * chain (`CommandDispatcher`) lets any subclass propagate so the durable
+ * inbox does not complete the update — Telegram redelivers, the operation
+ * is found terminal, and the duplicate branch finishes the audit
+ * idempotently.
+ */
+export class AuditFinalizationPendingError extends Error {
+  public constructor(message: string) {
+    super(message);
+    this.name = 'AuditFinalizationPendingError';
   }
 }
 
@@ -114,16 +167,36 @@ export interface EnqueueExternalOperationInput {
  * {@link PendingOperationsOutbox.recoverPending} after a restart can be
  * replayed even though the original caller (e.g. a specific
  * `ModerationService.ban()` call) is no longer on the call stack.
+ *
+ * Each kind also declares its retry-after-unknown policy
+ * (`retryAfterUnknown`). BLOCKER-2 (round-2): a non-idempotent destructive
+ * call like `telegram.deleteMessage` must NEVER be blindly re-issued after
+ * an unconfirmed `unknown` outcome — the first request may have landed, and
+ * re-issuing it would turn a success into a confirmed failure ("message
+ * already deleted"). Kinds default to `retryAfterUnknown: true` (safe for
+ * idempotent calls: ban/unban/restrict re-apply the same state as a no-op,
+ * `rabbitmq.publish` republishes the SAME envelope id, S3 recovery only
+ * ever re-runs a read-only HEAD).
  */
-export class PendingOperationResolvers {
-  private readonly resolvers = new Map<string, PendingOperationExecutor>();
+export interface PendingOperationResolver {
+  readonly executor: PendingOperationExecutor;
+  readonly retryAfterUnknown: boolean;
+}
 
-  public register(kind: string, executor: PendingOperationExecutor): void {
-    this.resolvers.set(kind, executor);
+export class PendingOperationResolvers {
+  private readonly resolvers = new Map<string, PendingOperationResolver>();
+
+  public register(kind: string, executor: PendingOperationExecutor, options: { readonly retryAfterUnknown?: boolean } = {}): void {
+    this.resolvers.set(kind, { executor, retryAfterUnknown: options.retryAfterUnknown ?? true });
   }
 
   public get(kind: string): PendingOperationExecutor | undefined {
-    return this.resolvers.get(kind);
+    return this.resolvers.get(kind)?.executor;
+  }
+
+  /** Whether an `unknown` outcome for this kind may schedule a blind retry. Unknown kinds default to safe (true) for forward compatibility. */
+  public retryAfterUnknown(kind: string): boolean {
+    return this.resolvers.get(kind)?.retryAfterUnknown ?? true;
   }
 }
 
@@ -146,6 +219,7 @@ function toRow(row: typeof pendingOperations.$inferSelect): PendingOperationRow 
     status: row.status,
     attemptCount: row.attemptCount,
     result: (row.result as Record<string, unknown> | null) ?? null,
+    auditStatus: row.auditStatus,
   };
 }
 
@@ -203,6 +277,8 @@ export class PendingOperationsOutbox {
   private readonly workerId = randomUUID();
   private workerTimer: ReturnType<typeof setTimeout> | undefined;
   private workerStopped = true;
+  /** Every background sweep currently in flight, so {@link stopAndDrain} can await them before the process tears down its database pool. */
+  private readonly activeSweeps = new Set<Promise<unknown>>();
 
   public constructor(
     private readonly db: DrizzleDatabase,
@@ -233,13 +309,19 @@ export class PendingOperationsOutbox {
       const outcome: AttemptOutcome = row.result ? { status: row.status, result: row.result } : { status: row.status };
       // The original attempt resolved earlier — possibly with an audit that
       // never got written. A redelivery reaching this branch is exactly the
-      // moment to complete that audit (idempotently).
-      await this.finalizeAudit(row, outcome, onFinal);
-      return { row, outcome, isFinal: true, duplicate: true };
+      // moment to complete that audit (idempotently). A row already marked
+      // 'written'/'policy_skipped' is skipped here (retention-tombstone:
+      // the audit existed once, retention may have purged it, and it must
+      // NOT be resurrected).
+      const auditFinalized = (await this.finalizeAudit(row, outcome, onFinal)) !== 'failed';
+      return { row, outcome, isFinal: true, duplicate: true, auditFinalized };
     }
     const result = await this.attemptById(row, executor);
-    if (result.isFinal) await this.finalizeAudit(result.row, result.outcome, onFinal);
-    return result;
+    if (result.isFinal) {
+      const auditFinalized = (await this.finalizeAudit(result.row, result.outcome, onFinal)) !== 'failed';
+      return { ...result, auditFinalized };
+    }
+    return { ...result, auditFinalized: true };
   }
 
   /**
@@ -281,6 +363,33 @@ export class PendingOperationsOutbox {
   }
 
   /**
+   * Stops new work AND waits for the sweep already in flight to finish —
+   * BOTS-9 review round-2 (MEDIUM): `stopWorker()` alone returned the
+   * instant the timer was cleared, so shutdown could close the DB pool
+   * while a sweep was mid-`finalizeAudit`, stranding rows as
+   * `in_progress`/`audit_status='pending'` and causing a re-run of the
+   * whole operation after restart. Bounded by `timeoutMs` so a wedged
+   * sweep (e.g. an executor hanging on a dead network) can't block SIGTERM
+   * forever; anything still in flight is logged for the operator.
+   */
+  public async stopAndDrain(timeoutMs = this.leaseDurationMs): Promise<void> {
+    this.stopWorker();
+    const inFlight = [...this.activeSweeps];
+    if (inFlight.length === 0) return;
+    let timedOut = false;
+    const bounded = new Promise<void>((resolve) => {
+      setTimeout(() => {
+        timedOut = true;
+        resolve();
+      }, timeoutMs);
+    });
+    await Promise.race([Promise.allSettled(inFlight), bounded]);
+    if (timedOut) {
+      this.logger.warn({ event: 'pending_operations.shutdown.drain_timeout', details: { inFlight: inFlight.length } });
+    }
+  }
+
+  /**
    * Starts polling for due work every `pollIntervalMs` for as long as the
    * process stays up (BOTS-9 review BLOCKER-2: previously retries only
    * ever happened once, at bootstrap). Safe to call once per instance; a
@@ -292,13 +401,15 @@ export class PendingOperationsOutbox {
     this.workerStopped = false;
     const tick = (): void => {
       if (this.workerStopped) return;
-      this.recoverPending(onFinal)
+      const sweep = this.recoverPending(onFinal)
         .catch((error: unknown) => {
           this.logger.error({ event: 'pending_operations.worker.tick_failed', error: { name: error instanceof Error ? error.name : 'UnknownError', message: error instanceof Error ? error.message : String(error) } });
         })
         .finally(() => {
+          this.activeSweeps.delete(sweep);
           if (!this.workerStopped) this.workerTimer = setTimeout(tick, pollIntervalMs);
         });
+      this.activeSweeps.add(sweep);
     };
     tick();
   }
@@ -425,7 +536,7 @@ export class PendingOperationsOutbox {
     if (!claimed) {
       // Lost the claim — someone else (a concurrent call, or the polling
       // worker) already holds this row's lease right now.
-      return { row, outcome: { status: 'unknown' }, isFinal: false, duplicate: true };
+      return { row, outcome: { status: 'unknown' }, isFinal: false, duplicate: true, auditFinalized: true };
     }
     return this.runClaimed(claimed, executor);
   }
@@ -437,7 +548,7 @@ export class PendingOperationsOutbox {
       const resolved = await this.resolve(claimed.id, 'succeeded', resultPayload);
       if (!resolved) return this.orphanedResult(claimed, { status: 'succeeded', result: resultPayload });
       this.logger.info({ event: 'pending_operations.attempt.succeeded', details: { kind: claimed.kind, id: claimed.id } });
-      return { row: { ...claimed, status: 'succeeded', result: resultPayload }, outcome: { status: 'succeeded', result: resultPayload }, isFinal: true, duplicate: false };
+      return { row: { ...claimed, status: 'succeeded', result: resultPayload }, outcome: { status: 'succeeded', result: resultPayload }, isFinal: true, duplicate: false, auditFinalized: true };
     } catch (error: unknown) {
       if (error instanceof GrammyError || error instanceof ConfirmedExternalError) {
         // CONFIRMED — the external system itself answered with an error.
@@ -452,7 +563,7 @@ export class PendingOperationsOutbox {
         const resolved = await this.resolve(claimed.id, 'failed', confirmed);
         if (!resolved) return this.orphanedResult(claimed, { status: 'failed', result: confirmed });
         this.logger.warn({ event: 'pending_operations.attempt.failed', details: { kind: claimed.kind, id: claimed.id, ...confirmed } });
-        return { row: { ...claimed, status: 'failed', result: confirmed }, outcome: { status: 'failed', result: confirmed }, isFinal: true, duplicate: false };
+        return { row: { ...claimed, status: 'failed', result: confirmed }, outcome: { status: 'failed', result: confirmed }, isFinal: true, duplicate: false, auditFinalized: true };
       }
       // UNCONFIRMED — timeout, network error, or any other non-Telegram
       // failure. We do not know whether Telegram applied the change.
@@ -463,12 +574,18 @@ export class PendingOperationsOutbox {
   /** A CAS on resolve() failed: this worker's lease was reclaimed by someone else before it could report its own result — see the class doc's "LATE COMPLETION" note. Logged distinctly because it's a rare, operationally important signal, and reported as non-final/duplicate so the caller never writes an audit record for an outcome this worker no longer has authority over. */
   private orphanedResult(row: PendingOperationRow, attempted: AttemptOutcome): PendingOperationResult {
     this.logger.error({ event: 'pending_operations.attempt.lease_lost', details: { kind: row.kind, id: row.id, attemptedStatus: attempted.status } });
-    return { row, outcome: { status: 'unknown' }, isFinal: false, duplicate: true };
+    return { row, outcome: { status: 'unknown' }, isFinal: false, duplicate: true, auditFinalized: true };
   }
 
   private async markUnknownAndMaybeRetry(row: PendingOperationRow, error: unknown): Promise<PendingOperationResult> {
     const attemptCount = row.attemptCount;
-    const exhausted = attemptCount >= this.maxAttempts;
+    // BOTS-9 review round-2 (BLOCKER-2): per-kind retry policy. A kind
+    // declared non-retryable-after-unknown (`telegram.deleteMessage`) is
+    // terminal on the FIRST unknown — never blindly re-issued — because the
+    // original request may have landed and a re-issued destructive call
+    // would misreport a real success as a confirmed failure.
+    const retryable = this.resolvers.retryAfterUnknown(row.kind);
+    const exhausted = !retryable || attemptCount >= this.maxAttempts;
     const nextAttemptAt = exhausted ? null : new Date(Date.now() + PENDING_OPERATION_RETRY_BASE_DELAY_MS * 2 ** (attemptCount - 1));
     // BOTS-9 review finding (BLOCKER-4): a raw Error.message is
     // unstructured free text from wherever the failure originated — a
@@ -483,8 +600,8 @@ export class PendingOperationsOutbox {
       .returning();
     if (resolved.length === 0) return this.orphanedResult(row, { status: 'unknown', result: errorSummary });
     this.logger.warn({
-      event: exhausted ? 'pending_operations.attempt.unknown_exhausted' : 'pending_operations.attempt.unknown_will_retry',
-      details: { kind: row.kind, id: row.id, attemptCount, ...(nextAttemptAt ? { nextAttemptAt: nextAttemptAt.toISOString() } : {}) },
+      event: exhausted ? (retryable ? 'pending_operations.attempt.unknown_exhausted' : 'pending_operations.attempt.unknown_non_retryable') : 'pending_operations.attempt.unknown_will_retry',
+      details: { kind: row.kind, id: row.id, attemptCount, retryAfterUnknown: retryable, ...(nextAttemptAt ? { nextAttemptAt: nextAttemptAt.toISOString() } : {}) },
       error: errorSummary,
     });
     return {
@@ -492,6 +609,7 @@ export class PendingOperationsOutbox {
       outcome: { status: 'unknown', result: errorSummary },
       isFinal: exhausted,
       duplicate: false,
+      auditFinalized: true,
     };
   }
 
@@ -509,22 +627,35 @@ export class PendingOperationsOutbox {
    * Runs the terminal audit finalizer and, on success, durably records that
    * the audit is no longer owed (BOTS-9 review HIGH-3). Never throws — a
    * finalizer failure is logged as an error and leaves `audit_status` at
-   * 'pending' for the worker's backfill pass. Returns whether the audit got
-   * written.
+   * 'pending' for the worker's backfill pass.
+   *
+   * BOTS-9 review round-2 (BLOCKER-1): `markAuditWritten()` is ONLY reached
+   * after the finalizer returned an explicit `{status:'recorded'}`. A
+   * `{status:'policy_skipped'}` result marks the row `policy_skipped`
+   * instead (terminal, nothing owed). Any throw keeps the audit owed. A row
+   * already marked `written`/`policy_skipped` is a retention tombstone: the
+   * terminal audit existed (or was deliberately skipped) once, retention may
+   * have purged the event, and the finalizer must NOT be re-invoked — that
+   * would resurrect the event on redelivery.
    */
-  private async finalizeAudit(row: PendingOperationRow, outcome: AttemptOutcome, onFinal: PendingOperationFinalizer | undefined): Promise<boolean> {
-    if (!onFinal) return false;
+  private async finalizeAudit(row: PendingOperationRow, outcome: AttemptOutcome, onFinal: PendingOperationFinalizer | undefined): Promise<AuditFinalizeStatus> {
+    if (!onFinal) return 'failed';
+    if (row.auditStatus === 'written' || row.auditStatus === 'policy_skipped') return 'recorded';
     try {
-      await onFinal(row, outcome);
+      const result = await onFinal(row, outcome);
+      if (result.status === 'policy_skipped') {
+        await this.markAuditSkipped(row.id);
+        return 'policy_skipped';
+      }
       await this.markAuditWritten(row.id);
-      return true;
+      return 'recorded';
     } catch (error: unknown) {
       this.logger.error({
         event: 'pending_operations.audit.finalization_failed',
         details: { kind: row.kind, id: row.id, outcomeStatus: outcome.status },
         error: { name: error instanceof Error ? error.name : 'UnknownError', message: error instanceof Error ? error.message : String(error) },
       });
-      return false;
+      return 'failed';
     }
   }
 
@@ -532,6 +663,13 @@ export class PendingOperationsOutbox {
     await this.db
       .update(pendingOperations)
       .set({ auditStatus: 'written', auditWorkerId: null, auditLeaseExpiresAt: null, updatedAt: new Date() })
+      .where(and(eq(pendingOperations.id, id), eq(pendingOperations.auditStatus, 'pending')));
+  }
+
+  private async markAuditSkipped(id: string): Promise<void> {
+    await this.db
+      .update(pendingOperations)
+      .set({ auditStatus: 'policy_skipped', auditWorkerId: null, auditLeaseExpiresAt: null, updatedAt: new Date() })
       .where(and(eq(pendingOperations.id, id), eq(pendingOperations.auditStatus, 'pending')));
   }
 
@@ -558,8 +696,12 @@ export class PendingOperationsOutbox {
         return;
       }
       const outcome: AttemptOutcome = claimed.result ? { status: claimed.status as AttemptOutcome['status'], result: claimed.result } : { status: claimed.status as AttemptOutcome['status'] };
-      const written = await this.finalizeAudit(claimed, outcome, onFinal);
-      if (!written) {
+      const status = await this.finalizeAudit(claimed, outcome, onFinal);
+      if (status === 'failed') {
+        // Audit still owed and could not be written right now — release the
+        // claim and stop this pass; the next worker tick retries (no tight
+        // failure loop). recorded/policy_skipped both make the row terminal
+        // for audit purposes, so the pass continues.
         await this.releaseAuditClaim(claimed.id);
         return;
       }

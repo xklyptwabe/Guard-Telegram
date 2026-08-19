@@ -6,11 +6,12 @@ import { localeForTelegram } from '../i18n/index.js';
 import { AuditEventProcessor } from '../lib/audit/eventProcessor.js';
 import { toDownstreamInput, toDownstreamMutationResult } from '../lib/audit/serviceAdapter.js';
 import { notApplicable, observed } from '../lib/audit/snapshot.js';
-import type { AuditService } from '../lib/auditService.js';
+import { AuditPolicyDisabledError, type AuditService } from '../lib/auditService.js';
 import type { Cooldowns } from '../lib/cooldowns.js';
 import { getUpdateContext } from '../lib/context.js';
 import type { EventBus } from '../lib/eventBus.js';
 import type { Logger } from '../lib/logger.js';
+import { AuditFinalizationPendingError } from '../lib/moderation/pendingOperationsOutbox.js';
 import { hasPermission } from '../lib/permissions.js';
 import type { ReplyService } from '../lib/reply.js';
 import type { TelegramCommandDefinition } from './contracts.js';
@@ -26,6 +27,24 @@ const callbackPattern = /^v1:([a-z][a-z0-9_]{0,31}):([A-Za-z0-9_-]*)$/;
 function chatAndUser(ctx: Context): { chatId: string; userId: string } | undefined {
   if (!ctx.chat || !ctx.from) return undefined;
   return { chatId: String(ctx.chat.id), userId: String(ctx.from.id) };
+}
+
+/**
+ * BOTS-9 review round-2 (BLOCKER-4/HIGH-8): thrown when a command's
+ * `command.executed` audit could not be written for an *infrastructure*
+ * reason. `dispatchCommand` lets it propagate so the durable inbox does NOT
+ * complete the update: Telegram redelivers it, the command re-runs (safe
+ * for every state-changing command in this codebase — they are all
+ * outbox-idempotent), and the idempotency key (keyed on the update) makes
+ * the audit land exactly once. A policy-disabled event never reaches here —
+ * it maps to a normal success instead.
+ */
+export class CommandAuditPendingError extends AuditFinalizationPendingError {
+  public constructor(commandName: string, cause: unknown) {
+    super(`command.executed audit for "${commandName}" is still owed (infrastructure failure)`);
+    this.name = 'CommandAuditPendingError';
+    this.cause = cause;
+  }
 }
 
 export function encodeCallback(commandName: string, rawArguments = ''): string {
@@ -113,8 +132,22 @@ export class CommandDispatcher {
       await this.recordCommandExecuted(identity, command, commandName, durationMs, true);
     } catch (error: unknown) {
       const durationMs = Date.now() - startedAt;
+      // BLOCKER-4: the side effect ran (and the user saw its reply); only a
+      // MANDATORY audit record is still owed (command.executed from this
+      // dispatcher, or the terminal moderation/integration audit from an
+      // outbox-backed command). Do NOT record a misleading success:false
+      // event, do NOT swallow — rethrow so the durable inbox fails the
+      // update and Telegram redelivers it, which completes the audit
+      // idempotently.
+      if (error instanceof AuditFinalizationPendingError) throw error;
       this.logger.error({ event: 'command.failed', module: command.moduleId, chatId: identity.chatId, userId: identity.userId, commandName, error: { name: error instanceof Error ? error.name : 'UnknownError', message: error instanceof Error ? error.message : String(error) } });
-      await this.recordCommandExecuted(identity, command, commandName, durationMs, false);
+      // The failure record is best-effort: if auditing is down, the
+      // command's own error handling must still complete.
+      try {
+        await this.recordCommandExecuted(identity, command, commandName, durationMs, false);
+      } catch {
+        // already failing — nothing more to persist
+      }
       await this.reply.send(ctx, t('common.internalError')).catch((replyError: unknown) => {
         this.logger.error({ event: 'command.error_reply_failed', module: command.moduleId, chatId: identity.chatId, userId: identity.userId, commandName, error: { name: replyError instanceof Error ? replyError.name : 'UnknownError', message: replyError instanceof Error ? replyError.message : String(replyError) } });
       });
@@ -132,11 +165,12 @@ export class CommandDispatcher {
    * used for `module.state.changed` — so a redelivered Update never
    * produces a second `command.executed` row for the same invocation.
    *
-   * Deliberately swallows any failure here (missing update context, audit
-   * policy disabled, a transient DB error, ...): auditing is supplementary
-   * to the command's own outcome, which has already been delivered to the
-   * user by the time this runs, and must not be retroactively broken by an
-   * audit-side problem.
+   * BOTS-9 review round-2 (HIGH-8/BLOCKER-4): failures are NOT swallowed
+   * any more. A policy-disabled event is a normal no-op (nothing owed), a
+   * missing update context is logged (nothing to key on), but any
+   * *infrastructure* failure throws {@link CommandAuditPendingError} so
+   * the durable inbox retries the update until the record lands — a
+   * command must not pass without its audit.
    */
   private async recordCommandExecuted(
     identity: { chatId: string; userId: string },
@@ -172,10 +206,17 @@ export class CommandDispatcher {
           success,
         }),
       });
-      const input = toDownstreamInput(record);
+      // Round-2 (HIGH): the canonical module id is passed EXPLICITLY (not
+      // derived from snapshot field presence) so BOTS-8 module-level
+      // policies always apply to command.executed.
+      const input = { ...toDownstreamInput(record), moduleId: command.moduleId };
       const mutationResult = toDownstreamMutationResult(record);
       await this.audit.recordEntityChange(input, () => Promise.resolve(mutationResult));
     } catch (error: unknown) {
+      if (error instanceof AuditPolicyDisabledError) {
+        this.logger.info({ event: 'audit.command_executed.policy_skipped', module: command.moduleId, chatId: identity.chatId, userId: identity.userId, commandName });
+        return;
+      }
       this.logger.warn({
         event: 'audit.command_executed.failed',
         module: command.moduleId,
@@ -184,6 +225,7 @@ export class CommandDispatcher {
         commandName,
         error: { name: error instanceof Error ? error.name : 'UnknownError', message: error instanceof Error ? error.message : String(error) },
       });
+      throw new CommandAuditPendingError(commandName, error);
     }
   }
 

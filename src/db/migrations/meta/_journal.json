@@ -127,6 +127,13 @@
       "when": 1786030000000,
       "tag": "0017_processed_updates_inbox",
       "breakpoints": true
+    },
+    {
+      "idx": 18,
+      "version": "7",
+      "when": 1786300000000,
+      "tag": "0018_pending_operations_audit_policy_skipped",
+      "breakpoints": true
     }
   ]
 }

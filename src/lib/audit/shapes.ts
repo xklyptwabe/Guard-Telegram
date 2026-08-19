@@ -78,7 +78,11 @@ export const memberStatusChangedSchema = z.object({
  * the protection. Caught by `tests/integration/bot13.e2e.test.ts` against
  * a real Postgres; no fake/mock ever exercises real schema stripping.
  */
-export const memberStatusSnapshotSchema = memberStatusChangedSchema.extend({ observedAt: z.string().optional() });
+export const memberStatusSnapshotSchema = memberStatusChangedSchema.extend({
+  observedAt: z.string().optional(),
+  /** Round-2 (HIGH): strictly-increasing update_id — tie-breaker for equal-second updates. */
+  observedUpdateId: z.number().int().optional(),
+});
 
 export const botMembershipChangedSchema = z.object({
   chatId: z.string().min(1),
@@ -106,6 +110,20 @@ export const botAdministratorRightsSchema = z.object({
   canInviteUsers: z.boolean(),
   canPinMessages: z.boolean().optional(),
   canManageTopics: z.boolean().optional(),
+  // BOTS-9 review round-2 (HIGH-4): full ChatMemberAdministrator rights
+  // coverage — the previously missing fields. `is_anonymous` is common on
+  // group admins; the stories/messages/direct-messages/tags fields are
+  // group- or channel-relevant depending on the account. All optional so
+  // older snapshots and providers that omit a field keep validating; each
+  // is only recorded when Telegram actually sent it.
+  isAnonymous: z.boolean().optional(),
+  canPostStories: z.boolean().optional(),
+  canEditStories: z.boolean().optional(),
+  canDeleteStories: z.boolean().optional(),
+  canPostMessages: z.boolean().optional(),
+  canEditMessages: z.boolean().optional(),
+  canManageDirectMessages: z.boolean().optional(),
+  canManageTags: z.boolean().optional(),
 });
 
 export const botMembershipSnapshotSchemaBase = botMembershipChangedSchema.extend({
@@ -113,7 +131,11 @@ export const botMembershipSnapshotSchemaBase = botMembershipChangedSchema.extend
 });
 
 /** See {@link memberStatusSnapshotSchema} — same schema-stripping fix, for bot.membership.changed's observedAt. */
-export const botMembershipSnapshotSchema = botMembershipSnapshotSchemaBase.extend({ observedAt: z.string().optional() });
+export const botMembershipSnapshotSchema = botMembershipSnapshotSchemaBase.extend({
+  observedAt: z.string().optional(),
+  /** Round-2 (HIGH): strictly-increasing update_id — tie-breaker for equal-second updates. */
+  observedUpdateId: z.number().int().optional(),
+});
 
 export const moderationActionSchema = z.object({
   chatId: z.string().min(1),
@@ -138,6 +160,8 @@ export const messageEditedSchema = z.object({
   messageId: z.string().min(1),
   userId: z.string().min(1),
   editedAt: z.string(),
+  /** Round-2 (HIGH): Telegram's strictly-increasing update_id, the tie-breaker when two edits share the same second-precision `editedAt`. */
+  observedUpdateId: z.number().int().optional(),
   textLength: z.number().int().nonnegative(),
   text: z.string().max(4096).optional(),
 });
@@ -173,6 +197,9 @@ export const integrationActionSchema = z.object({
   targetType: z.string().min(1),
   targetId: z.string().min(1),
   statusCode: z.number().int().optional(),
+  /** Round-2 (HIGH-2): first-class outcome — failed and unknown are distinguishable, not collapsed into `success: false`. */
+  outcome: z.enum(['succeeded', 'failed', 'unknown']),
+  /** Derived from `outcome`; kept for backward-compatible readers. */
   success: z.boolean(),
 });
 

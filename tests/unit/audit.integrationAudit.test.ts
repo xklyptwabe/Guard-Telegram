@@ -1,13 +1,14 @@
 import { describe, expect, it, vi } from 'vitest';
 
 import { recordIntegrationAction } from '../../src/lib/audit/integrationAudit.js';
-import type { AuditService } from '../../src/lib/auditService.js';
+import { AuditPolicyDisabledError, type AuditService } from '../../src/lib/auditService.js';
 import type { Logger } from '../../src/lib/logger.js';
 
-function fakeAuditService(options: { throwOnRecord?: boolean } = {}) {
+function fakeAuditService(options: { throwOnRecord?: boolean; policyDisabled?: boolean } = {}) {
   const calls: Array<{ input: unknown; result: unknown }> = [];
   const audit = {
     recordEntityChange: vi.fn(async (input: unknown, mutate: () => Promise<unknown>) => {
+      if (options.policyDisabled) throw new AuditPolicyDisabledError('integration.action', 'v1');
       if (options.throwOnRecord) throw new Error('simulated audit failure');
       const result = await mutate();
       calls.push({ input, result });
@@ -22,7 +23,7 @@ function fakeLogger() {
 }
 
 describe('recordIntegrationAction', () => {
-  it('records a successful integration call with all fields', async () => {
+  it('records a successful integration call with all fields, outcome first-class', async () => {
     const { audit, calls } = fakeAuditService();
     const logger = fakeLogger();
 
@@ -31,7 +32,7 @@ describe('recordIntegrationAction', () => {
       action: 'send_reminder',
       targetType: 'queue',
       targetId: 'guard.telegram.actions',
-      success: true,
+      outcome: 'succeeded',
     });
 
     expect(calls).toHaveLength(1);
@@ -41,11 +42,13 @@ describe('recordIntegrationAction', () => {
       action: 'send_reminder',
       targetType: 'queue',
       targetId: 'guard.telegram.actions',
+      outcome: 'succeeded',
       success: true,
     });
+    expect(await recordIntegrationAction(audit, logger, { integrationId: 'r', action: 'a', targetType: 't', targetId: 'i', outcome: 'succeeded' })).toEqual({ status: 'recorded' });
   });
 
-  it('records a failed integration call with success:false', async () => {
+  it('BOTS-9 round-2 HIGH-2: failed and unknown stay distinguishable — NOT collapsed into success:false', async () => {
     const { audit, calls } = fakeAuditService();
     const logger = fakeLogger();
 
@@ -54,19 +57,29 @@ describe('recordIntegrationAction', () => {
       action: 'put',
       targetType: 'object',
       targetId: 'exports/2026-08.csv',
-      success: false,
+      outcome: 'failed',
+    });
+    await recordIntegrationAction(audit, logger, {
+      integrationId: 's3',
+      action: 'put',
+      targetType: 'object',
+      targetId: 'exports/2026-08.csv',
+      outcome: 'unknown',
     });
 
-    const call = calls[0] as { result: { after: Record<string, unknown> } };
-    expect(call.result.after.success).toBe(false);
+    const failed = calls[0] as { result: { after: Record<string, unknown> } };
+    const unknown = calls[1] as { result: { after: Record<string, unknown> } };
+    expect(failed.result.after).toMatchObject({ outcome: 'failed', success: false });
+    expect(unknown.result.after).toMatchObject({ outcome: 'unknown', success: false });
+    expect(failed.result.after.outcome).not.toBe(unknown.result.after.outcome);
   });
 
   it('includes statusCode only when provided (never fabricates one)', async () => {
     const { audit, calls } = fakeAuditService();
     const logger = fakeLogger();
 
-    await recordIntegrationAction(audit, logger, { integrationId: 's3', action: 'put', targetType: 'object', targetId: 'k', statusCode: 200, success: true });
-    await recordIntegrationAction(audit, logger, { integrationId: 'rabbitmq', action: 'publish', targetType: 'queue', targetId: 'q', success: true });
+    await recordIntegrationAction(audit, logger, { integrationId: 's3', action: 'put', targetType: 'object', targetId: 'k', statusCode: 200, outcome: 'succeeded' });
+    await recordIntegrationAction(audit, logger, { integrationId: 'rabbitmq', action: 'publish', targetType: 'queue', targetId: 'q', outcome: 'succeeded' });
 
     const withStatus = calls[0] as { result: { after: Record<string, unknown> } };
     const withoutStatus = calls[1] as { result: { after: Record<string, unknown> } };
@@ -78,7 +91,7 @@ describe('recordIntegrationAction', () => {
     const { audit, calls } = fakeAuditService();
     const logger = fakeLogger();
 
-    const params = { integrationId: 'rabbitmq', action: 'ping', targetType: 'queue', targetId: 'q', success: true } as const;
+    const params = { integrationId: 'rabbitmq', action: 'ping', targetType: 'queue', targetId: 'q', outcome: 'succeeded' } as const;
     await recordIntegrationAction(audit, logger, params);
     await recordIntegrationAction(audit, logger, params);
 
@@ -88,22 +101,27 @@ describe('recordIntegrationAction', () => {
     expect(first.input.idempotencyKey).not.toBe(second.input.idempotencyKey);
   });
 
-  it('never throws — swallows an audit-layer failure and logs it instead', async () => {
+  it('BOTS-9 round-2 BLOCKER-1: an infrastructure audit failure THROWS (outbox keeps audit_status=pending) instead of being swallowed', async () => {
     const { audit } = fakeAuditService({ throwOnRecord: true });
     const logger = fakeLogger();
 
-    await expect(
-      recordIntegrationAction(audit, logger, { integrationId: 'rabbitmq', action: 'publish', targetType: 'queue', targetId: 'q', success: true }),
-    ).resolves.toBeUndefined();
-
+    await expect(recordIntegrationAction(audit, logger, { integrationId: 'rabbitmq', action: 'publish', targetType: 'queue', targetId: 'q', outcome: 'succeeded' })).rejects.toThrow('simulated audit failure');
     expect(logger.warn).toHaveBeenCalledWith(expect.objectContaining({ event: 'audit.integration_action.failed' }));
+  });
+
+  it('BOTS-9 round-2 BLOCKER-1: a policy-disabled event maps to {status:"policy_skipped"} — nothing owed, backfill stops', async () => {
+    const { audit } = fakeAuditService({ policyDisabled: true });
+    const logger = fakeLogger();
+
+    await expect(recordIntegrationAction(audit, logger, { integrationId: 'rabbitmq', action: 'publish', targetType: 'queue', targetId: 'q', outcome: 'succeeded' })).resolves.toEqual({ status: 'policy_skipped' });
+    expect(logger.info).toHaveBeenCalledWith(expect.objectContaining({ event: 'audit.integration_action.policy_skipped' }));
   });
 
   it('BOTS-9 review HIGH-7: without chatId, tenantId is the platform-wide sentinel — unchanged, current behavior for every existing caller', async () => {
     const { audit, calls } = fakeAuditService();
     const logger = fakeLogger();
 
-    await recordIntegrationAction(audit, logger, { integrationId: 's3', action: 'put', targetType: 'object', targetId: 'k', success: true });
+    await recordIntegrationAction(audit, logger, { integrationId: 's3', action: 'put', targetType: 'object', targetId: 'k', outcome: 'succeeded' });
 
     const call = calls[0] as { input: { tenantId: string } };
     expect(call.input.tenantId).toBe('__platform__');
@@ -113,7 +131,7 @@ describe('recordIntegrationAction', () => {
     const { audit, calls } = fakeAuditService();
     const logger = fakeLogger();
 
-    await recordIntegrationAction(audit, logger, { integrationId: 's3', action: 'put', targetType: 'object', targetId: 'k', success: true, chatId: '-100555' });
+    await recordIntegrationAction(audit, logger, { integrationId: 's3', action: 'put', targetType: 'object', targetId: 'k', outcome: 'succeeded', chatId: '-100555' });
 
     const call = calls[0] as { input: { tenantId: string } };
     expect(call.input.tenantId).toBe('-100555');

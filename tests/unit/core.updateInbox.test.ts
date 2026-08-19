@@ -144,4 +144,49 @@ describe('UpdateInbox (BOTS-9 review BLOCKER-5)', () => {
     expect(forBotB.claim).toBe('claimed');
     expect(db.rows).toHaveLength(2);
   });
+
+  // ---------------------------------------------------------------------
+  // BOTS-9 review round-2 (BLOCKER-4): busy reason — webhook transport
+  // needs to distinguish "retry later" from "give up"
+  // ---------------------------------------------------------------------
+
+  it('round-2: busy with a LIVE lease held elsewhere reports lease_held (webhook must NOT answer 200)', async () => {
+    const inbox = makeInbox();
+    const other = { claim: undefined, attemptCount: 0 };
+    void other;
+
+    // Simulate another worker's active lease: a row claimed with a future lease.
+    await inbox.begin('bot-1', '200'); // claim by THIS worker
+    db.rows[0]!.workerId = 'other-worker'; // …then the lease belongs to someone else
+
+    const again = await inbox.begin('bot-1', '200');
+    expect(again.claim).toBe('busy');
+    expect(again.busyReason).toBe('lease_held');
+  });
+
+  it('round-2: an attempts-exhausted row reports exhausted (webhook answers 200 — no infinite retry loop)', async () => {
+    const inbox = makeInbox(2);
+    const first = await inbox.begin('bot-1', '201');
+    expect(first.claim).toBe('claimed');
+    await inbox.fail('bot-1', '201', first.attemptCount, new Error('boom'));
+    db.rows[0]!.nextAttemptAt = new Date(0); // backoff elapsed — redelivery is due
+    const second = await inbox.begin('bot-1', '201'); // attempt 2
+    expect(second.claim).toBe('claimed');
+    await inbox.fail('bot-1', '201', second.attemptCount, new Error('boom'));
+    db.rows[0]!.nextAttemptAt = new Date(0);
+    // maxAttempts reached — no further claims.
+    const third = await inbox.begin('bot-1', '201');
+    expect(third.claim).toBe('busy');
+    expect(third.busyReason).toBe('exhausted');
+  });
+
+  it('round-2: a row still inside its backoff window reports backoff (webhook answers 409, Telegram redelivers later)', async () => {
+    const inbox = makeInbox();
+    const first = await inbox.begin('bot-1', '202');
+    await inbox.fail('bot-1', '202', first.attemptCount, new Error('boom'));
+    // nextAttemptAt is in the future — redelivery arrives too early.
+    const early = await inbox.begin('bot-1', '202');
+    expect(early.claim).toBe('busy');
+    expect(early.busyReason).toBe('backoff');
+  });
 });

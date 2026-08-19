@@ -63,6 +63,20 @@ export class AuditIdempotencyConflictError extends Error {
   }
 }
 
+/**
+ * BOTS-9 review round-2 (BLOCKER-1): thrown when the resolved audit policy
+ * deliberately disables the event. Finalizers must map this to
+ * `{ status: 'policy_skipped' }` — the audit is *not* owed, the operation
+ * row becomes terminal for audit purposes — while any other (infrastructure)
+ * error keeps the audit owed and the outbox retries it.
+ */
+export class AuditPolicyDisabledError extends Error {
+  public constructor(eventType: string, eventVersion: string) {
+    super(`Audit policy is unavailable for ${eventType}@${eventVersion}`);
+    this.name = 'AuditPolicyDisabledError';
+  }
+}
+
 export class ForbiddenAuditValueError extends Error {
   public constructor(field: string) {
     super(`Audit field "${field}" contains forbidden credential data.`);
@@ -114,7 +128,7 @@ export class AuditService {
         ...(input.moduleId !== undefined ? { moduleId: input.moduleId } : {}),
       });
       if (!effectivePolicy.values.enabled) {
-        throw new Error(`Audit policy is unavailable for ${input.eventType}@${input.eventVersion}`);
+        throw new AuditPolicyDisabledError(input.eventType, input.eventVersion);
       }
 
       const snapshotWhere = and(

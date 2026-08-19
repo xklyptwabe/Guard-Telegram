@@ -24,6 +24,17 @@ export interface RabbitMqBridge {
   readonly enabled: boolean;
   publish(type: string, payload: unknown): Promise<void>;
   consume(type: string, handler: ActionHandler): Promise<void>;
+  /**
+   * BOTS-9 review round-2 (BLOCKER-3): registers the Zod schema that
+   * defines the *only* fields allowed in `payload` for an action type.
+   * Publishing an action type with no registered schema is rejected, and
+   * publishing with a payload that fails the schema is rejected too —
+   * a raw Telegram Update (or any other unvalidated blob) can therefore
+   * never reach `moderation.pending_operations.request_payload`. The
+   * parsed (normalized) payload is what gets persisted AND published, so
+   * live execution and post-restart recovery use the identical envelope.
+   */
+  registerActionSchema(type: string, schema: z.ZodType): void;
   close(): Promise<void>;
 }
 
@@ -68,6 +79,7 @@ export async function createRabbitMq(
       enabled: false,
       publish: () => Promise.resolve(),
       consume: () => Promise.resolve(),
+      registerActionSchema: () => undefined,
       close: () => Promise.resolve(),
     };
   }
@@ -90,21 +102,36 @@ export async function createRabbitMq(
   await channel.prefetch(config.rabbitMqPrefetch);
   logger.info({ event: 'rabbitmq.connected' });
 
+  // BOTS-9 review round-2 (BLOCKER-3): strict per-action payload schemas.
+  // Publishing an action type with no registered schema (or a payload that
+  // fails its schema) is REJECTED before anything is persisted or sent —
+  // there is no generic `unknown` escape hatch anymore.
+  const actionSchemas = new Map<string, z.ZodType>();
+  const validatePayload = (type: string, payload: unknown): unknown => {
+    const schema = actionSchemas.get(type);
+    if (!schema) {
+      throw new Error(`No payload schema registered for rabbit action type "${type}" — refusing to publish/persist an unvalidated payload (BLOCKER-3)`);
+    }
+    return schema.parse(payload); // normalized: unknown keys stripped, types coerced
+  };
+
   const rawPublish = async (type: string, payload: unknown): Promise<void> => {
-    const envelope = actionEnvelopeSchema.parse({ id: randomUUID(), type, attempt: 0, payload });
+    const normalizedPayload = validatePayload(type, payload);
+    const envelope = actionEnvelopeSchema.parse({ id: randomUUID(), type, attempt: 0, payload: normalizedPayload });
     await publishConfirmed(channel, topology.actionsExchange, topology.routingKey, envelope);
   };
 
   const publishViaOutbox = async (type: string, payload: unknown): Promise<void> => {
     // BOTS-9 review fix (BLOCKER-3): durable intent BEFORE the external
-    // call. The envelope — including its id — is created here and stored in
-    // the write-ahead row, so every retry (this process or a post-restart
-    // recovery) republishes the SAME envelope id and consumers can dedupe
-    // redeliveries. All publish failures here are unconfirmed from our
-    // side (waitForConfirms rejects on channel errors/timeouts too), so
-    // they stay `unknown` and retry with the identical envelope — safe by
-    // construction, no blind non-idempotent replay.
-    const envelope = actionEnvelopeSchema.parse({ id: randomUUID(), type, attempt: 0, payload });
+    // call. The envelope — including its id — is created here from the
+    // NORMALIZED payload (schema-validated, only allowed fields) and stored
+    // in the write-ahead row, so every retry (this process or a
+    // post-restart recovery) republishes the SAME envelope id with the SAME
+    // normalized payload and consumers can dedupe redeliveries. Live and
+    // recovery execution therefore use one identical model — no raw
+    // update can reach the DB, and no divergence between the two paths.
+    const normalizedPayload = validatePayload(type, payload);
+    const envelope = actionEnvelopeSchema.parse({ id: randomUUID(), type, attempt: 0, payload: normalizedPayload });
     const kind = 'rabbitmq.publish';
     const result = await outbox!.execute(
       {
@@ -124,18 +151,33 @@ export async function createRabbitMq(
     }
   };
 
+  // Best-effort post-call audit (DLQ/retry rerouting, outbox-less bootstrap
+  // path): must never break the call's own result — the audit failure is
+  // logged and swallowed here by design (see integrationAudit.ts's note).
+  const auditBestEffort = async (input: Omit<Parameters<typeof recordIntegrationAction>[2], 'outcome'> & { outcome: 'succeeded' | 'failed' | 'unknown' }): Promise<void> => {
+    try {
+      await recordIntegrationAction(audit, logger, input);
+    } catch (error: unknown) {
+      logger.warn({
+        event: 'audit.integration_action.best_effort_failed',
+        details: { integrationId: input.integrationId, action: input.action, targetType: input.targetType, targetId: input.targetId },
+        error: { name: error instanceof Error ? error.name : 'UnknownError', message: error instanceof Error ? error.message : String(error) },
+      });
+    }
+  };
+
   const publish = outbox
     ? publishViaOutbox
     : // Outbox unavailable (early bootstrap/tests) — the pre-BLOCKER-3
-      // direct path, still post-call audited.
+      // direct path, still post-call audited (best-effort).
       async (type: string, payload: unknown): Promise<void> => {
         try {
           await rawPublish(type, payload);
         } catch (error: unknown) {
-          await recordIntegrationAction(audit, logger, { integrationId: 'rabbitmq', action: type, targetType: 'queue', targetId: topology.actionQueue, success: false });
+          await auditBestEffort({ integrationId: 'rabbitmq', action: type, targetType: 'queue', targetId: topology.actionQueue, outcome: 'unknown' });
           throw error;
         }
-        await recordIntegrationAction(audit, logger, { integrationId: 'rabbitmq', action: type, targetType: 'queue', targetId: topology.actionQueue, success: true });
+        await auditBestEffort({ integrationId: 'rabbitmq', action: type, targetType: 'queue', targetId: topology.actionQueue, outcome: 'succeeded' });
       };
 
   // Recovery executor for `rabbitmq.publish` rows found after a restart:
@@ -170,9 +212,9 @@ export async function createRabbitMq(
   const rerouteWithAudit = async (queue: string, envelope: ActionEnvelope, action: string): Promise<void> => {
     try {
       await sendToQueue(queue, envelope);
-      await recordIntegrationAction(audit, logger, { integrationId: 'rabbitmq', action, targetType: 'queue', targetId: queue, success: true });
+      await auditBestEffort({ integrationId: 'rabbitmq', action, targetType: 'queue', targetId: queue, outcome: 'succeeded' });
     } catch (error: unknown) {
-      await recordIntegrationAction(audit, logger, { integrationId: 'rabbitmq', action, targetType: 'queue', targetId: queue, success: false });
+      await auditBestEffort({ integrationId: 'rabbitmq', action, targetType: 'queue', targetId: queue, outcome: 'unknown' });
       throw error;
     }
   };
@@ -182,10 +224,19 @@ export async function createRabbitMq(
     let action: ActionEnvelope;
     try {
       action = actionEnvelopeSchema.parse(JSON.parse(message.content.toString('utf8')));
+      // BOTS-9 review round-2 (BLOCKER-3): inbound payloads for a known
+      // action type are normalized through the SAME registered schema —
+      // an envelope whose payload violates it is treated as invalid.
+      const payloadSchema = actionSchemas.get(action.type);
+      if (payloadSchema) {
+        const parsedPayload = payloadSchema.safeParse(action.payload);
+        if (!parsedPayload.success) throw new Error(`Invalid payload for registered action type "${action.type}"`);
+        action = { ...action, payload: parsedPayload.data };
+      }
     } catch (error: unknown) {
     try {
       await sendToQueue(topology.deadLetterQueue, { id: randomUUID(), type: 'invalid', attempt: 0, payload: { reason: 'invalid_message' } });
-      await recordIntegrationAction(audit, logger, { integrationId: 'rabbitmq', action: 'dlq', targetType: 'queue', targetId: topology.deadLetterQueue, success: true });
+      await auditBestEffort({ integrationId: 'rabbitmq', action: 'dlq', targetType: 'queue', targetId: topology.deadLetterQueue, outcome: 'succeeded' });
       channel.ack(message);
       logger.warn({ event: 'rabbitmq.invalid_to_dlq', error: { name: error instanceof Error ? error.name : 'UnknownError', message: error instanceof Error ? error.message : String(error) } });
     } catch {
@@ -221,6 +272,9 @@ export async function createRabbitMq(
   return {
     enabled: true,
     publish,
+    registerActionSchema(type: string, schema: z.ZodType): void {
+      actionSchemas.set(type, schema);
+    },
     async consume(type: string, handler: ActionHandler): Promise<void> {
       handlers.set(type, handler);
       if (consumerStarted) return;

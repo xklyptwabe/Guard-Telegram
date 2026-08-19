@@ -52,7 +52,13 @@ export function createStorage(
         return { reconciled: true, statusCode: head.$metadata.httpStatusCode };
       } catch (error: unknown) {
         if (error instanceof S3ServiceException && error.$metadata.httpStatusCode === 404) {
-          throw new ConfirmedExternalError('object absent after unrecoverable upload — body is never stored in the outbox', { errorCode: 404 });
+          // Round-2 (HIGH-1): the intent is EXPLICITLY modeled as
+          // non-retryable — the body was never durably staged, so the PUT
+          // cannot be re-executed. The audit record surfaces
+          // `unrecoverable: true` + errorCode so operators can tell
+          // "upload never happened, intent unrecoverable" apart from a
+          // plain failed operation.
+          throw new ConfirmedExternalError('object absent after unrecoverable upload — body is never stored in the outbox', { errorCode: 404, unrecoverable: true, reason: 'put_intent_unrecoverable' });
         }
         throw error;
       }

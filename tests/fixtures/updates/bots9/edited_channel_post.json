@@ -1,0 +1,10 @@
+{
+  "update_id": 200022,
+  "edited_channel_post": {
+    "message_id": 905,
+    "date": 1770001300,
+    "edit_date": 1770001300,
+    "chat": { "id": -1002222222222, "type": "channel", "title": "Fixture Channel" },
+    "text": "channel post without author"
+  }
+}
