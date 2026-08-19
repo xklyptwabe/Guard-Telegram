@@ -1,6 +1,6 @@
-import { timingSafeEqual } from 'node:crypto';
-
 import { z } from 'zod';
+
+import { constantTimeEquals } from '../lib/cryptoEquals.js';
 
 import { PLATFORM_TENANT_SENTINEL } from '../lib/audit/serviceAdapter.js';
 
@@ -45,7 +45,7 @@ export function authenticateBackendApiPrincipal(
 ): BackendApiPrincipal | undefined {
   const token = bearerToken(authorizationHeader);
   if (token === undefined) return undefined;
-  const matched = principals.find((principal) => constantTimeTokenEquals(token, principal.token));
+  const matched = principals.find((principal) => constantTimeEquals(token, principal.token));
   if (matched === undefined) return undefined;
   return {
     actorId: matched.actorId,
@@ -79,9 +79,4 @@ function bearerToken(authorizationHeader: string | readonly string[] | undefined
   return match?.[1];
 }
 
-function constantTimeTokenEquals(actual: string, expected: string): boolean {
-  const actualBuffer = Buffer.from(actual);
-  const expectedBuffer = Buffer.from(expected);
-  if (actualBuffer.length !== expectedBuffer.length) return false;
-  return timingSafeEqual(actualBuffer, expectedBuffer);
-}
+
