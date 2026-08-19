@@ -94,6 +94,16 @@ describe('recordMessageEdited', () => {
     expect(call.result.metadata).toMatchObject({ operation: 'update' });
     expect(call.result.snapshotData).toMatchObject({ editedAt: '2026-05-05T00:00:00.000Z', textLength: 5 });
   });
+
+  it('round-3: infrastructure audit failure is NOT swallowed — throws AuditFinalizationPendingError', async () => {
+    const { AuditFinalizationPendingError } = await import('../../src/lib/moderation/pendingOperationsOutbox.js');
+    const audit = { recordEntityChange: vi.fn(async () => { throw new Error('db down'); }) } as unknown as AuditService;
+    const fixture = loadFixture('edited_message.json');
+    const ctx = { editedMessage: fixture.edited_message } as never;
+    await expect(
+      runWithUpdateContext({ updateId: String(fixture.update_id), chatId: '-1001111111111' }, () => recordMessageEdited(audit, logger(), ctx)),
+    ).rejects.toBeInstanceOf(AuditFinalizationPendingError);
+  });
 });
 
 describe('recordMessageDeleted', () => {

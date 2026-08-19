@@ -133,4 +133,18 @@ describe('recordMemberStatusChanged', () => {
     expect(call.result.after).toMatchObject({ status: 'kicked' }); // ...but keeps the newer, already-known status rather than regressing to "administrator"
     expect(call.result.metadata).toMatchObject({ operation: 'noop', outOfOrder: true });
   });
+
+  it('round-3: infrastructure audit failure is NOT swallowed — throws AuditFinalizationPendingError', async () => {
+    const { AuditFinalizationPendingError } = await import('../../src/lib/moderation/pendingOperationsOutbox.js');
+    const audit = {
+      recordEntityChange: vi.fn(async () => {
+        throw new Error('db down');
+      }),
+    } as unknown as AuditService;
+    const fixture = loadFixture('chat_member.promoted.json');
+    const ctx = { chatMember: fixture.chat_member } as never;
+    await expect(
+      runWithUpdateContext({ updateId: String(fixture.update_id), chatId: '-1001111111111' }, () => recordMemberStatusChanged(audit, logger(), ctx)),
+    ).rejects.toBeInstanceOf(AuditFinalizationPendingError);
+  });
 });

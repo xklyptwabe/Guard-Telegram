@@ -251,4 +251,30 @@ describe('ModerationService', () => {
     expect(db.rows[0]?.auditStatus).toBe('pending'); // the audit is still owed — never 'written'
     expect(testLogger.error).toHaveBeenCalledWith(expect.objectContaining({ event: 'audit.moderation_action.recovered_without_metadata' }));
   });
+
+  it('round-3: mute stores duration_seconds (not a frozen until_date) and recomputes until_date at call time', async () => {
+    const bot = fakeBot();
+    const { audit } = fakeAuditService();
+    const service = new ModerationService(bot as never, audit, outbox, resolvers, logger());
+    const before = Math.floor(Date.now() / 1000);
+    await runWithUpdateContext({ updateId: '1', chatId: '-100111' }, () =>
+      service.restrict({ chatId: '-100111', targetUserId: '2', actorUserId: '9', durationSeconds: 600 }),
+    );
+    expect(db.rows[0]?.requestPayload).toMatchObject({ duration_seconds: 600 });
+    expect(db.rows[0]?.requestPayload).not.toHaveProperty('until_date');
+    const called = bot.api.raw.restrictChatMember.mock.calls[0]?.[0] as { until_date: number };
+    expect(called.until_date).toBeGreaterThanOrEqual(before + 600);
+    expect(called.until_date).toBeLessThanOrEqual(Math.floor(Date.now() / 1000) + 600 + 2);
+  });
+
+  it('round-3: without update context, deleteMessage uses a stable key (no Date.now) so a retry cannot double-fire', async () => {
+    const bot = fakeBot();
+    const { audit } = fakeAuditService();
+    const service = new ModerationService(bot as never, audit, outbox, resolvers, logger());
+    await service.deleteMessage('-100111', '55', '9');
+    await service.deleteMessage('-100111', '55', '9');
+    expect(db.rows).toHaveLength(1);
+    expect(db.rows[0]?.idempotencyKey).toBe('moderation.delete:-100111:55');
+    expect(bot.api.raw.deleteMessage).toHaveBeenCalledTimes(1);
+  });
 });

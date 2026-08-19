@@ -23,7 +23,7 @@ import { Logger } from './lib/logger.js';
 import { ModerationService } from './lib/moderation/moderationService.js';
 import { PendingOperationResolvers, PendingOperationsOutbox } from './lib/moderation/pendingOperationsOutbox.js';
 import { buildOutboxFinalizer, makeIntegrationAuditFinalizer } from './lib/integrations/externalOperationGateway.js';
-import { createRabbitMq } from './lib/rabbitmq.js';
+import { createRabbitMq, registerPlatformRabbitActionSchemas } from './lib/rabbitmq.js';
 import { ReplyService } from './lib/reply.js';
 import { createStorage } from './lib/storage.js';
 import { createModules } from './modules/index.js';
@@ -84,6 +84,7 @@ async function bootstrap(): Promise<void> {
     sharedOutbox = pendingOperationsOutbox;
     storage = createStorage(config, logger, pendingOperationsOutbox, pendingOperationResolvers);
     rabbitMq = await createRabbitMq(config, logger, audit, pendingOperationsOutbox, pendingOperationResolvers);
+    registerPlatformRabbitActionSchemas(rabbitMq);
     const chatSettings = new ChatSettingsService(database.db, audit);
     moderation = new ModerationService(bot, audit, pendingOperationsOutbox, pendingOperationResolvers, logger);
     // One terminal-audit finalizer for every kind: telegram.* → moderation

@@ -17,6 +17,17 @@ const actionEnvelopeSchema = z.object({
   payload: z.unknown(),
 });
 
+/** Built-in payloads the bot itself may publish. Additional types must be registered at bootstrap. */
+export const platformRabbitActionSchemas = {
+  'platform.ping': z.object({ reason: z.string().max(128) }).strict(),
+} as const;
+
+export function registerPlatformRabbitActionSchemas(bridge: { registerActionSchema(type: string, schema: z.ZodType): void }): void {
+  for (const [type, schema] of Object.entries(platformRabbitActionSchemas)) {
+    bridge.registerActionSchema(type, schema);
+  }
+}
+
 type ActionEnvelope = z.infer<typeof actionEnvelopeSchema>;
 export type ActionHandler = (action: ActionEnvelope) => Promise<void>;
 
@@ -146,8 +157,11 @@ export async function createRabbitMq(
         return { messageId: envelope.id };
       },
     );
-    if (result.outcome.status === 'failed') {
-      throw new Error(`RabbitMQ publish failed: ${JSON.stringify(result.outcome.result ?? {})}`);
+    if (result.isFinal && !result.auditFinalized) {
+      throw new Error(`RabbitMQ publish audit is still owed for type ${type}`);
+    }
+    if (result.outcome.status !== 'succeeded') {
+      throw new Error(`RabbitMQ publish ${result.outcome.status}: ${JSON.stringify(result.outcome.result ?? {})}`);
     }
   };
 
@@ -227,12 +241,7 @@ export async function createRabbitMq(
       // BOTS-9 review round-2 (BLOCKER-3): inbound payloads for a known
       // action type are normalized through the SAME registered schema —
       // an envelope whose payload violates it is treated as invalid.
-      const payloadSchema = actionSchemas.get(action.type);
-      if (payloadSchema) {
-        const parsedPayload = payloadSchema.safeParse(action.payload);
-        if (!parsedPayload.success) throw new Error(`Invalid payload for registered action type "${action.type}"`);
-        action = { ...action, payload: parsedPayload.data };
-      }
+      action = { ...action, payload: validatePayload(action.type, action.payload) };
     } catch (error: unknown) {
     try {
       await sendToQueue(topology.deadLetterQueue, { id: randomUUID(), type: 'invalid', attempt: 0, payload: { reason: 'invalid_message' } });

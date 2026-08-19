@@ -1,4 +1,4 @@
-import { createHash, randomUUID } from 'node:crypto';
+import { createHash } from 'node:crypto';
 
 import { HeadObjectCommand, PutObjectCommand, S3Client, S3ServiceException } from '@aws-sdk/client-s3';
 
@@ -79,7 +79,7 @@ export function createStorage(
             // chat-less integration: the pending_operations row lives under
             // the platform pseudo-scope, mirroring audit's tenant sentinel.
             chatId: 'platform',
-            idempotencyKey: `s3.putObject:${key}:${bodyDigest}:${randomUUID()}`,
+            idempotencyKey: `s3.putObject:${key}:${bodyDigest}`,
             requestPayload: { key, contentType, bodyDigest, sizeBytes: body.byteLength },
             metadata: integrationOperationMetadata({ integrationId: 's3', action: 'put', targetType: 'object', targetId: key }),
           },
@@ -98,10 +98,12 @@ export function createStorage(
             }
           },
         );
-        if (result.outcome.status === 'failed') {
-          // Confirmed rejection — surface to the caller exactly as the
-          // pre-outbox implementation did (it rethrew the SDK error).
-          throw new Error(`S3 put failed: ${JSON.stringify(result.outcome.result ?? {})}`);
+        if (result.isFinal && !result.auditFinalized) {
+          throw new Error(`S3 put audit is still owed for key ${key}`);
+        }
+        if (result.outcome.status !== 'succeeded') {
+          // unknown / failed / in-flight retry must NOT look like a successful put.
+          throw new Error(`S3 put ${result.outcome.status}: ${JSON.stringify(result.outcome.result ?? {})}`);
         }
       },
       close: () => {

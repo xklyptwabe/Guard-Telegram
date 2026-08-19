@@ -110,12 +110,11 @@ export class ModerationService {
   }
 
   public async restrict(input: RestrictActionInput): Promise<ModerationOutcome> {
-    const untilDate = Math.floor(Date.now() / 1000) + input.durationSeconds;
     return this.performAndAudit('mute', input, 'telegram.restrictChatMember.mute', {
       chat_id: Number(input.chatId),
       user_id: Number(input.targetUserId),
       permissions: MUTED_PERMISSIONS,
-      until_date: untilDate,
+      duration_seconds: input.durationSeconds,
     });
   }
 
@@ -157,7 +156,7 @@ export class ModerationService {
     const context = getUpdateContext();
     const idempotencyKey = context
       ? `moderation.delete:telegram-update:${context.botId ?? 'unscoped-bot'}:${context.updateId}:${chatId}:${messageId}`
-      : `moderation.delete:${chatId}:${messageId}:${Date.now()}`;
+      : `moderation.delete:${chatId}:${messageId}`;
     const kind = 'telegram.deleteMessage';
     const result = await this.outbox.execute(
       {
@@ -235,11 +234,13 @@ export class ModerationService {
       }
     });
     this.resolvers.register('telegram.restrictChatMember.mute', async (payload) => {
+      const durationSeconds = typeof payload.duration_seconds === 'number' ? payload.duration_seconds : undefined;
+      const untilDate = durationSeconds !== undefined ? Math.floor(Date.now() / 1000) + durationSeconds : (payload.until_date as number);
       await this.bot.api.raw.restrictChatMember({
         chat_id: payload.chat_id as number,
         user_id: payload.user_id as number,
         permissions: payload.permissions as ChatPermissions,
-        until_date: payload.until_date as number,
+        until_date: untilDate,
       });
     });
     this.resolvers.register('telegram.restrictChatMember.unmute', async (payload) => {
@@ -260,9 +261,10 @@ export class ModerationService {
 
   private async dispatch(action: ModerationAction, input: ModerationActionInput, kind: string, requestPayload: Record<string, unknown>) {
     const context = getUpdateContext();
+    const durationKey = typeof requestPayload.duration_seconds === 'number' ? `:${requestPayload.duration_seconds}` : '';
     const idempotencyKey = context
       ? `moderation.action:telegram-update:${context.botId ?? 'unscoped-bot'}:${context.updateId}:${input.chatId}:${input.targetUserId}:${action}`
-      : `moderation.action:${input.chatId}:${input.targetUserId}:${action}:${Date.now()}`;
+      : `moderation.action:${input.chatId}:${input.targetUserId}:${action}${durationKey}`;
     const metadata: Record<string, unknown> = { action, actorUserId: input.actorUserId, targetUserId: input.targetUserId, ...(input.reason !== undefined ? { reason: input.reason } : {}) };
     return this.outbox.execute(
       { kind, chatId: input.chatId, idempotencyKey, requestPayload, metadata },

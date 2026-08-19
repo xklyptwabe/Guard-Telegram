@@ -5,6 +5,7 @@ import { AuditPolicyDisabledError, type AuditService } from '../auditService.js'
 import { getUpdateContext } from '../context.js';
 import type { Logger } from '../logger.js';
 import { normalizeError } from '../logger.js';
+import { AuditFinalizationPendingError } from '../moderation/pendingOperationsOutbox.js';
 import { AuditEventProcessor } from './eventProcessor.js';
 import type { RaiseAuditEventInput } from './eventProcessor.js';
 import { readCurrentSnapshotData } from './entitySnapshotLookup.js';
@@ -158,7 +159,12 @@ export async function recordMessageEdited(audit: AuditService, logger: Logger, c
       },
     );
   } catch (error) {
+    if (error instanceof AuditPolicyDisabledError) {
+      logger.info({ event: 'audit.message_edited.policy_skipped', chatId, details: { messageId } });
+      return;
+    }
     logger.warn({ event: 'audit.message_edited.failed', chatId, details: { messageId }, error: normalizeError(error) });
+    throw new AuditFinalizationPendingError(`message.edited audit for ${chatId}:${messageId} is still owed`);
   }
 }
 

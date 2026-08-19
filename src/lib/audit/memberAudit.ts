@@ -1,9 +1,10 @@
 import type { Context } from 'grammy';
 
-import type { AuditService } from '../auditService.js';
+import { AuditPolicyDisabledError, type AuditService } from '../auditService.js';
 import { getUpdateContext } from '../context.js';
 import type { Logger } from '../logger.js';
 import { normalizeError } from '../logger.js';
+import { AuditFinalizationPendingError } from '../moderation/pendingOperationsOutbox.js';
 import { AuditEventProcessor } from './eventProcessor.js';
 import { readCurrentSnapshotData } from './entitySnapshotLookup.js';
 import { memberStatusSchema } from './shapes.js';
@@ -115,6 +116,11 @@ export async function recordMemberStatusChanged(audit: AuditService, logger: Log
       },
     );
   } catch (error) {
+    if (error instanceof AuditPolicyDisabledError) {
+      logger.info({ event: 'audit.member_status_changed.policy_skipped', chatId });
+      return;
+    }
     logger.warn({ event: 'audit.member_status_changed.failed', chatId, error: normalizeError(error) });
+    throw new AuditFinalizationPendingError(`member.status.changed audit for chat ${chatId} is still owed`);
   }
 }

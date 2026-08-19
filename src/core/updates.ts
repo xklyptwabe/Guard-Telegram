@@ -13,6 +13,7 @@ import { runWithUpdateContext } from '../lib/context.js';
 import type { Logger } from '../lib/logger.js';
 import type { ModuleRegistry } from './registry.js';
 import type { TelegramBotModule } from './contracts.js';
+import { AuditFinalizationPendingError } from '../lib/moderation/pendingOperationsOutbox.js';
 import { UpdateInbox } from './updateInbox.js';
 
 const webhookUpdateSchema = z.object({ update_id: z.number().int() }).passthrough();
@@ -87,14 +88,13 @@ export function registerPlatformMiddleware(bot: Bot<Context>, database: DrizzleD
         }
         if (claim === 'busy') {
           // Live lease elsewhere, inside the backoff window, or attempts
-          // exhausted — do not reprocess now; redelivery (after lease
-          // expiry / backoff) decides. On the webhook transport a
-          // *transient* busy must NOT be confirmed with 200 — the update
-          // is still owed work (round-2 BLOCKER-4).
-          if (transportMode === 'webhook' && busyReason !== 'exhausted') {
+          // exhausted. Transient busy must NEVER look like success: webhook
+          // answers 409; long polling throws so grammy does not advance
+          // getUpdates offset (round-3: default transport is long_polling).
+          if (busyReason !== 'exhausted') {
             throw new UpdateBusyError(updateId, busyReason ?? 'unknown');
           }
-          logger.info({ event: 'update.inbox.busy_skipped', details: { updateId, attemptCount, busyReason } });
+          logger.info({ event: 'update.inbox.busy_skipped', details: { updateId, attemptCount, busyReason, transportMode } });
           return;
         }
         logger.debug({ event: 'update.received' });
@@ -120,6 +120,7 @@ export function registerModuleUpdateHandlers(bot: Bot<Context>, modules: readonl
           try {
             await handler.handle(ctx);
           } catch (error: unknown) {
+            if (error instanceof AuditFinalizationPendingError || (error instanceof Error && error.name === 'AuditFinalizationPendingError')) throw error;
             logger.error({ event: 'module.update_handler.failed', module: module.id, details: { handlerId: handler.id }, error: { name: error instanceof Error ? error.name : 'UnknownError', message: error instanceof Error ? error.message : String(error) } });
           }
         }
@@ -206,8 +207,10 @@ export async function startWebhook(bot: Bot<Context>, config: AppConfig, logger:
       } catch (error: unknown) {
         // Round-2 (BLOCKER-4): busy ≠ 200 — a transiently busy update must
         // be redelivered by Telegram, not confirmed as processed.
-        if (error instanceof UpdateBusyError) {
-          response.writeHead(409).end();
+        if (error instanceof UpdateBusyError || error instanceof AuditFinalizationPendingError) {
+          // Transient: Telegram must redeliver. 503 (not 400) so operators
+          // and future retry filters do not treat this as a malformed update.
+          response.writeHead(error instanceof UpdateBusyError ? 409 : 503).end();
           return;
         }
         logger.error({ event: 'transport.webhook.request_failed', error: { name: error instanceof Error ? error.name : 'UnknownError', message: error instanceof Error ? error.message : String(error) } });
