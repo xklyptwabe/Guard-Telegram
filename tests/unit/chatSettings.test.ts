@@ -10,9 +10,11 @@ function fakeDb(initialLocale: string | undefined) {
     select: () => ({
       from: () => ({
         where: () => ({
-          limit: () => ({
-            for: () => Promise.resolve(locale !== undefined ? [{ locale }] : []),
-          }),
+          limit: () => {
+            const data = locale !== undefined ? [{ locale }] : [];
+            const promise = Promise.resolve(data);
+            return Object.assign(promise, { for: () => promise });
+          },
         }),
       }),
     }),
@@ -33,7 +35,6 @@ function fakeAuditService() {
   const calls: Array<{ input: unknown; result: unknown }> = [];
   const audit = {
     recordEntityChange: vi.fn(async (input: unknown, mutate: (tx: unknown) => Promise<unknown>) => {
-      // ChatSettingsService's mutate reaches into `this.db`/`tx` directly for the actual row write — pass the same fake db object recordEntityChange would give it in production (a drizzle transaction).
       const result = await mutate((audit as unknown as { __tx: unknown }).__tx);
       calls.push({ input, result });
       return { eventId: 'evt-1', subjectSequence: 1, duplicate: false };
@@ -60,7 +61,7 @@ describe('ChatSettingsService.setLocale', () => {
     expect(call.result.metadata).toMatchObject({ operation: 'update' });
   });
 
-  it('uses the schema default ("ru") as before, never fabricating a value, when the chat had no settings row yet', async () => {
+  it('uses not_observed as before when the chat had no settings row — never fabricates a default locale', async () => {
     const { db, tx } = fakeDb(undefined);
     const { audit, calls } = fakeAuditService();
     (audit as unknown as { __tx: unknown }).__tx = tx;
@@ -68,8 +69,10 @@ describe('ChatSettingsService.setLocale', () => {
 
     await runWithUpdateContext({ updateId: '1', chatId: 'chat-1' }, () => service.setLocale('chat-1', 'en'));
 
-    const call = calls[0] as { result: { before?: Record<string, unknown> } };
-    expect(call.result.before).toMatchObject({ locale: 'ru' });
+    const call = calls[0] as { result: { before?: Record<string, unknown>; after?: Record<string, unknown>; beforeSnapshotStatus?: string } };
+    expect(call.result.before).toBeUndefined();
+    expect(call.result.beforeSnapshotStatus).toBe('not_observed');
+    expect(call.result.after).toMatchObject({ locale: 'en' });
   });
 
   it('records operation "noop" when the requested locale is already current', async () => {
