@@ -104,8 +104,10 @@ export const AUDIT_EVENT_DEFINITIONS: AuditEventDefinitions = {
     sparseSnapshotSchema: memberStatusSnapshotSchema,
     // 'observedAt' (Telegram's own `date` for the update) is what makes
     // the out-of-order/staleness guard in memberAudit.ts actually work —
-    // see memberStatusSnapshotSchema's doc comment.
-    allowlist: ['chatId', 'userId', 'status', 'observedAt'],
+    // see memberStatusSnapshotSchema's doc comment. 'observedUpdateId' is
+    // the round-2 equal-timestamp tie-breaker — it must reach the DB or
+    // the guard silently degrades (BOTS-13-style schema-stripping bug).
+    allowlist: ['chatId', 'userId', 'status', 'observedAt', 'observedUpdateId'],
   }),
 
   'bot.membership.changed': defineAuditEvent('bot.membership.changed', {
@@ -118,7 +120,7 @@ export const AUDIT_EVENT_DEFINITIONS: AuditEventDefinitions = {
     canBeDisabled: false,
     snapshotSchema: botMembershipChangedSchema,
     sparseSnapshotSchema: botMembershipSnapshotSchema,
-    allowlist: ['chatId', 'status', 'observedAt', 'rights'],
+    allowlist: ['chatId', 'status', 'observedAt', 'observedUpdateId', 'rights'],
   }),
 
   'moderation.action': defineAuditEvent('moderation.action', {
@@ -147,6 +149,7 @@ export const AUDIT_EVENT_DEFINITIONS: AuditEventDefinitions = {
       'messageId',
       'userId',
       'editedAt',
+      'observedUpdateId',
       'textLength',
       { field: 'text', when: (policy) => policy.allowMessageTextLogging },
     ],
@@ -191,7 +194,7 @@ export const AUDIT_EVENT_DEFINITIONS: AuditEventDefinitions = {
     siteVisible: false,
     canBeDisabled: true,
     snapshotSchema: integrationActionSchema,
-    allowlist: ['integrationId', 'action', 'targetType', 'targetId', 'statusCode', 'success'],
+    allowlist: ['integrationId', 'action', 'targetType', 'targetId', 'statusCode', 'outcome', 'success'],
   }),
 
   'audit.exported': defineAuditEvent('audit.exported', {

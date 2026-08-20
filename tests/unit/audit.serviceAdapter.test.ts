@@ -243,14 +243,14 @@ describe('toDownstreamInput', () => {
       version: 1,
       operation: 'noop',
       before: notApplicable(),
-      after: observed({ integrationId: 'i1', action: 'call', targetType: 'webhook', targetId: 'wh-1', statusCode: 200, success: true }),
+      after: observed({ integrationId: 'i1', action: 'call', targetType: 'webhook', targetId: 'wh-1', statusCode: 200, outcome: 'succeeded', success: true }),
     });
     const recordB = processor.process({
       name: 'integration.action',
       version: 1,
       operation: 'noop',
       before: notApplicable(),
-      after: observed({ integrationId: 'i1', action: 'call', targetType: 'webhook', targetId: 'wh-1', statusCode: 500, success: false }),
+      after: observed({ integrationId: 'i1', action: 'call', targetType: 'webhook', targetId: 'wh-1', statusCode: 500, outcome: 'failed', success: false }),
     });
 
     // Same identity (integrationId/targetId), genuinely different payload

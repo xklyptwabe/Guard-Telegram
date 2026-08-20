@@ -63,8 +63,15 @@ export const pendingOperations = moderationSchema.table(
      * between operation resolution and audit completion leaves 'pending' —
      * the worker's audit-backfill pass then retries the audit (idempotent
      * via the `...:audit` idempotency key) without re-invoking the executor.
+     *
+     * BOTS-9 review round-2 (BLOCKER-1): 'policy_skipped' is the terminal
+     * counterpart of 'written' for a *deliberate* policy decision — the
+     * resolved audit policy disabled the event, so no record is owed and
+     * the backfill pass must stop retrying the row. Only an explicit
+     * `{status:'policy_skipped'}` finalizer result may set it; any
+     * infrastructure failure leaves 'pending'.
      */
-    auditStatus: text('audit_status', { enum: ['pending', 'written'] }).notNull().default('pending'),
+    auditStatus: text('audit_status', { enum: ['pending', 'written', 'policy_skipped'] }).notNull().default('pending'),
     /** Lease pair for the audit-backfill claim — separate from the operation's own worker_id so backfilling a terminal row never looks like an operation retry. */
     auditWorkerId: text('audit_worker_id'),
     auditLeaseExpiresAt: timestamp('audit_lease_expires_at', { withTimezone: true }),

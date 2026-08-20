@@ -21,6 +21,21 @@ export interface TransportController {
   stop(): Promise<void>;
 }
 
+/**
+ * BOTS-9 review round-2 (BLOCKER-4): thrown by the platform middleware when
+ * a webhook-delivered update is busy (live lease held elsewhere, or still
+ * inside its backoff window) — the transport MUST NOT answer 200 for work
+ * that is still owed; Telegram redelivers on a non-2xx. Attempts-exhausted
+ * rows answer 200 (permanently undeliverable — retrying forever would just
+ * loop).
+ */
+export class UpdateBusyError extends Error {
+  public constructor(updateId: string, reason: string) {
+    super(`Update ${updateId} is busy (${reason})`);
+    this.name = 'UpdateBusyError';
+  }
+}
+
 function chatTitle(ctx: Context): string | undefined {
   return ctx.chat && 'title' in ctx.chat ? ctx.chat.title : undefined;
 }
@@ -35,7 +50,7 @@ function messageThreadId(ctx: Context): string | undefined {
   return undefined;
 }
 
-export function registerPlatformMiddleware(bot: Bot<Context>, database: DrizzleDatabase, registry: ModuleRegistry, logger: Logger): void {
+export function registerPlatformMiddleware(bot: Bot<Context>, database: DrizzleDatabase, registry: ModuleRegistry, logger: Logger, transportMode: 'long_polling' | 'webhook' = 'long_polling'): void {
   // BOTS-9 review fix (BLOCKER-5): the old code inserted the
   // processed_updates marker BEFORE `await next()` — any crash or handler
   // exception after that insert permanently lost the update, because
@@ -65,15 +80,21 @@ export function registerPlatformMiddleware(bot: Bot<Context>, database: DrizzleD
               set: { ...(ctx.from.language_code ? { languageCode: ctx.from.language_code } : {}), updatedAt: now },
             });
         }
-        const { claim, attemptCount } = await inbox.begin(String(ctx.me.id), updateId);
+        const { claim, attemptCount, busyReason } = await inbox.begin(String(ctx.me.id), updateId);
         if (claim === 'completed') {
           logger.info({ event: 'update.duplicate_skipped' });
           return;
         }
         if (claim === 'busy') {
-          // Live lease elsewhere or attempts exhausted — do not reprocess
-          // now; redelivery (after lease expiry / backoff) decides.
-          logger.info({ event: 'update.inbox.busy_skipped', details: { updateId, attemptCount } });
+          // Live lease elsewhere, inside the backoff window, or attempts
+          // exhausted — do not reprocess now; redelivery (after lease
+          // expiry / backoff) decides. On the webhook transport a
+          // *transient* busy must NOT be confirmed with 200 — the update
+          // is still owed work (round-2 BLOCKER-4).
+          if (transportMode === 'webhook' && busyReason !== 'exhausted') {
+            throw new UpdateBusyError(updateId, busyReason ?? 'unknown');
+          }
+          logger.info({ event: 'update.inbox.busy_skipped', details: { updateId, attemptCount, busyReason } });
           return;
         }
         logger.debug({ event: 'update.received' });
@@ -183,6 +204,12 @@ export async function startWebhook(bot: Bot<Context>, config: AppConfig, logger:
         await bot.handleUpdate(body);
         response.writeHead(200).end();
       } catch (error: unknown) {
+        // Round-2 (BLOCKER-4): busy ≠ 200 — a transiently busy update must
+        // be redelivered by Telegram, not confirmed as processed.
+        if (error instanceof UpdateBusyError) {
+          response.writeHead(409).end();
+          return;
+        }
         logger.error({ event: 'transport.webhook.request_failed', error: { name: error instanceof Error ? error.name : 'UnknownError', message: error instanceof Error ? error.message : String(error) } });
         response.writeHead(400).end();
       }

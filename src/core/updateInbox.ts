@@ -16,6 +16,9 @@ export type InboxClaim =
   /** Someone else is processing it right now (live lease) or attempts are exhausted — skip, redelivery will retry if allowed. */
   | 'busy';
 
+/** Why a `busy` claim happened — lets the webhook transport decide whether to answer 409 (retry later) or 200 (give up). */
+export type InboxBusyReason = 'lease_held' | 'backoff' | 'exhausted';
+
 /**
  * BOTS-9 review finding (BLOCKER-5): replaces the old insert-marker-before-
  * handlers dedup, which turned any post-insert crash or handler exception
@@ -54,7 +57,7 @@ export class UpdateInbox {
    * Returns the claimed row's attempt count so {@link fail} can schedule
    * the retry backoff without a re-read.
    */
-  public async begin(botId: string, updateId: string): Promise<{ claim: InboxClaim; attemptCount: number }> {
+  public async begin(botId: string, updateId: string): Promise<{ claim: InboxClaim; attemptCount: number; busyReason?: InboxBusyReason }> {
     await this.db
       .insert(processedUpdates)
       .values({ botId, updateId, status: 'received' })
@@ -76,12 +79,18 @@ export class UpdateInbox {
     if (claimed[0]) return { claim: 'claimed', attemptCount: claimed[0].attemptCount };
 
     const [row] = await this.db
-      .select({ status: processedUpdates.status, attemptCount: processedUpdates.attemptCount })
+      .select({ status: processedUpdates.status, attemptCount: processedUpdates.attemptCount, leaseExpiresAt: processedUpdates.leaseExpiresAt })
       .from(processedUpdates)
       .where(and(eq(processedUpdates.botId, botId), eq(processedUpdates.updateId, updateId)))
       .limit(1);
     if (row?.status === 'completed') return { claim: 'completed', attemptCount: row.attemptCount };
-    return { claim: 'busy', attemptCount: row?.attemptCount ?? 0 };
+    // Round-2 (BLOCKER-4): distinguish WHY the claim failed so the webhook
+    // transport can answer 409 (transient — retry later) instead of
+    // confirming a 200 for an update that is still owed work.
+    const leaseHeld = row?.status === 'processing' && row.leaseExpiresAt !== null && new Date(row.leaseExpiresAt) > now;
+    if (leaseHeld) return { claim: 'busy', attemptCount: row?.attemptCount ?? 0, busyReason: 'lease_held' };
+    if ((row?.attemptCount ?? 0) >= this.maxAttempts) return { claim: 'busy', attemptCount: row?.attemptCount ?? 0, busyReason: 'exhausted' };
+    return { claim: 'busy', attemptCount: row?.attemptCount ?? 0, busyReason: 'backoff' };
   }
 
   /** Marks the update fully processed — from this moment redelivery dedups instead of reprocessing. */

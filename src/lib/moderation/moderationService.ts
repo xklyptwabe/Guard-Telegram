@@ -1,15 +1,32 @@
 import type { Bot, Context } from 'grammy';
 import type { ChatPermissions } from '@grammyjs/types';
 
+import { MODULE_IDS } from '../../constants.js';
 import { getUpdateContext } from '../context.js';
 import type { Logger } from '../logger.js';
 import { normalizeError } from '../logger.js';
-import type { AuditService } from '../auditService.js';
+import { AuditPolicyDisabledError, type AuditService } from '../auditService.js';
 import { AuditEventProcessor } from '../audit/eventProcessor.js';
 import { safeDownstreamMutationResult } from '../audit/mutationResult.js';
 import { observed, notApplicable } from '../audit/snapshot.js';
 import { recordMessageDeleted } from '../audit/messageAudit.js';
-import { type AttemptOutcome, type PendingOperationRow, type PendingOperationResolvers, type PendingOperationsOutbox } from './pendingOperationsOutbox.js';
+import { type AttemptOutcome, AuditFinalizationPendingError, type PendingOperationRow, type PendingOperationResolvers, type PendingOperationsOutbox } from './pendingOperationsOutbox.js';
+
+/**
+ * BOTS-9 review round-2 (BLOCKER-4): thrown when a moderation operation
+ * reached a terminal outcome but its mandatory terminal audit record is
+ * still owed (finalizer failed). The caller must propagate this all the way
+ * up so the durable inbox does NOT complete the update — Telegram redelivers
+ * it, the outbox finds the row terminal, and the duplicate branch finishes
+ * the audit idempotently. Policy-skips do NOT reach here (`auditFinalized`
+ * is true for them).
+ */
+export class ModerationAuditPendingError extends AuditFinalizationPendingError {
+  public constructor(rowId: string, kind: string) {
+    super(`Terminal moderation operation ${rowId} (${kind}) resolved but its mandatory audit record is still owed`);
+    this.name = 'ModerationAuditPendingError';
+  }
+}
 
 export type ModerationAction = 'ban' | 'kick' | 'mute' | 'unban' | 'unmute';
 
@@ -156,6 +173,10 @@ export class ModerationService {
       // the worker backfills it later without re-invoking the executor.
       async (row, outcome) => this.auditRecoveredOperation(row, outcome),
     );
+    // BLOCKER-4: a terminal outcome whose mandatory audit is still owed must
+    // fail the update chain (inbox not completed → Telegram redelivers →
+    // duplicate branch finishes the audit).
+    if (result.isFinal && !result.auditFinalized) throw new ModerationAuditPendingError(result.row.id, kind);
     return result.isFinal ? this.toOutcome(result.outcome) : { status: 'unknown', willRetry: true };
   }
 
@@ -170,9 +191,7 @@ export class ModerationService {
    * `startWorker`) for tests and for the very first pass at boot.
    */
   public async recoverPending(): Promise<void> {
-    await this.outbox.recoverPending(async (row, outcome) => {
-      await this.auditRecoveredOperation(row, outcome);
-    });
+    await this.outbox.recoverPending(async (row, outcome) => this.auditRecoveredOperation(row, outcome));
   }
 
   /**
@@ -184,9 +203,7 @@ export class ModerationService {
    * as the process runs. Call `stopWorker()` during graceful shutdown.
    */
   public startWorker(): void {
-    this.outbox.startWorker(async (row, outcome) => {
-      await this.auditRecoveredOperation(row, outcome);
-    });
+    this.outbox.startWorker(async (row, outcome) => this.auditRecoveredOperation(row, outcome));
   }
 
   public stopWorker(): void {
@@ -228,9 +245,17 @@ export class ModerationService {
     this.resolvers.register('telegram.restrictChatMember.unmute', async (payload) => {
       await this.bot.api.raw.restrictChatMember({ chat_id: payload.chat_id as number, user_id: payload.user_id as number, permissions: payload.permissions as ChatPermissions });
     });
-    this.resolvers.register('telegram.deleteMessage', async (payload) => {
-      await this.bot.api.raw.deleteMessage({ chat_id: payload.chat_id as number, message_id: payload.message_id as number });
-    });
+    // BOTS-9 review round-2 (BLOCKER-2): deleteMessage is destructive and
+    // NOT provably idempotent — a re-issued delete on an already-deleted
+    // message returns a confirmed error, misreporting a real success as
+    // failed. Unknown → terminal, never a blind retry.
+    this.resolvers.register(
+      'telegram.deleteMessage',
+      async (payload) => {
+        await this.bot.api.raw.deleteMessage({ chat_id: payload.chat_id as number, message_id: payload.message_id as number });
+      },
+      { retryAfterUnknown: false },
+    );
   }
 
   private async dispatch(action: ModerationAction, input: ModerationActionInput, kind: string, requestPayload: Record<string, unknown>) {
@@ -251,6 +276,8 @@ export class ModerationService {
 
   private async performAndAudit(action: ModerationAction, input: ModerationActionInput, kind: string, requestPayload: Record<string, unknown>): Promise<ModerationOutcome> {
     const result = await this.dispatch(action, input, kind, requestPayload);
+    // BLOCKER-4: same mandatory-audit propagation as deleteMessage.
+    if (result.isFinal && !result.auditFinalized) throw new ModerationAuditPendingError(result.row.id, kind);
     return result.isFinal ? this.toOutcome(result.outcome) : { status: 'unknown', willRetry: true };
   }
 
@@ -259,12 +286,12 @@ export class ModerationService {
   }
 
   /** A row resolving during `recoverPending()` has no live command/actor on the call stack — everything needed comes from what was written ahead in `row.metadata` and `row.chatId`. `telegram.deleteMessage` and the moderation-action kinds need different audit events, so this dispatches on `row.kind`. Public so the shared outbox finalizer router (see core wiring / the integration gateway) can delegate `telegram.*` kinds here. */
-  public async auditRecoveredOperation(row: PendingOperationRow, outcome: AttemptOutcome): Promise<void> {
+  public async auditRecoveredOperation(row: PendingOperationRow, outcome: AttemptOutcome): Promise<{ readonly status: 'recorded' } | { readonly status: 'policy_skipped' }> {
     if (row.kind === 'telegram.deleteMessage') {
       const messageId = String(row.requestPayload.message_id);
       const deletedBy = typeof row.metadata.deletedBy === 'string' ? row.metadata.deletedBy : undefined;
       const knownAuthorUserId = typeof row.metadata.knownAuthorUserId === 'string' ? row.metadata.knownAuthorUserId : undefined;
-      await recordMessageDeleted(this.audit, this.logger, {
+      return recordMessageDeleted(this.audit, this.logger, {
         chatId: row.chatId,
         messageId,
         idempotencyKey: `${row.idempotencyKey}:audit`,
@@ -272,22 +299,26 @@ export class ModerationService {
         ...(deletedBy !== undefined ? { deletedBy } : {}),
         ...(knownAuthorUserId !== undefined ? { knownAuthorUserId } : {}),
       });
-      return;
     }
 
     const action = typeof row.metadata.action === 'string' ? (row.metadata.action as ModerationAction) : undefined;
     const targetUserId = typeof row.metadata.targetUserId === 'string' ? row.metadata.targetUserId : undefined;
     const actorUserId = typeof row.metadata.actorUserId === 'string' ? row.metadata.actorUserId : undefined;
     if (!action || !targetUserId || !actorUserId) {
-      this.logger.warn({ event: 'audit.moderation_action.recovered_without_metadata', chatId: row.chatId, details: { kind: row.kind, id: row.id } });
-      return;
+      // BLOCKER-1: missing audit metadata must NEVER finalize as 'written'.
+      // Throw — the outbox keeps `audit_status='pending'` and the backfill
+      // pass keeps retrying (loudly logged) until an operator fixes or
+      // skips the row. Silent completion with zero events is the exact bug
+      // the review forbids.
+      this.logger.error({ event: 'audit.moderation_action.recovered_without_metadata', chatId: row.chatId, details: { kind: row.kind, id: row.id } });
+      throw new Error(`pending_operations row ${row.id} (${row.kind}) reached terminal state without the audit metadata needed to finalize its record`);
     }
     const reason = typeof row.metadata.reason === 'string' ? row.metadata.reason : undefined;
-    await this.recordModerationAction(action, { chatId: row.chatId, targetUserId, actorUserId, ...(reason !== undefined ? { reason } : {}) }, row.idempotencyKey, outcome);
+    return this.recordModerationAction(action, { chatId: row.chatId, targetUserId, actorUserId, ...(reason !== undefined ? { reason } : {}) }, row.idempotencyKey, outcome);
   }
 
   /** Writes the one-and-only `moderation.action` audit record for this operation. `outcome.status` maps directly onto BOTS-7's `AuditOperation`: a confirmed Telegram-side error is `'failed'`, an unresolved timeout is `'unknown'` — both first-class, not shoehorned into `'update'`. `pendingOperationIdempotencyKey` is the stable key already on the `pending_operations` row — reused (with an `:audit` suffix) rather than re-derived, so this works identically whether called from a live command or from `recoverPending()`. */
-  private async recordModerationAction(action: ModerationAction, input: ModerationActionInput, pendingOperationIdempotencyKey: string, outcome: AttemptOutcome): Promise<void> {
+  private async recordModerationAction(action: ModerationAction, input: ModerationActionInput, pendingOperationIdempotencyKey: string, outcome: AttemptOutcome): Promise<{ readonly status: 'recorded' } | { readonly status: 'policy_skipped' }> {
     const idempotencyKey = `${pendingOperationIdempotencyKey}:audit`;
     const subjectType = 'chat_member_moderation';
     const subjectId = `${input.chatId}:${input.targetUserId}`;
@@ -306,6 +337,11 @@ export class ModerationService {
           idempotencyKey,
           actorId: input.actorUserId,
           actorType: 'telegram_user',
+          // HIGH (round-2): BOTS-9 events must carry the canonical module
+          // identifier explicitly — never derived from whatever fields a
+          // snapshot happens to contain — so BOTS-8 module-level policies
+          // actually apply.
+          moduleId: MODULE_IDS.moderation,
         },
         () => {
           const outcomeResult = outcome.result;
@@ -332,8 +368,17 @@ export class ModerationService {
           return Promise.resolve({ ...mutationResult, metadata: { operation, ...(outcome.result !== undefined ? { result: outcome.result } : {}) } });
         },
       );
+      return { status: 'recorded' };
     } catch (error) {
+      if (error instanceof AuditPolicyDisabledError) {
+        this.logger.info({ event: 'audit.moderation_action.policy_skipped', chatId: input.chatId, details: { action } });
+        return { status: 'policy_skipped' };
+      }
+      // BLOCKER-1/4: infrastructure failure — do NOT swallow. The outbox
+      // keeps `audit_status='pending'` and the caller fails the update
+      // chain so the mandatory record eventually lands.
       this.logger.warn({ event: 'audit.moderation_action.failed', chatId: input.chatId, details: { action }, error: normalizeError(error) });
+      throw error;
     }
   }
 }

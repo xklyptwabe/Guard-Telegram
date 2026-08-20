@@ -5,7 +5,7 @@ import { z } from 'zod';
 import type { TelegramCommandDefinition } from '../../src/core/contracts.js';
 import { CommandDispatcher } from '../../src/core/dispatcher.js';
 import type { ModuleRegistry } from '../../src/core/registry.js';
-import type { AuditService } from '../../src/lib/auditService.js';
+import { AuditPolicyDisabledError, type AuditService } from '../../src/lib/auditService.js';
 import type { Cooldowns } from '../../src/lib/cooldowns.js';
 import { runWithUpdateContext } from '../../src/lib/context.js';
 import type { EventBus } from '../../src/lib/eventBus.js';
@@ -34,10 +34,11 @@ function fakeCommand(overrides: Partial<TelegramCommandDefinition> = {}): Telegr
 }
 
 /** Records every `recordEntityChange` call; never reports a duplicate unless `alwaysDuplicate` is set. */
-function fakeAuditService(options: { alwaysDuplicate?: boolean; throwOnRecord?: boolean } = {}) {
+function fakeAuditService(options: { alwaysDuplicate?: boolean; throwOnRecord?: boolean; policyDisabled?: boolean } = {}) {
   const calls: Array<{ input: unknown; result: unknown }> = [];
   const audit = {
     recordEntityChange: vi.fn(async (input: unknown, mutate: () => Promise<unknown>) => {
+      if (options.policyDisabled) throw new AuditPolicyDisabledError('command.executed', 'v1');
       if (options.throwOnRecord) throw new Error('simulated audit failure');
       if (options.alwaysDuplicate) return { eventId: 'evt-existing', subjectSequence: 1, duplicate: true };
       const result = await mutate();
@@ -133,16 +134,28 @@ describe('CommandDispatcher — command.executed audit wiring', () => {
     expect(logger.warn).toHaveBeenCalledWith(expect.objectContaining({ event: 'audit.command_executed.missing_update_context' }));
   });
 
-  it('swallows an audit-side failure (e.g. policy disabled) without breaking the command flow or the reply', async () => {
+  it('BOTS-9 round-2 BLOCKER-4: a policy-disabled audit is a normal no-op — command flow and reply are unaffected', async () => {
     const command = fakeCommand();
-    const { audit } = fakeAuditService({ throwOnRecord: true });
-    const { dispatcher, reply, logger } = fakeDispatcher(command, audit);
+    const { audit } = fakeAuditService({ policyDisabled: true });
+    const { dispatcher, reply } = fakeDispatcher(command, audit);
     const ctx = fakeCtx(1, 2);
 
     await expect(runWithUpdateContext({ updateId: 'upd-5' }, () => dispatcher.dispatchCommand(ctx, 'test', ''))).resolves.toBeUndefined();
 
     expect(command.execute).toHaveBeenCalled(); // the actual command still ran successfully
     expect(reply.send).not.toHaveBeenCalledWith(ctx, 'common.internalError'); // success path, not the error path
+  });
+
+  it('BOTS-9 round-2 BLOCKER-4/HIGH-8: an INFRASTRUCTURE audit failure propagates so the durable inbox retries until the record lands', async () => {
+    const command = fakeCommand();
+    const { audit } = fakeAuditService({ throwOnRecord: true });
+    const { dispatcher, reply, logger } = fakeDispatcher(command, audit);
+    const ctx = fakeCtx(1, 2);
+
+    await expect(runWithUpdateContext({ updateId: 'upd-5' }, () => dispatcher.dispatchCommand(ctx, 'test', ''))).rejects.toThrow(/still owed/);
+
+    expect(command.execute).toHaveBeenCalled(); // the command itself ran
+    expect(reply.send).not.toHaveBeenCalledWith(ctx, 'common.internalError'); // no misleading error reply — the command succeeded
     expect(logger.warn).toHaveBeenCalledWith(expect.objectContaining({ event: 'audit.command_executed.failed' }));
   });
 

@@ -12,9 +12,10 @@ import { toDownstreamMutationResult } from './serviceAdapter.js';
 
 const auditProcessor = new AuditEventProcessor();
 
-/** Only the fields Telegram's `ChatMemberAdministrator` carries that this schema tracks — see `botAdministratorRightsSchema`'s doc comment for why the rest (custom_title, channel-only fields) are excluded. */
+/** Only the fields Telegram's `ChatMemberAdministrator` carries that this schema tracks — see `botAdministratorRightsSchema`'s doc comment. */
 interface RawChatMember {
   readonly status?: string;
+  readonly is_anonymous?: boolean;
   readonly can_manage_chat?: boolean;
   readonly can_delete_messages?: boolean;
   readonly can_manage_video_chats?: boolean;
@@ -24,9 +25,16 @@ interface RawChatMember {
   readonly can_invite_users?: boolean;
   readonly can_pin_messages?: boolean;
   readonly can_manage_topics?: boolean;
+  readonly can_post_stories?: boolean;
+  readonly can_edit_stories?: boolean;
+  readonly can_delete_stories?: boolean;
+  readonly can_post_messages?: boolean;
+  readonly can_edit_messages?: boolean;
+  readonly can_manage_direct_messages?: boolean;
+  readonly can_manage_tags?: boolean;
 }
 
-/** BOTS-9 review fix (HIGH-2): extracts the bot's own admin rights when it holds them — undefined for any non-administrator status, matching the schema's `rights` field being optional. */
+/** BOTS-9 review fix (HIGH-2): extracts the bot's own admin rights when it holds them — undefined for any non-administrator status, matching the schema's `rights` field being optional. Round-2 (HIGH-4): full `ChatMemberAdministrator` coverage — each optional field is only included when Telegram actually sent it. */
 function extractRights(member: RawChatMember | undefined): BotAdministratorRights | undefined {
   if (!member || member.status !== 'administrator') return undefined;
   const parsed = botAdministratorRightsSchema.safeParse({
@@ -39,6 +47,14 @@ function extractRights(member: RawChatMember | undefined): BotAdministratorRight
     canInviteUsers: member.can_invite_users,
     ...(member.can_pin_messages !== undefined ? { canPinMessages: member.can_pin_messages } : {}),
     ...(member.can_manage_topics !== undefined ? { canManageTopics: member.can_manage_topics } : {}),
+    ...(member.is_anonymous !== undefined ? { isAnonymous: member.is_anonymous } : {}),
+    ...(member.can_post_stories !== undefined ? { canPostStories: member.can_post_stories } : {}),
+    ...(member.can_edit_stories !== undefined ? { canEditStories: member.can_edit_stories } : {}),
+    ...(member.can_delete_stories !== undefined ? { canDeleteStories: member.can_delete_stories } : {}),
+    ...(member.can_post_messages !== undefined ? { canPostMessages: member.can_post_messages } : {}),
+    ...(member.can_edit_messages !== undefined ? { canEditMessages: member.can_edit_messages } : {}),
+    ...(member.can_manage_direct_messages !== undefined ? { canManageDirectMessages: member.can_manage_direct_messages } : {}),
+    ...(member.can_manage_tags !== undefined ? { canManageTags: member.can_manage_tags } : {}),
   });
   return parsed.success ? parsed.data : undefined;
 }
@@ -109,12 +125,22 @@ export async function recordBotMembershipChanged(audit: AuditService, logger: Lo
         ...(actorId !== undefined ? { actorId, actorType: 'telegram_user' } : {}),
       },
       async (tx) => {
-        const current = (await readCurrentSnapshotData(tx, chatId, subjectType, subjectId)) as { status?: string; rights?: BotAdministratorRights; observedAt?: string } | undefined;
-        const isStale = current?.observedAt !== undefined && current.observedAt > observedAt;
+        const current = (await readCurrentSnapshotData(tx, chatId, subjectType, subjectId)) as { status?: string; rights?: BotAdministratorRights; observedAt?: string; observedUpdateId?: number } | undefined;
+        // Round-2 (HIGH): update.date has second precision — two updates in
+        // the same second are common (ban+unban), and a plain `>` lets the
+        // second one overwrite the first as if newer. Telegram's update_id
+        // is strictly increasing, so it is the tie-breaker; if the order is
+        // genuinely undecidable the snapshot is NOT overwritten.
+        const rawIncomingUpdateId = updateContext.updateId !== undefined ? Number(updateContext.updateId) : 0;
+        const incomingUpdateId = Number.isFinite(rawIncomingUpdateId) ? rawIncomingUpdateId : 0;
+        const isStale =
+          current?.observedAt !== undefined &&
+          (current.observedAt > observedAt || (current.observedAt === observedAt && (current.observedUpdateId ?? 0) >= incomingUpdateId));
 
         const afterStatus = isStale && current?.status !== undefined ? current.status : newStatusParsed.data;
         const afterRights = isStale ? current?.rights : newRights;
         const effectiveObservedAt = isStale && current?.observedAt !== undefined ? current.observedAt : observedAt;
+        const effectiveObservedUpdateId = isStale ? (current?.observedUpdateId ?? incomingUpdateId) : incomingUpdateId;
         const statusChanged = oldStatusParsed.success ? oldStatusParsed.data !== afterStatus : true;
         const rightsChanged = !rightsEqual(oldRights, afterRights);
         const operation = isStale ? 'noop' : statusChanged || rightsChanged ? 'update' : 'noop';
@@ -134,7 +160,7 @@ export async function recordBotMembershipChanged(audit: AuditService, logger: Lo
           ...mutationResult,
           metadata: { operation, ...(isStale ? { outOfOrder: true } : {}) },
           snapshotStatus: mutationResult.snapshotStatus,
-          snapshotData: { ...mutationResult.snapshotData, observedAt: effectiveObservedAt },
+          snapshotData: { ...mutationResult.snapshotData, observedAt: effectiveObservedAt, observedUpdateId: effectiveObservedUpdateId },
         };
       },
     );

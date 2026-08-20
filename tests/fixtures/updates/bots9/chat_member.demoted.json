@@ -1,0 +1,16 @@
+{
+  "update_id": 200005,
+  "chat_member": {
+    "chat": { "id": -1001111111111, "type": "supergroup", "title": "Fixture Chat" },
+    "from": { "id": 999999, "is_bot": false, "first_name": "Owner", "username": "owner" },
+    "date": 1770000600,
+    "old_chat_member": {
+      "status": "administrator",
+      "user": { "id": 666666, "is_bot": false, "first_name": "Frank" },
+      "can_manage_chat": true,
+      "can_delete_messages": true,
+      "is_anonymous": false
+    },
+    "new_chat_member": { "status": "member", "user": { "id": 666666, "is_bot": false, "first_name": "Frank" } }
+  }
+}

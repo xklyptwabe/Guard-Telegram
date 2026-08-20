@@ -114,8 +114,8 @@ describe.skipIf(!testDatabaseUrl)('BOTS-9 blockers: real-DB verification', () =>
 
     const workerA = new PendingOperationsOutbox(client.db, silentLogger(), resolvers);
     const workerB = new PendingOperationsOutbox(client.db, silentLogger(), resolvers);
-    const onFinalA = vi.fn(async () => undefined);
-    const onFinalB = vi.fn(async () => undefined);
+    const onFinalA = vi.fn(async () => ({ status: 'recorded' as const }));
+    const onFinalB = vi.fn(async () => ({ status: 'recorded' as const }));
 
     // Both sweeps start before either executor finishes — the gated
     // executor guarantees real overlap against the same row.
@@ -307,7 +307,7 @@ describe.skipIf(!testDatabaseUrl)('BOTS-9 blockers: real-DB verification', () =>
     expect(row?.status).toBe('succeeded');
     expect(row?.auditStatus).toBe('pending');
 
-    const working = vi.fn(async () => undefined);
+    const working = vi.fn(async () => ({ status: 'recorded' as const }));
     await outbox.recoverPending(working);
     [row] = await client.db.select().from(pendingOperations).where(eq(pendingOperations.idempotencyKey, 'bots9-h3-1'));
     expect(row?.auditStatus).toBe('written');

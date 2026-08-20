@@ -96,26 +96,26 @@ describe('integration write-ahead gateway (BOTS-9 review BLOCKER-3)', () => {
     expect(calls[0]?.input.idempotencyKey).toBe('rabbitmq.publish:env-1:audit');
     expect(db.rows[0]?.auditStatus).toBe('written');
 
-    // Redelivery of the same logical publish: executor NOT re-run, and even
-    // though execute() re-invokes the finalizer, the audit layer's
-    // idempotency key collapses it to the same single event.
+    // Redelivery of the same logical publish: executor NOT re-run. The row
+    // is already marked audit_status='written', so (round-2 retention
+    // tombstone) the finalizer is NOT re-invoked at all — an audit event
+    // that once existed must never be resurrected after retention purges it.
     await outbox.execute(
       { kind: 'rabbitmq.publish', chatId: 'platform', idempotencyKey: 'rabbitmq.publish:env-1', requestPayload: {}, metadata: {} },
       vi.fn(),
       finalizer,
     );
-    expect(calls).toHaveLength(2); // finalizer re-invoked…
-    expect(calls[1]?.input.idempotencyKey).toBe('rabbitmq.publish:env-1:audit'); // …with the SAME stable key
+    expect(calls).toHaveLength(1); // tombstone — no re-finalization
   });
 
   it('buildOutboxFinalizer routes telegram.* to ModerationService and everything else to the integration finalizer', async () => {
-    const moderationAudit = vi.fn(async () => undefined);
+    const moderationAudit = vi.fn(async () => ({ status: 'recorded' as const }));
     const moderation = { auditRecoveredOperation: moderationAudit } as unknown as ModerationService;
-    const integration: PendingOperationFinalizer = vi.fn(async () => undefined);
+    const integration: PendingOperationFinalizer = vi.fn(async () => ({ status: 'recorded' as const }));
     const finalizer = buildOutboxFinalizer(moderation, integration);
 
-    const telegramRow = { id: 'r1', kind: 'telegram.banChatMember', chatId: 'c', requestPayload: {}, metadata: {}, idempotencyKey: 'k1', status: 'succeeded' as const, attemptCount: 1, result: null };
-    const s3Row = { id: 'r2', kind: 's3.putObject', chatId: 'platform', requestPayload: {}, metadata: {}, idempotencyKey: 'k2', status: 'succeeded' as const, attemptCount: 1, result: null };
+    const telegramRow = { id: 'r1', kind: 'telegram.banChatMember', chatId: 'c', requestPayload: {}, metadata: {}, idempotencyKey: 'k1', status: 'succeeded' as const, attemptCount: 1, result: null, auditStatus: 'pending' };
+    const s3Row = { id: 'r2', kind: 's3.putObject', chatId: 'platform', requestPayload: {}, metadata: {}, idempotencyKey: 'k2', status: 'succeeded' as const, attemptCount: 1, result: null, auditStatus: 'pending' };
     const outcome = { status: 'succeeded' as const };
 
     await finalizer(telegramRow, outcome);

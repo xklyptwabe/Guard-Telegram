@@ -48,9 +48,11 @@ async function bootstrap(): Promise<void> {
     shuttingDown = true;
     logger.info({ event: 'shutdown.started', details: { signal } });
     // BOTS-9 review fix (BLOCKER-2): stop the outbox's persistent poll
-    // loop before closing the database pool it depends on — synchronous,
-    // so no need for Promise.allSettled here.
-    sharedOutbox?.stopWorker();
+    // loop AND drain the sweep already in flight before closing the
+    // database pool it depends on (round-2 MEDIUM: stopWorker alone could
+    // return while a sweep was mid-finalize, stranding rows and re-running
+    // the whole operation after restart).
+    await sharedOutbox?.stopAndDrain();
     const closers = [transport?.stop(), backendApi?.stop(), rabbitMq?.close(), redis?.close(), storage?.close(), database.close()].filter(
       (operation): operation is Promise<void> => operation !== undefined,
     );
@@ -94,7 +96,7 @@ async function bootstrap(): Promise<void> {
     const registry = new ModuleRegistry(modules, database.db, audit, events, logger);
     const reply = new ReplyService(config, logger);
     const dispatcher = new CommandDispatcher(collectCommands(modules), registry, new Cooldowns(), reply, events, i18n, logger, audit);
-    registerPlatformMiddleware(bot, database.db, registry, logger);
+    registerPlatformMiddleware(bot, database.db, registry, logger, config.telegramTransport);
     registerBotMembershipAudit(bot, audit, logger);
     registerModuleUpdateHandlers(bot, modules, registry, logger);
     await registerCommands(bot, modules, dispatcher, i18n, logger);

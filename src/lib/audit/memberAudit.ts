@@ -16,6 +16,8 @@ interface MemberSnapshotData {
   readonly status: string;
   /** Telegram's own `date` (unix seconds) for the update that produced this status — used to detect out-of-order redelivery. */
   readonly observedAt: string;
+  /** Round-2 (HIGH): strictly-increasing update_id — tie-breaker when two updates share the same second. */
+  readonly observedUpdateId?: number;
 }
 
 /**
@@ -74,10 +76,23 @@ export async function recordMemberStatusChanged(audit: AuditService, logger: Log
       },
       async (tx) => {
         const current = (await readCurrentSnapshotData(tx, chatId, subjectType, subjectId)) as Partial<MemberSnapshotData> | undefined;
-        const isStale = current?.observedAt !== undefined && current.observedAt > observedAt;
+        // Round-2 (HIGH): update.date has second precision — two updates in
+        // the same second must not let the later-arriving one clobber the
+        // earlier one as if newer. update_id (strictly increasing per bot)
+        // is the tie-breaker; when undecidable, the snapshot is NOT
+        // overwritten.
+        // Some tests/consumers use non-numeric update ids — NaN would fail
+        // the snapshot schema, so coerce unparseable ids to 0 (an unknown
+        // order marker never wins a tie-break).
+        const rawIncomingUpdateId = updateContext.updateId !== undefined ? Number(updateContext.updateId) : 0;
+        const incomingUpdateId = Number.isFinite(rawIncomingUpdateId) ? rawIncomingUpdateId : 0;
+        const isStale =
+          current?.observedAt !== undefined &&
+          (current.observedAt > observedAt || (current.observedAt === observedAt && (current.observedUpdateId ?? 0) >= incomingUpdateId));
 
         const afterStatus = isStale && current?.status !== undefined ? current.status : newStatusParsed.data;
         const effectiveObservedAt = isStale && current?.observedAt !== undefined ? current.observedAt : observedAt;
+        const effectiveObservedUpdateId = isStale ? (current?.observedUpdateId ?? incomingUpdateId) : incomingUpdateId;
         const operation = isStale ? 'noop' : oldStatusParsed.success && oldStatusParsed.data === afterStatus ? 'noop' : 'update';
 
         const record = auditProcessor.process({
@@ -95,7 +110,7 @@ export async function recordMemberStatusChanged(audit: AuditService, logger: Log
           ...mutationResult,
           metadata: { operation, ...(isStale ? { outOfOrder: true } : {}) },
           snapshotStatus: mutationResult.snapshotStatus,
-          snapshotData: { ...mutationResult.snapshotData, observedAt: effectiveObservedAt },
+          snapshotData: { ...mutationResult.snapshotData, observedAt: effectiveObservedAt, observedUpdateId: effectiveObservedUpdateId },
         };
       },
     );

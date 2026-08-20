@@ -223,19 +223,20 @@ describe('ModerationService', () => {
     expect(call.result.after).toMatchObject({ action: 'ban', targetUserId: '2', reason: 'spam' });
   });
 
-  it('recoverPending(): logs a warning and skips auditing when a recovered row is missing the metadata needed to reconstruct the record', async () => {
+  it('BOTS-9 round-2 BLOCKER-1: a recovered row missing audit metadata NEVER finalizes as written — the finalizer throws, audit_status stays pending, nothing is recorded', async () => {
     db.rows.push({
       id: 'row-2',
       kind: 'telegram.banChatMember',
       chatId: '-100111',
       requestPayload: { chat_id: -100111, user_id: 2 },
-      metadata: {}, // nothing written ahead — should never happen via ModerationService itself, but must not crash recovery
+      metadata: {}, // nothing written ahead — must not silently finalize as 'written'
       idempotencyKey: 'k-broken',
       status: 'pending',
       attemptCount: 0,
       lastAttemptAt: null,
       nextAttemptAt: null,
       result: null,
+      auditStatus: 'pending',
       createdAt: new Date(),
       updatedAt: new Date(),
     });
@@ -246,7 +247,8 @@ describe('ModerationService', () => {
 
     await service.recoverPending();
 
-    expect(calls).toHaveLength(0);
-    expect(testLogger.warn).toHaveBeenCalledWith(expect.objectContaining({ event: 'audit.moderation_action.recovered_without_metadata' }));
+    expect(calls).toHaveLength(0); // no audit event was fabricated
+    expect(db.rows[0]?.auditStatus).toBe('pending'); // the audit is still owed — never 'written'
+    expect(testLogger.error).toHaveBeenCalledWith(expect.objectContaining({ event: 'audit.moderation_action.recovered_without_metadata' }));
   });
 });
