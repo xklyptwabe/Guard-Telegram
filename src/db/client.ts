@@ -75,6 +75,14 @@ function createDatabaseClient(
   pool.on('error', (error: Error) => {
     logger?.error({ event: 'database.pool.idle_client_error', error: { name: error.name, message: error.message } });
   });
+  // A live checkout also emits 'error' when postmaster dies (57P01). Unhandled
+  // that becomes an uncaughtException — vitest exit 1 / process crash — even
+  // after the query promise already rejected.
+  pool.on('connect', (client) => {
+    client.on('error', (error: Error) => {
+      logger?.error({ event: 'database.client.connection_error', error: { name: error.name, message: error.message } });
+    });
+  });
   return {
     pool,
     db: drizzle(pool, { schema }),
