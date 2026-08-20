@@ -59,6 +59,7 @@ describe('PendingOperationsOutbox', () => {
 
   it('an unconfirmed error (timeout/network) is "unknown", not "failed", and is not final while retries remain', async () => {
     const outbox = new PendingOperationsOutbox(db as never, logger(), resolvers, 5, 10);
+    resolvers.register('telegram.banChatMember', async () => undefined, { retryAfterUnknown: true });
     const executor = vi.fn(async () => {
       throw new Error('socket hang up');
     });
@@ -246,6 +247,7 @@ describe('PendingOperationsOutbox', () => {
 
   it('a non-final `unknown` with a future next_attempt_at is NOT re-claimed by the worker before its backoff elapses', async () => {
     const outbox = new PendingOperationsOutbox(db as never, logger(), resolvers);
+    resolvers.register('telegram.banChatMember', async () => undefined, { retryAfterUnknown: true });
     const executor = vi.fn(async () => {
       throw new Error('socket hang up');
     });
@@ -342,6 +344,7 @@ describe('PendingOperationsOutbox', () => {
 
   it('BLOCKER-2: a retryable kind still retries after unknown (ban/unban semantics)', async () => {
     const outbox = new PendingOperationsOutbox(db as never, logger(), resolvers);
+    resolvers.register('telegram.banChatMember', async () => undefined, { retryAfterUnknown: true });
     const executor = vi.fn(async () => {
       throw new Error('socket hang up');
     });
@@ -374,6 +377,7 @@ describe('PendingOperationsOutbox', () => {
   });
 
   it('auditFinalized is true for interim (non-final) outcomes — nothing owed yet', async () => {
+    resolvers.register('telegram.banChatMember', async () => undefined, { retryAfterUnknown: true });
     const outbox = new PendingOperationsOutbox(db as never, logger(), resolvers, 3, 10);
     const executor = vi.fn(async () => {
       throw new Error('socket hang up');

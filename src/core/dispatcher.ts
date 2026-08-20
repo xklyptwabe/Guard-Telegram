@@ -92,6 +92,7 @@ export class CommandDispatcher {
     if (!command || !identity) return;
     const t = this.translator(ctx);
     const startedAt = Date.now();
+    const cooldownKey = `${identity.chatId}:${identity.userId}:${command.id}`;
     try {
       if (!(await this.registry.isEnabled(identity.chatId, command.moduleId))) {
         this.logger.warn({ event: 'command.feature_disabled', module: command.moduleId, chatId: identity.chatId, userId: identity.userId, commandName });
@@ -103,7 +104,7 @@ export class CommandDispatcher {
         await this.reply.send(ctx, t('common.permissionDenied'));
         return;
       }
-      if (!this.cooldowns.take(`${identity.chatId}:${identity.userId}:${command.id}`, command.cooldownMs)) {
+      if (!this.cooldowns.take(cooldownKey, command.cooldownMs)) {
         this.logger.warn({ event: 'command.cooldown_denied', module: command.moduleId, chatId: identity.chatId, userId: identity.userId, commandName });
         await this.reply.send(ctx, t('common.cooldown'));
         return;
@@ -139,7 +140,10 @@ export class CommandDispatcher {
       // event, do NOT swallow — rethrow so the durable inbox fails the
       // update and Telegram redelivers it, which completes the audit
       // idempotently.
-      if (error instanceof AuditFinalizationPendingError) throw error;
+      if (error instanceof AuditFinalizationPendingError) {
+        this.cooldowns.release(cooldownKey);
+        throw error;
+      }
       this.logger.error({ event: 'command.failed', module: command.moduleId, chatId: identity.chatId, userId: identity.userId, commandName, error: { name: error instanceof Error ? error.name : 'UnknownError', message: error instanceof Error ? error.message : String(error) } });
       // The failure record is best-effort: if auditing is down, the
       // command's own error handling must still complete.

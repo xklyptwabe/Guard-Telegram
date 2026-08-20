@@ -129,6 +129,11 @@ export class AuditFinalizationPendingError extends Error {
   }
 }
 
+export function isAuditPendingError(error: unknown): boolean {
+  if (error instanceof AuditFinalizationPendingError) return true;
+  return error instanceof Error && (error.name === 'AuditFinalizationPendingError' || error.name.endsWith('AuditPendingError'));
+}
+
 /**
  * BOTS-9 review finding (BLOCKER-3): the confirmed-vs-unknown
  * classification must not be Telegram-specific — an S3 4xx/5xx *response*
@@ -196,7 +201,7 @@ export class PendingOperationResolvers {
 
   /** Whether an `unknown` outcome for this kind may schedule a blind retry. Unknown kinds default to safe (true) for forward compatibility. */
   public retryAfterUnknown(kind: string): boolean {
-    return this.resolvers.get(kind)?.retryAfterUnknown ?? true;
+    return this.resolvers.get(kind)?.retryAfterUnknown ?? false;
   }
 }
 

@@ -10,6 +10,11 @@ export async function hasPermission(ctx: Context, permission: ModulePermission):
   // (outbox noise, false sense of moderation). Admin commands require a
   // real group/supergroup/channel membership check.
   if (ctx.chat.type === 'private') return false;
-  const member = await ctx.api.getChatMember(ctx.chat.id, ctx.from.id);
-  return member.status === 'administrator' || member.status === 'creator';
+  try {
+    const member = await ctx.api.getChatMember(ctx.chat.id, ctx.from.id);
+    return member.status === 'administrator' || member.status === 'creator';
+  } catch {
+    // Fail closed: a Telegram/network blip is not admin rights.
+    return false;
+  }
 }

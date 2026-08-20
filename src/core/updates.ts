@@ -13,7 +13,7 @@ import { constantTimeEquals } from '../lib/cryptoEquals.js';
 import type { Logger } from '../lib/logger.js';
 import type { ModuleRegistry } from './registry.js';
 import type { TelegramBotModule } from './contracts.js';
-import { AuditFinalizationPendingError } from '../lib/moderation/pendingOperationsOutbox.js';
+import { AuditFinalizationPendingError, isAuditPendingError } from '../lib/moderation/pendingOperationsOutbox.js';
 import { UpdateInbox } from './updateInbox.js';
 
 const webhookUpdateSchema = z.object({ update_id: z.number().int() }).passthrough();
@@ -34,6 +34,13 @@ export class UpdateBusyError extends Error {
   }
 }
 
+export class UpdateExhaustedError extends Error {
+  public constructor(updateId: string) {
+    super(`Update ${updateId} exhausted inbox attempts`);
+    this.name = 'UpdateExhaustedError';
+  }
+}
+
 /** grammY wraps every middleware throw in BotError — HTTP layer must unwrap. */
 export function unwrapMiddlewareError(error: unknown): unknown {
   return error instanceof BotError ? error.error : error;
@@ -43,17 +50,24 @@ export function isTransientUpdateError(error: unknown): boolean {
   const cause = unwrapMiddlewareError(error);
   return (
     cause instanceof UpdateBusyError ||
-    cause instanceof AuditFinalizationPendingError ||
-    (cause instanceof Error && (cause.name === 'UpdateBusyError' || cause.name === 'AuditFinalizationPendingError'))
+    (cause instanceof Error && cause.name === 'UpdateBusyError') ||
+    isAuditPendingError(cause)
   );
+}
+
+export function isExhaustedUpdateError(error: unknown): boolean {
+  const cause = unwrapMiddlewareError(error);
+  return cause instanceof UpdateExhaustedError || (cause instanceof Error && cause.name === 'UpdateExhaustedError');
 }
 
 /** HTTP status for a failed webhook handleUpdate. Never 200 for owed work. */
 export function webhookStatusForError(error: unknown): 409 | 503 | 400 {
   const cause = unwrapMiddlewareError(error);
   if (cause instanceof UpdateBusyError || (cause instanceof Error && cause.name === 'UpdateBusyError')) return 409;
-  if (cause instanceof AuditFinalizationPendingError || (cause instanceof Error && cause.name === 'AuditFinalizationPendingError')) return 503;
-  return 400;
+  if (isAuditPendingError(cause) || isExhaustedUpdateError(cause)) return 503;
+  if (cause instanceof SyntaxError) return 400;
+  if (cause instanceof z.ZodError) return 400;
+  return 503;
 }
 
 function chatTitle(ctx: Context): string | undefined {
@@ -98,16 +112,17 @@ export function registerPlatformMiddleware(bot: Bot<Context>, database: DrizzleD
           return;
         }
         if (claim === 'busy') {
-          if (busyReason !== 'exhausted') {
-            throw new UpdateBusyError(updateId, busyReason ?? 'unknown');
+          if (busyReason === 'exhausted') {
+            logger.error({ event: 'update.inbox.exhausted', details: { updateId, attemptCount, transportMode } });
+            throw new UpdateExhaustedError(updateId);
           }
-          logger.info({ event: 'update.inbox.busy_skipped', details: { updateId, attemptCount, busyReason, transportMode } });
-          return;
+          throw new UpdateBusyError(updateId, busyReason ?? 'unknown');
         }
         logger.debug({ event: 'update.received' });
         try {
           await next();
-          await inbox.complete(String(ctx.me.id), updateId);
+          const completed = await inbox.complete(String(ctx.me.id), updateId);
+          if (!completed) throw new UpdateBusyError(updateId, 'lease_lost');
         } catch (error: unknown) {
           await inbox.fail(String(ctx.me.id), updateId, attemptCount, error);
           throw error;
@@ -127,8 +142,8 @@ export function registerModuleUpdateHandlers(bot: Bot<Context>, modules: readonl
           try {
             await handler.handle(ctx);
           } catch (error: unknown) {
-            if (error instanceof AuditFinalizationPendingError || (error instanceof Error && error.name === 'AuditFinalizationPendingError')) throw error;
             logger.error({ event: 'module.update_handler.failed', module: module.id, details: { handlerId: handler.id }, error: { name: error instanceof Error ? error.name : 'UnknownError', message: error instanceof Error ? error.message : String(error) } });
+            throw error;
           }
         }
       }
@@ -167,13 +182,30 @@ export function startLongPolling(bot: Bot<Context>, config: Pick<AppConfig, 'tel
             await bot.handleUpdate(update);
             offset = update.update_id + 1;
           } catch (error: unknown) {
-            logger.warn({
-              event: isTransientUpdateError(error) ? 'transport.long_polling.will_retry' : 'transport.long_polling.update_failed',
+            if (isExhaustedUpdateError(error)) {
+              logger.error({
+                event: 'transport.long_polling.exhausted_skip',
+                details: { updateId: update.update_id, offset },
+                error: { name: error instanceof Error ? error.name : 'UnknownError', message: error instanceof Error ? error.message : String(error) },
+              });
+              offset = update.update_id + 1;
+              continue;
+            }
+            if (isTransientUpdateError(error)) {
+              logger.warn({
+                event: 'transport.long_polling.will_retry',
+                details: { updateId: update.update_id, offset },
+                error: { name: error instanceof Error ? error.name : 'UnknownError', message: error instanceof Error ? error.message : String(error) },
+              });
+              await sleep(500, abort.signal);
+              break;
+            }
+            logger.error({
+              event: 'transport.long_polling.poison_skip',
               details: { updateId: update.update_id, offset },
               error: { name: error instanceof Error ? error.name : 'UnknownError', message: error instanceof Error ? error.message : String(error) },
             });
-            await sleep(500, abort.signal);
-            break;
+            offset = update.update_id + 1;
           }
         }
       } catch (error: unknown) {

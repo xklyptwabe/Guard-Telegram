@@ -55,6 +55,42 @@ describe('startLongPolling offset (round-5)', () => {
     expect(offsets[1]).toBe(0);
     expect(bot.handleUpdate).toHaveBeenCalledTimes(1);
   });
+
+  it('advances offset on a non-transient handler error so one poison update cannot stall the queue', async () => {
+    const offsets: number[] = [];
+    let releaseSecond: (() => void) | undefined;
+    const secondFetch = new Promise<void>((resolve) => {
+      releaseSecond = resolve;
+    });
+
+    const bot = {
+      api: {
+        getUpdates: vi.fn(async (args: { offset: number }, signal?: AbortSignal) => {
+          offsets.push(args.offset);
+          if (offsets.length === 1) return [{ update_id: 10 }, { update_id: 11 }];
+          releaseSecond?.();
+          await new Promise<void>((_resolve, reject) => {
+            if (signal?.aborted) {
+              reject(new Error('aborted'));
+              return;
+            }
+            signal?.addEventListener('abort', () => reject(new Error('aborted')), { once: true });
+          });
+          return [];
+        }),
+      },
+      handleUpdate: vi.fn(async (update: { update_id: number }) => {
+        if (update.update_id === 10) throw new Error('programmer bug');
+      }),
+    };
+
+    const transport = startLongPolling(bot as never, { telegramAllowedUpdates: ['message'], telegramRunnerConcurrency: 1 }, logger());
+    await secondFetch;
+    await transport.stop();
+
+    expect(offsets.at(-1)).toBeGreaterThanOrEqual(11);
+    expect(bot.handleUpdate).toHaveBeenCalledTimes(2);
+  });
 });
 
 describe('startWebhook HTTP (round-5)', () => {

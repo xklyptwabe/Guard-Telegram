@@ -51,7 +51,7 @@ function fakeAuditService(options: { alwaysDuplicate?: boolean; throwOnRecord?: 
 
 function fakeDispatcher(command: TelegramCommandDefinition, audit: AuditService) {
   const registry = { isEnabled: vi.fn(async () => true) } as unknown as ModuleRegistry;
-  const cooldowns = { take: vi.fn(() => true) } as unknown as Cooldowns;
+  const cooldowns = { take: vi.fn(() => true), release: vi.fn() } as unknown as Cooldowns;
   const reply = { send: vi.fn(async () => undefined) } as unknown as ReplyService;
   const events = { publish: vi.fn() } as unknown as EventBus;
   const logger = { info: vi.fn(), debug: vi.fn(), warn: vi.fn(), error: vi.fn() } as unknown as Logger;
@@ -163,7 +163,7 @@ describe('CommandDispatcher — command.executed audit wiring', () => {
     const command = fakeCommand();
     const { audit, calls } = fakeAuditService();
     const registry = { isEnabled: vi.fn(async () => false) } as unknown as ModuleRegistry;
-    const cooldowns = { take: vi.fn(() => true) } as unknown as Cooldowns;
+    const cooldowns = { take: vi.fn(() => true), release: vi.fn() } as unknown as Cooldowns;
     const reply = { send: vi.fn(async () => undefined) } as unknown as ReplyService;
     const events = { publish: vi.fn() } as unknown as EventBus;
     const logger = { info: vi.fn(), debug: vi.fn(), warn: vi.fn(), error: vi.fn() } as unknown as Logger;

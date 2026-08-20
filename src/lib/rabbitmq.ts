@@ -88,7 +88,7 @@ export async function createRabbitMq(
   if (!config.rabbitMqEnabled) {
     return {
       enabled: false,
-      publish: () => Promise.resolve(),
+      publish: () => Promise.reject(new Error('RabbitMQ is disabled')),
       consume: () => Promise.resolve(),
       registerActionSchema: () => undefined,
       close: () => Promise.resolve(),

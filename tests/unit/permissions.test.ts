@@ -26,4 +26,13 @@ describe('hasPermission', () => {
     } as never;
     await expect(hasPermission(ctx, 'chat_admin')).resolves.toBe(false);
   });
+
+  it('fail-closed when getChatMember throws', async () => {
+    const ctx = {
+      chat: { id: -100, type: 'supergroup' },
+      from: { id: 2 },
+      api: { getChatMember: vi.fn(async () => { throw new Error('timeout'); }) },
+    } as never;
+    await expect(hasPermission(ctx, 'chat_admin')).resolves.toBe(false);
+  });
 });

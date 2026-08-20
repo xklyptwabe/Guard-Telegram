@@ -261,7 +261,7 @@ describe('ModerationService', () => {
       service.restrict({ chatId: '-100111', targetUserId: '2', actorUserId: '9', durationSeconds: 600 }),
     );
     expect(db.rows[0]?.requestPayload).toMatchObject({ duration_seconds: 600 });
-    expect(db.rows[0]?.requestPayload).not.toHaveProperty('until_date');
+    expect(db.rows[0]?.requestPayload).toHaveProperty('until_date');
     const restrictCalls = bot.api.raw.restrictChatMember.mock.calls as unknown as ReadonlyArray<readonly [Record<string, unknown>]>;
     const called = restrictCalls[0]?.[0];
     expect(called).toBeDefined();
@@ -277,7 +277,7 @@ describe('ModerationService', () => {
     await service.deleteMessage('-100111', '55', '9');
     await service.deleteMessage('-100111', '55', '9');
     expect(db.rows).toHaveLength(1);
-    expect(db.rows[0]?.idempotencyKey).toBe('moderation.delete:-100111:55');
+    expect(db.rows[0]?.idempotencyKey).toBe('moderation.delete:-100111:55:9');
     expect(bot.api.raw.deleteMessage).toHaveBeenCalledTimes(1);
   });
 });

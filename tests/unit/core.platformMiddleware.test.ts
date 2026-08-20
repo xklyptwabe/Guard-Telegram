@@ -37,4 +37,18 @@ describe('registerModuleUpdateHandlers (round-3)', () => {
     await expect(handlers[0]!({ chat: { id: 1 } }, next)).rejects.toBeInstanceOf(AuditFinalizationPendingError);
     expect(next).not.toHaveBeenCalled();
   });
+
+  it('rethrows ordinary handler errors so the inbox does not complete', async () => {
+    const handlers: Array<(ctx: any, next: () => Promise<void>) => Promise<void>> = [];
+    const bot = { use: (fn: (ctx: any, next: () => Promise<void>) => Promise<void>) => handlers.push(fn) };
+    const module = {
+      id: 'membership-audit',
+      updateHandlers: [{ id: 'chat_member', handle: async () => { throw new Error('boom'); } }],
+    };
+    const registry = { isEnabled: vi.fn(async () => true) };
+    registerModuleUpdateHandlers(bot as never, [module] as never, registry as never, logger());
+    const next = vi.fn(async () => undefined);
+    await expect(handlers[0]!({ chat: { id: 1 } }, next)).rejects.toThrow('boom');
+    expect(next).not.toHaveBeenCalled();
+  });
 });
