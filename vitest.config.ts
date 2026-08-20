@@ -3,6 +3,7 @@ import { defineConfig } from 'vitest/config';
 export default defineConfig({
   test: {
     include: ['tests/**/*.test.ts'],
+    globalSetup: ['tests/setup/globalMigrate.ts'],
     // The DB-integration files (tests/integration/*) all point at ONE
     // shared PostgreSQL and wipe shared tables (audit.events,
     // moderation.pending_operations, …) in their beforeEach. Running test

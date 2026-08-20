@@ -134,6 +134,13 @@
       "when": 1786300000000,
       "tag": "0018_pending_operations_audit_policy_skipped",
       "breakpoints": true
+    },
+    {
+      "idx": 19,
+      "version": "7",
+      "when": 1787165400000,
+      "tag": "0019_ensure_telegram_bot_role",
+      "breakpoints": true
     }
   ]
 }
