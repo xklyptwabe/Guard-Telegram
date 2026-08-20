@@ -128,7 +128,10 @@ describe.skipIf(!testDatabaseUrl)('BOTS-9 round-2 fixes: real-DB verification', 
     const bot = fakeBot();
     const resolvers = new PendingOperationResolvers();
     const outbox = new PendingOperationsOutbox(client.db, silentLogger(), resolvers);
-    const failingAudit = { recordEntityChange: vi.fn(async () => Promise.reject(new Error('audit db down'))) } as never;
+    const failingAudit = {
+      recordEntityChange: vi.fn(async () => Promise.reject(new Error('audit db down'))),
+      maskOutboxMetadata: vi.fn(async (input: { metadata: Record<string, unknown> }) => input.metadata),
+    } as never;
     const service = new ModerationService(bot as never, failingAudit, outbox, resolvers, silentLogger());
 
     await expect(
