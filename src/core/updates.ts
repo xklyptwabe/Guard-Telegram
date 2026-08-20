@@ -1,7 +1,6 @@
 import { createServer, type IncomingMessage, type Server } from 'node:http';
 
-import { run, type RunnerHandle } from '@grammyjs/runner';
-import { type Bot, type Context } from 'grammy';
+import { BotError, type Bot, type Context } from 'grammy';
 import { z } from 'zod';
 
 import type { AppConfig } from '../config.js';
@@ -10,9 +9,12 @@ import { telegramUsers } from '../db/schema/core.js';
 import type { AuditService } from '../lib/auditService.js';
 import { recordBotMembershipChanged } from '../lib/audit/botMembershipAudit.js';
 import { runWithUpdateContext } from '../lib/context.js';
+import { constantTimeEquals } from '../lib/cryptoEquals.js';
 import type { Logger } from '../lib/logger.js';
 import type { ModuleRegistry } from './registry.js';
 import type { TelegramBotModule } from './contracts.js';
+import { bots9WalExclusion } from '../lib/bots9WalExclusions.js';
+import { isAuditPendingError } from '../lib/moderation/pendingOperationsOutbox.js';
 import { UpdateInbox } from './updateInbox.js';
 
 const webhookUpdateSchema = z.object({ update_id: z.number().int() }).passthrough();
@@ -23,17 +25,50 @@ export interface TransportController {
 
 /**
  * BOTS-9 review round-2 (BLOCKER-4): thrown by the platform middleware when
- * a webhook-delivered update is busy (live lease held elsewhere, or still
- * inside its backoff window) — the transport MUST NOT answer 200 for work
- * that is still owed; Telegram redelivers on a non-2xx. Attempts-exhausted
- * rows answer 200 (permanently undeliverable — retrying forever would just
- * loop).
+ * a delivered update is busy (live lease held elsewhere, or still inside
+ * its backoff window) — the transport MUST NOT confirm the update.
  */
 export class UpdateBusyError extends Error {
   public constructor(updateId: string, reason: string) {
     super(`Update ${updateId} is busy (${reason})`);
     this.name = 'UpdateBusyError';
   }
+}
+
+export class UpdateExhaustedError extends Error {
+  public constructor(updateId: string) {
+    super(`Update ${updateId} exhausted inbox attempts`);
+    this.name = 'UpdateExhaustedError';
+  }
+}
+
+/** grammY wraps every middleware throw in BotError — HTTP layer must unwrap. */
+export function unwrapMiddlewareError(error: unknown): unknown {
+  return error instanceof BotError ? error.error : error;
+}
+
+export function isTransientUpdateError(error: unknown): boolean {
+  const cause = unwrapMiddlewareError(error);
+  return (
+    cause instanceof UpdateBusyError ||
+    (cause instanceof Error && cause.name === 'UpdateBusyError') ||
+    isAuditPendingError(cause)
+  );
+}
+
+export function isExhaustedUpdateError(error: unknown): boolean {
+  const cause = unwrapMiddlewareError(error);
+  return cause instanceof UpdateExhaustedError || (cause instanceof Error && cause.name === 'UpdateExhaustedError');
+}
+
+/** HTTP status for a failed webhook handleUpdate. Never 200 for owed work. */
+export function webhookStatusForError(error: unknown): 409 | 503 | 400 {
+  const cause = unwrapMiddlewareError(error);
+  if (cause instanceof UpdateBusyError || (cause instanceof Error && cause.name === 'UpdateBusyError')) return 409;
+  if (isAuditPendingError(cause) || isExhaustedUpdateError(cause)) return 503;
+  if (cause instanceof SyntaxError) return 400;
+  if (cause instanceof z.ZodError) return 400;
+  return 503;
 }
 
 function chatTitle(ctx: Context): string | undefined {
@@ -51,14 +86,6 @@ function messageThreadId(ctx: Context): string | undefined {
 }
 
 export function registerPlatformMiddleware(bot: Bot<Context>, database: DrizzleDatabase, registry: ModuleRegistry, logger: Logger, transportMode: 'long_polling' | 'webhook' = 'long_polling'): void {
-  // BOTS-9 review fix (BLOCKER-5): the old code inserted the
-  // processed_updates marker BEFORE `await next()` — any crash or handler
-  // exception after that insert permanently lost the update, because
-  // redelivery found the marker and skipped. UpdateInbox turns the marker
-  // into a durable received→processing→completed state machine: only a
-  // `completed` row dedups; anything else is reprocessed on redelivery.
-  // The raw update is never stored (BLOCKER-4) — Telegram's own
-  // redelivery drives the retry.
   const inbox = new UpdateInbox(database, logger);
   bot.use(async (ctx, next) => {
     const updateId = String(ctx.update.update_id);
@@ -69,6 +96,18 @@ export function registerPlatformMiddleware(bot: Bot<Context>, database: DrizzleD
     await runWithUpdateContext(
       { updateId, ...(botId ? { botId } : {}), ...(chatId ? { chatId } : {}), ...(userId ? { userId } : {}), ...(threadId ? { messageThreadId: threadId } : {}) },
       async () => {
+        const { claim, attemptCount, busyReason } = await inbox.begin(String(ctx.me.id), updateId);
+        if (claim === 'completed') {
+          logger.info({ event: 'update.duplicate_skipped' });
+          return;
+        }
+        if (claim === 'busy') {
+          if (busyReason === 'exhausted') {
+            logger.error({ event: 'update.inbox.exhausted', details: { updateId, attemptCount, transportMode } });
+            throw new UpdateExhaustedError(updateId);
+          }
+          throw new UpdateBusyError(updateId, busyReason ?? 'unknown');
+        }
         if (ctx.chat) await registry.ensureChat(chatId!, ctx.chat.type, chatTitle(ctx));
         if (ctx.from) {
           const now = new Date();
@@ -80,27 +119,11 @@ export function registerPlatformMiddleware(bot: Bot<Context>, database: DrizzleD
               set: { ...(ctx.from.language_code ? { languageCode: ctx.from.language_code } : {}), updatedAt: now },
             });
         }
-        const { claim, attemptCount, busyReason } = await inbox.begin(String(ctx.me.id), updateId);
-        if (claim === 'completed') {
-          logger.info({ event: 'update.duplicate_skipped' });
-          return;
-        }
-        if (claim === 'busy') {
-          // Live lease elsewhere, inside the backoff window, or attempts
-          // exhausted — do not reprocess now; redelivery (after lease
-          // expiry / backoff) decides. On the webhook transport a
-          // *transient* busy must NOT be confirmed with 200 — the update
-          // is still owed work (round-2 BLOCKER-4).
-          if (transportMode === 'webhook' && busyReason !== 'exhausted') {
-            throw new UpdateBusyError(updateId, busyReason ?? 'unknown');
-          }
-          logger.info({ event: 'update.inbox.busy_skipped', details: { updateId, attemptCount, busyReason } });
-          return;
-        }
         logger.debug({ event: 'update.received' });
         try {
           await next();
-          await inbox.complete(String(ctx.me.id), updateId);
+          const completed = await inbox.complete(String(ctx.me.id), updateId);
+          if (!completed) throw new UpdateBusyError(updateId, 'lease_lost');
         } catch (error: unknown) {
           await inbox.fail(String(ctx.me.id), updateId, attemptCount, error);
           throw error;
@@ -121,6 +144,7 @@ export function registerModuleUpdateHandlers(bot: Bot<Context>, modules: readonl
             await handler.handle(ctx);
           } catch (error: unknown) {
             logger.error({ event: 'module.update_handler.failed', module: module.id, details: { handlerId: handler.id }, error: { name: error instanceof Error ? error.name : 'UnknownError', message: error instanceof Error ? error.message : String(error) } });
+            throw error;
           }
         }
       }
@@ -129,14 +153,6 @@ export function registerModuleUpdateHandlers(bot: Bot<Context>, modules: readonl
   });
 }
 
-/**
- * BOTS-9: registers `bot.membership.changed` auditing directly on the bot
- * — deliberately not routed through `registerModuleUpdateHandlers` (and
- * therefore never gated by any module's enabled/disabled state). The
- * event's definition marks it `canBeDisabled: false`: whether the bot
- * itself can still act in a chat is core infrastructure, not an optional
- * feature a chat's admins should be able to silence.
- */
 export function registerBotMembershipAudit(bot: Bot<Context>, audit: AuditService, logger: Logger): void {
   bot.use(async (ctx, next) => {
     await recordBotMembershipChanged(audit, logger, ctx);
@@ -144,18 +160,81 @@ export function registerBotMembershipAudit(bot: Bot<Context>, audit: AuditServic
   });
 }
 
+/**
+ * Sequential long polling that advances Telegram's offset ONLY after
+ * handleUpdate succeeds. @grammyjs/runner increments offset at fetch time,
+ * so a later throw could never be redelivered — this loop keeps the same
+ * offset on transient failures (busy / audit-pending / crash).
+ */
 export function startLongPolling(bot: Bot<Context>, config: Pick<AppConfig, 'telegramAllowedUpdates' | 'telegramRunnerConcurrency'>, logger: Logger): TransportController {
-  const runner: RunnerHandle = run(bot, {
-    runner: { fetch: { allowed_updates: config.telegramAllowedUpdates } },
-    sink: { concurrency: config.telegramRunnerConcurrency },
-  });
-  logger.info({ event: 'transport.long_polling.started' });
+  const abort = new AbortController();
+  let offset = 0;
+  const loop = (async () => {
+    logger.info({ event: 'transport.long_polling.started', details: { concurrencyHint: config.telegramRunnerConcurrency } });
+    while (!abort.signal.aborted) {
+      try {
+        const updates = await bot.api.getUpdates(
+          { offset, timeout: 30, limit: 100, allowed_updates: config.telegramAllowedUpdates },
+          abort.signal as never,
+        );
+        for (const update of updates) {
+          if (abort.signal.aborted) return;
+          try {
+            await bot.handleUpdate(update);
+            offset = update.update_id + 1;
+          } catch (error: unknown) {
+            if (isExhaustedUpdateError(error)) {
+              logger.error({
+                event: 'transport.long_polling.exhausted_skip',
+                details: { updateId: update.update_id, offset },
+                error: { name: error instanceof Error ? error.name : 'UnknownError', message: error instanceof Error ? error.message : String(error) },
+              });
+              offset = update.update_id + 1;
+              continue;
+            }
+            logger.warn({
+              event: 'transport.long_polling.will_retry',
+              details: { updateId: update.update_id, offset },
+              error: { name: error instanceof Error ? error.name : 'UnknownError', message: error instanceof Error ? error.message : String(error) },
+            });
+            await sleep(500, abort.signal);
+            break;
+          }
+        }
+      } catch (error: unknown) {
+        if (abort.signal.aborted) return;
+        logger.error({
+          event: 'transport.long_polling.fetch_failed',
+          error: { name: error instanceof Error ? error.name : 'UnknownError', message: error instanceof Error ? error.message : String(error) },
+        });
+        const conflict =
+          error instanceof Error && (/409/.test(error.message) || /terminated by other getUpdates/i.test(error.message));
+        await sleep(conflict ? 5_000 : 2_000, abort.signal);
+      }
+    }
+  })();
+
   return {
     async stop(): Promise<void> {
-      await runner.stop();
+      abort.abort();
+      await loop.catch(() => undefined);
       logger.info({ event: 'transport.long_polling.stopped' });
     },
   };
+}
+
+function sleep(ms: number, signal: AbortSignal): Promise<void> {
+  return new Promise((resolve) => {
+    if (signal.aborted) {
+      resolve();
+      return;
+    }
+    const timer = setTimeout(resolve, ms);
+    signal.addEventListener('abort', () => {
+      clearTimeout(timer);
+      resolve();
+    }, { once: true });
+  });
 }
 
 function readBody(request: IncomingMessage, maxBytes: number): Promise<string> {
@@ -164,7 +243,10 @@ function readBody(request: IncomingMessage, maxBytes: number): Promise<string> {
     request.setEncoding('utf8');
     request.on('data', (chunk: string) => {
       body += chunk;
-      if (Buffer.byteLength(body, 'utf8') > maxBytes) reject(new Error('Webhook payload exceeds size limit'));
+      if (Buffer.byteLength(body, 'utf8') > maxBytes) {
+        request.destroy();
+        reject(new Error('Webhook payload exceeds size limit'));
+      }
     });
     request.on('end', () => resolve(body));
     request.on('error', reject);
@@ -175,18 +257,17 @@ function closeServer(server: Server): Promise<void> {
   return new Promise((resolve, reject) => server.close((error) => (error ? reject(error) : resolve())));
 }
 
-/**
- * BOTS-9 review finding (HIGH-5) — documented exclusion: `setWebhook` is
- * deliberately NOT routed through the write-ahead outbox. Same reasoning
- * as `setMyCommands`: bootstrap-only, idempotent (same URL/secret/allowed
- * updates → same state), and retried by the next restart. The webhook
- * secret never leaves this process for the outbox (BLOCKER-4) — storing it
- * in a write-ahead row would be a new leak, not a reliability gain.
- */
+function webhookSecretMatches(provided: string | readonly string[] | undefined, expected: string): boolean {
+  if (typeof provided !== 'string') return false;
+  return constantTimeEquals(provided, expected);
+}
+
 export async function startWebhook(bot: Bot<Context>, config: AppConfig, logger: Logger): Promise<TransportController> {
   if (!config.telegramWebhookUrl || !config.telegramWebhookSecret) throw new Error('Webhook configuration is incomplete');
   const webhookUrl = new URL(config.telegramWebhookUrl);
   const secret = config.telegramWebhookSecret;
+  // BOTS-9 HIGH-5: bootstrap-only, idempotent; retry-by-restart, not WAL.
+  void bots9WalExclusion('telegram.setWebhook');
   await bot.api.setWebhook(webhookUrl.toString(), {
     secret_token: secret,
     allowed_updates: config.telegramAllowedUpdates,
@@ -196,7 +277,7 @@ export async function startWebhook(bot: Bot<Context>, config: AppConfig, logger:
       try {
         const requestUrl = new URL(request.url ?? '/', webhookUrl);
         const providedSecret = request.headers['x-telegram-bot-api-secret-token'];
-        if (request.method !== 'POST' || requestUrl.pathname !== webhookUrl.pathname || providedSecret !== secret) {
+        if (request.method !== 'POST' || requestUrl.pathname !== webhookUrl.pathname || !webhookSecretMatches(providedSecret, secret)) {
           response.writeHead(401).end();
           return;
         }
@@ -204,10 +285,9 @@ export async function startWebhook(bot: Bot<Context>, config: AppConfig, logger:
         await bot.handleUpdate(body);
         response.writeHead(200).end();
       } catch (error: unknown) {
-        // Round-2 (BLOCKER-4): busy ≠ 200 — a transiently busy update must
-        // be redelivered by Telegram, not confirmed as processed.
-        if (error instanceof UpdateBusyError) {
-          response.writeHead(409).end();
+        const status = webhookStatusForError(error);
+        if (status !== 400) {
+          response.writeHead(status).end();
           return;
         }
         logger.error({ event: 'transport.webhook.request_failed', error: { name: error instanceof Error ? error.name : 'UnknownError', message: error instanceof Error ? error.message : String(error) } });
@@ -217,12 +297,12 @@ export async function startWebhook(bot: Bot<Context>, config: AppConfig, logger:
   });
   await new Promise<void>((resolve, reject) => {
     server.once('error', reject);
-    server.listen(config.telegramWebhookPort, () => {
+    server.listen(config.telegramWebhookPort, config.telegramWebhookHost, () => {
       server.off('error', reject);
       resolve();
     });
   });
-  logger.info({ event: 'transport.webhook.started', details: { port: config.telegramWebhookPort } });
+  logger.info({ event: 'transport.webhook.started', details: { port: config.telegramWebhookPort, host: config.telegramWebhookHost } });
   return {
     async stop(): Promise<void> {
       await closeServer(server);

@@ -87,4 +87,14 @@ describe('recordBotMembershipChanged', () => {
     await runWithUpdateContext({ updateId: '1', chatId: 'chat-1' }, () => recordBotMembershipChanged(audit, logger(), {} as never));
     expect(calls).toHaveLength(0);
   });
+
+  it('round-3: infrastructure audit failure is NOT swallowed — throws AuditFinalizationPendingError', async () => {
+    const { AuditFinalizationPendingError } = await import('../../src/lib/moderation/pendingOperationsOutbox.js');
+    const audit = { recordEntityChange: vi.fn(async () => { throw new Error('db down'); }) } as unknown as AuditService;
+    const fixture = loadFixture('my_chat_member.promoted.json');
+    const ctx = { myChatMember: fixture.my_chat_member } as never;
+    await expect(
+      runWithUpdateContext({ updateId: String(fixture.update_id), chatId: '-1001111111111' }, () => recordBotMembershipChanged(audit, logger(), ctx)),
+    ).rejects.toBeInstanceOf(AuditFinalizationPendingError);
+  });
 });

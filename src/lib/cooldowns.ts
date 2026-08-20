@@ -18,6 +18,11 @@ export class Cooldowns {
     return true;
   }
 
+  /** Undo take() so a redelivered update can finish owed audit after a pending error. */
+  public release(key: string): void {
+    this.expiresAt.delete(key);
+  }
+
   private sweep(now: number): void {
     for (const [key, expiry] of this.expiresAt) {
       if (expiry <= now) this.expiresAt.delete(key);

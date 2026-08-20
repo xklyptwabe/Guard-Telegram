@@ -4,7 +4,7 @@ import type { DrizzleDatabase } from '../db/client.js';
 import { chatSettings } from '../db/schema/core.js';
 import { AuditEventProcessor } from './audit/eventProcessor.js';
 import { toDownstreamMutationResult } from './audit/serviceAdapter.js';
-import { observed } from './audit/snapshot.js';
+import { observed, notObserved } from './audit/snapshot.js';
 import type { AuditService } from './auditService.js';
 import { getUpdateContext } from './context.js';
 
@@ -55,6 +55,7 @@ export class ChatSettingsService {
         source: 'telegram.command',
         idempotencyKey,
         ...(actorId !== undefined ? { actorId, actorType: 'telegram_user' } : {}),
+        moduleId: 'chat-settings',
       },
       async (tx) => {
         const current = await tx.select({ locale: chatSettings.locale }).from(chatSettings).where(eq(chatSettings.chatId, chatId)).limit(1).for('update');
@@ -65,15 +66,22 @@ export class ChatSettingsService {
           .values({ chatId, locale, updatedAt: now })
           .onConflictDoUpdate({ target: chatSettings.chatId, set: { locale, updatedAt: now } });
 
-        const operation = beforeLocale === locale ? 'noop' : 'update';
+        // BOTS-7: after comes from the row that actually landed, not the
+        // argument we intended to write. Missing previous row is
+        // not_observed — never a fabricated default locale.
+        const persisted = await tx.select({ locale: chatSettings.locale }).from(chatSettings).where(eq(chatSettings.chatId, chatId)).limit(1);
+        const afterLocale = persisted[0]?.locale;
+        if (afterLocale === undefined) throw new Error('chat.settings row missing after write');
+
+        const operation = beforeLocale === afterLocale ? 'noop' : 'update';
         const record = this.auditProcessor.process({
           name: 'chat.settings.changed',
           version: 1,
           operation,
           chatId,
           ...(actorId !== undefined ? { actorId } : {}),
-          before: beforeLocale !== undefined ? observed({ chatId, locale: beforeLocale }) : observed({ chatId, locale: 'ru' }), // 'ru' is the row's own DB default (see db/schema/core.ts) — never fabricated, mirrors the column default a first-ever write would have replaced
-          after: observed({ chatId, locale }),
+          before: beforeLocale !== undefined ? observed({ chatId, locale: beforeLocale }) : notObserved(),
+          after: observed({ chatId, locale: afterLocale }),
         });
         const mutationResult = toDownstreamMutationResult(record);
 

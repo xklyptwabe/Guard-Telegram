@@ -94,7 +94,7 @@ export class UpdateInbox {
   }
 
   /** Marks the update fully processed — from this moment redelivery dedups instead of reprocessing. */
-  public async complete(botId: string, updateId: string): Promise<void> {
+  public async complete(botId: string, updateId: string): Promise<boolean> {
     const now = new Date();
     const updated = await this.db
       .update(processedUpdates)
@@ -102,11 +102,10 @@ export class UpdateInbox {
       .where(and(eq(processedUpdates.botId, botId), eq(processedUpdates.updateId, updateId), eq(processedUpdates.workerId, this.workerId), eq(processedUpdates.status, 'processing')))
       .returning({ updateId: processedUpdates.updateId });
     if (updated.length === 0) {
-      // Lease was stolen mid-processing (this worker hung past its own
-      // lease) — the new owner owns the outcome now; our completion is a
-      // no-op for the row. Rare and operationally worth a distinct signal.
       this.logger.warn({ event: 'update.inbox.lease_lost', details: { botId, updateId } });
+      return false;
     }
+    return true;
   }
 
   /**

@@ -26,7 +26,14 @@ const secretKey = /(token|secret|password|authorization|cookie|databaseurl|rabbi
 const sensitiveUrl = /([a-z][a-z0-9+.-]*:\/\/)([^/@\s]+)@/gi;
 
 function redactString(value: string): string {
-  return value.replace(sensitiveUrl, '$1[REDACTED]@');
+  return value
+    .replace(sensitiveUrl, '$1[REDACTED]@')
+    .replace(/\bBearer\s+[A-Za-z0-9._\-+=/]+/gi, 'Bearer [REDACTED]')
+    .replace(/(?:^|[?&;\s])(?:password|passwd|pwd|token|api[_-]?key|secret)\s*[=:]\s*[^\s;&]+/gi, (match) =>
+      match.replace(/([=:])\s*[^\s;&]+/, '$1[REDACTED]'),
+    )
+    .replace(/\b\d{6,}:[A-Za-z0-9_-]{20,}\b/g, '[REDACTED_BOT_TOKEN]')
+    .replace(/\beyJ[A-Za-z0-9_-]*\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\b/g, '[REDACTED_JWT]');
 }
 
 export function redact(value: unknown): unknown {

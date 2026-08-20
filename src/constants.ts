@@ -1,5 +1,11 @@
 export const SERVICE_NAME = 'telegram-bot';
 export const PROCESSED_UPDATE_RETENTION_DAYS = 7;
+/**
+ * How long a successfully consumed Rabbit envelope id is kept for durable
+ * dedup. After this window a redelivered envelope may run again — the
+ * horizon must be ≥ broker TTL / max redelivery delay.
+ */
+export const CONSUMED_ENVELOPE_RETENTION_DAYS = 14;
 export const CALLBACK_VERSION = 'v1';
 
 export const MODULE_IDS = {

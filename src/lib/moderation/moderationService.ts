@@ -1,4 +1,4 @@
-import type { Bot, Context } from 'grammy';
+import { GrammyError, type Bot, type Context } from 'grammy';
 import type { ChatPermissions } from '@grammyjs/types';
 
 import { MODULE_IDS } from '../../constants.js';
@@ -110,12 +110,12 @@ export class ModerationService {
   }
 
   public async restrict(input: RestrictActionInput): Promise<ModerationOutcome> {
-    const untilDate = Math.floor(Date.now() / 1000) + input.durationSeconds;
     return this.performAndAudit('mute', input, 'telegram.restrictChatMember.mute', {
       chat_id: Number(input.chatId),
       user_id: Number(input.targetUserId),
       permissions: MUTED_PERMISSIONS,
-      until_date: untilDate,
+      duration_seconds: input.durationSeconds,
+      until_date: Math.floor(Date.now() / 1000) + input.durationSeconds,
     });
   }
 
@@ -157,7 +157,7 @@ export class ModerationService {
     const context = getUpdateContext();
     const idempotencyKey = context
       ? `moderation.delete:telegram-update:${context.botId ?? 'unscoped-bot'}:${context.updateId}:${chatId}:${messageId}`
-      : `moderation.delete:${chatId}:${messageId}:${Date.now()}`;
+      : `moderation.delete:${chatId}:${messageId}:${actorUserId}`;
     const kind = 'telegram.deleteMessage';
     const result = await this.outbox.execute(
       {
@@ -211,40 +211,59 @@ export class ModerationService {
   }
 
   private registerResolvers(): void {
-    this.resolvers.register('telegram.banChatMember', async (payload) => {
-      await this.bot.api.raw.banChatMember({ chat_id: payload.chat_id as number, user_id: payload.user_id as number });
-    });
-    this.resolvers.register('telegram.unbanChatMember', async (payload) => {
-      await this.bot.api.raw.unbanChatMember({ chat_id: payload.chat_id as number, user_id: payload.user_id as number, only_if_banned: true });
-    });
-    this.resolvers.register('telegram.kick', async (payload) => {
+    this.resolvers.register(
+      'telegram.banChatMember',
+      async (payload) => {
+        await this.bot.api.raw.banChatMember({ chat_id: payload.chat_id as number, user_id: payload.user_id as number });
+      },
+      { retryAfterUnknown: true },
+    );
+    this.resolvers.register(
+      'telegram.unbanChatMember',
+      async (payload) => {
+        await this.bot.api.raw.unbanChatMember({ chat_id: payload.chat_id as number, user_id: payload.user_id as number, only_if_banned: true });
+      },
+      { retryAfterUnknown: true },
+    );
+    this.resolvers.register(
+      'telegram.kick',
+      async (payload) => {
       // Both calls are individually idempotent — safe to replay this whole
       // executor from the top on recovery, whichever half it died on.
       await this.bot.api.raw.banChatMember({ chat_id: payload.chat_id as number, user_id: payload.user_id as number });
       try {
         await this.bot.api.raw.unbanChatMember({ chat_id: payload.chat_id as number, user_id: payload.user_id as number, only_if_banned: true });
       } catch (error) {
-        // BOTS-9 review finding (HIGH-8): the ban half already landed —
-        // tag the error so the outbox/audit layer can record that the
-        // target is left banned, not kicked, rather than an outcome
-        // indistinguishable from "kick simply failed, target unaffected".
-        // Attached to the SAME error object (not wrapped) so `instanceof
-        // GrammyError` still holds for the confirmed-vs-unknown check.
+        if (error instanceof GrammyError && (error.error_code === 429 || error.error_code >= 500)) {
+          throw new Error(`kick unban transient ${error.error_code}: ${error.description}`);
+        }
+        // Confirmed unban rejection after ban landed — not kicked.
         if (error && typeof error === 'object') (error as Record<string, unknown>).partialOutcome = 'banned_not_kicked';
         throw error;
       }
-    });
-    this.resolvers.register('telegram.restrictChatMember.mute', async (payload) => {
-      await this.bot.api.raw.restrictChatMember({
-        chat_id: payload.chat_id as number,
-        user_id: payload.user_id as number,
-        permissions: payload.permissions as ChatPermissions,
-        until_date: payload.until_date as number,
-      });
-    });
-    this.resolvers.register('telegram.restrictChatMember.unmute', async (payload) => {
-      await this.bot.api.raw.restrictChatMember({ chat_id: payload.chat_id as number, user_id: payload.user_id as number, permissions: payload.permissions as ChatPermissions });
-    });
+    },
+      { retryAfterUnknown: true },
+    );
+    this.resolvers.register(
+      'telegram.restrictChatMember.mute',
+      async (payload) => {
+        const untilDate = typeof payload.until_date === 'number' ? payload.until_date : Math.floor(Date.now() / 1000) + (typeof payload.duration_seconds === 'number' ? payload.duration_seconds : 0);
+        await this.bot.api.raw.restrictChatMember({
+          chat_id: payload.chat_id as number,
+          user_id: payload.user_id as number,
+          permissions: payload.permissions as ChatPermissions,
+          until_date: untilDate,
+        });
+      },
+      { retryAfterUnknown: true },
+    );
+    this.resolvers.register(
+      'telegram.restrictChatMember.unmute',
+      async (payload) => {
+        await this.bot.api.raw.restrictChatMember({ chat_id: payload.chat_id as number, user_id: payload.user_id as number, permissions: payload.permissions as ChatPermissions });
+      },
+      { retryAfterUnknown: true },
+    );
     // BOTS-9 review round-2 (BLOCKER-2): deleteMessage is destructive and
     // NOT provably idempotent — a re-issued delete on an already-deleted
     // message returns a confirmed error, misreporting a real success as
@@ -260,10 +279,18 @@ export class ModerationService {
 
   private async dispatch(action: ModerationAction, input: ModerationActionInput, kind: string, requestPayload: Record<string, unknown>) {
     const context = getUpdateContext();
+    const durationKey = typeof requestPayload.duration_seconds === 'number' ? `:${requestPayload.duration_seconds}` : '';
     const idempotencyKey = context
       ? `moderation.action:telegram-update:${context.botId ?? 'unscoped-bot'}:${context.updateId}:${input.chatId}:${input.targetUserId}:${action}`
-      : `moderation.action:${input.chatId}:${input.targetUserId}:${action}:${Date.now()}`;
-    const metadata: Record<string, unknown> = { action, actorUserId: input.actorUserId, targetUserId: input.targetUserId, ...(input.reason !== undefined ? { reason: input.reason } : {}) };
+      : `moderation.action:${input.chatId}:${input.targetUserId}:${action}${durationKey}`;
+    const reason = input.reason !== undefined ? input.reason.slice(0, 500) : undefined;
+    const metadata = await this.audit.maskOutboxMetadata({
+      tenantId: input.chatId,
+      eventType: 'moderation.action',
+      eventVersion: 'v1',
+      moduleId: MODULE_IDS.moderation,
+      metadata: { action, actorUserId: input.actorUserId, targetUserId: input.targetUserId, ...(reason !== undefined && reason.length > 0 ? { reason } : {}) },
+    });
     return this.outbox.execute(
       { kind, chatId: input.chatId, idempotencyKey, requestPayload, metadata },
       this.resolvers.get(kind)!,

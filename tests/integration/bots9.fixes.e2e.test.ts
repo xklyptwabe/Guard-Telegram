@@ -128,7 +128,10 @@ describe.skipIf(!testDatabaseUrl)('BOTS-9 round-2 fixes: real-DB verification', 
     const bot = fakeBot();
     const resolvers = new PendingOperationResolvers();
     const outbox = new PendingOperationsOutbox(client.db, silentLogger(), resolvers);
-    const failingAudit = { recordEntityChange: vi.fn(async () => Promise.reject(new Error('audit db down'))) } as never;
+    const failingAudit = {
+      recordEntityChange: vi.fn(async () => Promise.reject(new Error('audit db down'))),
+      maskOutboxMetadata: vi.fn(async (input: { metadata: Record<string, unknown> }) => input.metadata),
+    } as never;
     const service = new ModerationService(bot as never, failingAudit, outbox, resolvers, silentLogger());
 
     await expect(
@@ -295,6 +298,10 @@ describe.skipIf(!testDatabaseUrl)('BOTS-9 round-2 fixes: real-DB verification', 
     await runWithUpdateContext({ updateId: 'r2-3', botId: '42' }, () => service.ban({ chatId, targetUserId: '123', actorUserId: '456' }));
     let eventsForChat = await client.db.select().from(events).where(eq(events.tenantId, chatId));
     expect(eventsForChat).toHaveLength(1);
+
+    // Downstream already consumed the audit outbox — only then may retention
+    // delete the event (pending outbox must survive CASCADE).
+    await client.db.execute(sql`UPDATE audit.outbox SET status = 'delivered' WHERE event_id = ${eventsForChat[0]!.id}`);
 
     // Retention purges the audit event (backdate it past the policy window).
     await client.db.execute(sql`UPDATE audit.events SET occurred_at = now() - interval '2 days'`);

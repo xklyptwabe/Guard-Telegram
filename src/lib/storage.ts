@@ -1,4 +1,4 @@
-import { createHash, randomUUID } from 'node:crypto';
+import { createHash } from 'node:crypto';
 
 import { HeadObjectCommand, PutObjectCommand, S3Client, S3ServiceException } from '@aws-sdk/client-s3';
 
@@ -45,24 +45,24 @@ export function createStorage(
     // without the caller, which the audit trail now states explicitly). A
     // network-level HEAD failure stays `unknown` and retries — HEAD is
     // read-only, so retrying it is always safe.
-    resolvers.register(kind, async (payload) => {
-      const key = String(payload.key);
-      try {
-        const head = await client.send(new HeadObjectCommand({ Bucket: config.s3Bucket, Key: key }));
-        return { reconciled: true, statusCode: head.$metadata.httpStatusCode };
-      } catch (error: unknown) {
-        if (error instanceof S3ServiceException && error.$metadata.httpStatusCode === 404) {
-          // Round-2 (HIGH-1): the intent is EXPLICITLY modeled as
-          // non-retryable — the body was never durably staged, so the PUT
-          // cannot be re-executed. The audit record surfaces
-          // `unrecoverable: true` + errorCode so operators can tell
-          // "upload never happened, intent unrecoverable" apart from a
-          // plain failed operation.
-          throw new ConfirmedExternalError('object absent after unrecoverable upload — body is never stored in the outbox', { errorCode: 404, unrecoverable: true, reason: 'put_intent_unrecoverable' });
+    resolvers.register(
+      kind,
+      async (payload) => {
+        const key = String(payload.key);
+        try {
+          const head = await client.send(new HeadObjectCommand({ Bucket: config.s3Bucket, Key: key }));
+          return { reconciled: true, statusCode: head.$metadata.httpStatusCode };
+        } catch (error: unknown) {
+          if (error instanceof S3ServiceException && error.$metadata.httpStatusCode === 404) {
+            // Not confirmed-failed: PUT may still be in flight after our timeout.
+            // HEAD is read-only — retry as unknown until attempts exhaust.
+            throw new Error(`s3 HEAD 404 for ${key} — object not visible yet`);
+          }
+          throw error;
         }
-        throw error;
-      }
-    });
+      },
+      { retryAfterUnknown: true },
+    );
 
     return {
       enabled: true,
@@ -79,7 +79,7 @@ export function createStorage(
             // chat-less integration: the pending_operations row lives under
             // the platform pseudo-scope, mirroring audit's tenant sentinel.
             chatId: 'platform',
-            idempotencyKey: `s3.putObject:${key}:${bodyDigest}:${randomUUID()}`,
+            idempotencyKey: `s3.putObject:${key}:${bodyDigest}`,
             requestPayload: { key, contentType, bodyDigest, sizeBytes: body.byteLength },
             metadata: integrationOperationMetadata({ integrationId: 's3', action: 'put', targetType: 'object', targetId: key }),
           },
@@ -98,10 +98,12 @@ export function createStorage(
             }
           },
         );
-        if (result.outcome.status === 'failed') {
-          // Confirmed rejection — surface to the caller exactly as the
-          // pre-outbox implementation did (it rethrew the SDK error).
-          throw new Error(`S3 put failed: ${JSON.stringify(result.outcome.result ?? {})}`);
+        if (result.isFinal && !result.auditFinalized) {
+          throw new Error(`S3 put audit is still owed for key ${key}`);
+        }
+        if (result.outcome.status !== 'succeeded') {
+          // unknown / failed / in-flight retry must NOT look like a successful put.
+          throw new Error(`S3 put ${result.outcome.status}: ${JSON.stringify(result.outcome.result ?? {})}`);
         }
       },
       close: () => {

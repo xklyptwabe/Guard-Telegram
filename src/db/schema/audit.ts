@@ -112,6 +112,13 @@ export const events = auditSchema.table(
     index('events_subject_sequence_idx').on(table.tenantId, table.subjectType, table.subjectId, table.subjectSequence),
     index('events_correlation_idx').on(table.correlationId),
     index('events_type_occurred_idx').on(table.eventType, table.occurredAt.desc()),
+    foreignKey({
+      name: 'events_event_type_version_event_types_fk',
+      columns: [table.eventType, table.eventVersion],
+      foreignColumns: [eventTypes.eventType, eventTypes.eventVersion],
+    })
+      .onUpdate('cascade')
+      .onDelete('restrict'),
   ],
 );
 

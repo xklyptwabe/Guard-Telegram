@@ -3,7 +3,7 @@ import { fileURLToPath } from 'node:url';
 
 import { describe, expect, it, vi } from 'vitest';
 
-import { recordMessageDeleted, recordMessageEdited } from '../../src/lib/audit/messageAudit.js';
+import { recordMessageDeleted, recordMessageEdited, recordMessageObserved } from '../../src/lib/audit/messageAudit.js';
 import type { AuditService } from '../../src/lib/auditService.js';
 import { runWithUpdateContext } from '../../src/lib/context.js';
 import type { Logger } from '../../src/lib/logger.js';
@@ -24,6 +24,8 @@ function fakeAuditService(currentSnapshotRows: Array<Record<string, unknown>> = 
       calls.push({ input, result });
       return { eventId: 'evt-1', subjectSequence: 1, duplicate: false };
     }),
+    observeCurrentSnapshot: vi.fn(async () => undefined),
+    maskOutboxMetadata: vi.fn(async (input: { metadata: Record<string, unknown> }) => input.metadata),
   } as unknown as AuditService;
   return { audit, calls };
 }
@@ -81,7 +83,7 @@ describe('recordMessageEdited', () => {
     expect(call.result.metadata).toMatchObject({ operation: 'noop', outOfOrder: true });
     // The snapshot keeps the NEWER data — the stale edit did not regress it.
     expect(call.result.snapshotData).toMatchObject({ editedAt: '2033-01-01T00:00:00.000Z', text: 'newer version' });
-    expect(call.result.after).toMatchObject({ editedAt: '2033-01-01T00:00:00.000Z' });
+    expect(call.result.after).toMatchObject({ editedAt: '2001-01-01T00:00:00.000Z' });
   });
 
   it('BOTS-9 review HIGH-1: a genuinely newer edit still updates the snapshot normally', async () => {
@@ -93,6 +95,16 @@ describe('recordMessageEdited', () => {
     const call = calls[0] as { result: { snapshotData?: Record<string, unknown>; metadata?: Record<string, unknown> } };
     expect(call.result.metadata).toMatchObject({ operation: 'update' });
     expect(call.result.snapshotData).toMatchObject({ editedAt: '2026-05-05T00:00:00.000Z', textLength: 5 });
+  });
+
+  it('round-3: infrastructure audit failure is NOT swallowed — throws AuditFinalizationPendingError', async () => {
+    const { AuditFinalizationPendingError } = await import('../../src/lib/moderation/pendingOperationsOutbox.js');
+    const audit = { recordEntityChange: vi.fn(async () => { throw new Error('db down'); }) } as unknown as AuditService;
+    const fixture = loadFixture('edited_message.json');
+    const ctx = { editedMessage: fixture.edited_message } as never;
+    await expect(
+      runWithUpdateContext({ updateId: String(fixture.update_id), chatId: '-1001111111111' }, () => recordMessageEdited(audit, logger(), ctx)),
+    ).rejects.toBeInstanceOf(AuditFinalizationPendingError);
   });
 });
 

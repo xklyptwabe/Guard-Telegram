@@ -5,6 +5,7 @@ import { AuditPolicyDisabledError, type AuditService } from '../auditService.js'
 import { getUpdateContext } from '../context.js';
 import type { Logger } from '../logger.js';
 import { normalizeError } from '../logger.js';
+import { AuditFinalizationPendingError } from '../moderation/pendingOperationsOutbox.js';
 import { AuditEventProcessor } from './eventProcessor.js';
 import type { RaiseAuditEventInput } from './eventProcessor.js';
 import { readCurrentSnapshotData } from './entitySnapshotLookup.js';
@@ -68,6 +69,44 @@ function raiseTextCapableEvent(input: Omit<RaiseAuditEventInput<'message.edited'
  * explicit `no_author` warning per update rather than silently wrong
  * audits. Requires `edited_message` in `TELEGRAM_ALLOWED_UPDATES`.
  */
+export async function recordMessageObserved(audit: AuditService, logger: Logger, ctx: Context): Promise<void> {
+  const message = ctx.message;
+  if (!message || ctx.editedMessage) return;
+  const userId = message.from ? String(message.from.id) : undefined;
+  if (userId === undefined) return;
+  const updateContext = getUpdateContext();
+  if (!updateContext) return;
+  const chatId = String(message.chat.id);
+  const messageId = String(message.message_id);
+  const text = message.text ?? message.caption;
+  const observedAt = new Date(message.date * 1000).toISOString();
+  const rawIncomingUpdateId = Number(updateContext.updateId);
+  const incomingUpdateId = Number.isFinite(rawIncomingUpdateId) ? rawIncomingUpdateId : 0;
+  try {
+    await audit.observeCurrentSnapshot({
+      tenantId: chatId,
+      subjectType: 'message',
+      subjectId: `${chatId}:${messageId}`,
+      eventType: 'message.edited',
+      eventVersion: 'v1',
+      moduleId: MODULE_IDS.messageAudit,
+      snapshotData: {
+        chatId,
+        messageId,
+        userId,
+        editedAt: observedAt,
+        observedUpdateId: incomingUpdateId,
+        textLength: text?.length ?? 0,
+        ...(text !== undefined ? { text } : {}),
+      },
+      observedUpdateId: incomingUpdateId,
+    });
+  } catch (error) {
+    logger.warn({ event: 'audit.message_observed.failed', chatId, details: { messageId }, error: normalizeError(error) });
+    throw new AuditFinalizationPendingError(`message observation snapshot for ${chatId}:${messageId} is still owed`);
+  }
+}
+
 export async function recordMessageEdited(audit: AuditService, logger: Logger, ctx: Context): Promise<void> {
   const message = ctx.editedMessage;
   if (!message) return;
@@ -140,7 +179,7 @@ export async function recordMessageEdited(audit: AuditService, logger: Logger, c
         const isStale =
           previousEditedAt !== undefined &&
           (previousEditedAt > editedAt || (previousEditedAt === editedAt && (previousUpdateId ?? 0) >= incomingUpdateId));
-        const afterData = isStale ? previous : { chatId, messageId, userId, editedAt, observedUpdateId: incomingUpdateId, textLength: text?.length ?? 0, ...(text !== undefined ? { text } : {}) };
+        const incomingAfter = { chatId, messageId, userId, editedAt, observedUpdateId: incomingUpdateId, textLength: text?.length ?? 0, ...(text !== undefined ? { text } : {}) };
         const operation = isStale ? 'noop' : previous ? 'update' : 'create';
 
         const record = raiseTextCapableEvent({
@@ -150,15 +189,24 @@ export async function recordMessageEdited(audit: AuditService, logger: Logger, c
           chatId,
           actorId: userId,
           before: previous ? observed(previous) : notObserved(),
-          after: observed(afterData),
+          after: observed(incomingAfter),
         });
         const mutationResult = toDownstreamMutationResult(record);
 
-        return { ...mutationResult, metadata: { operation, ...(isStale ? { outOfOrder: true } : {}) } };
+        return {
+          ...mutationResult,
+          metadata: { operation, ...(isStale ? { outOfOrder: true } : {}) },
+          snapshotData: isStale && previous ? previous : incomingAfter,
+        };
       },
     );
   } catch (error) {
+    if (error instanceof AuditPolicyDisabledError) {
+      logger.info({ event: 'audit.message_edited.policy_skipped', chatId, details: { messageId } });
+      return;
+    }
     logger.warn({ event: 'audit.message_edited.failed', chatId, details: { messageId }, error: normalizeError(error) });
+    throw new AuditFinalizationPendingError(`message.edited audit for ${chatId}:${messageId} is still owed`);
   }
 }
 

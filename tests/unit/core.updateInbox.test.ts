@@ -164,7 +164,7 @@ describe('UpdateInbox (BOTS-9 review BLOCKER-5)', () => {
     expect(again.busyReason).toBe('lease_held');
   });
 
-  it('round-2: an attempts-exhausted row reports exhausted (webhook answers 200 — no infinite retry loop)', async () => {
+  it('round-2: an attempts-exhausted row reports exhausted (webhook answers 503 — do not confirm)', async () => {
     const inbox = makeInbox(2);
     const first = await inbox.begin('bot-1', '201');
     expect(first.claim).toBe('claimed');

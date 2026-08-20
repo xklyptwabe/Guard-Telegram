@@ -11,6 +11,7 @@ import type { Cooldowns } from '../lib/cooldowns.js';
 import { getUpdateContext } from '../lib/context.js';
 import type { EventBus } from '../lib/eventBus.js';
 import type { Logger } from '../lib/logger.js';
+import { bots9WalExclusion } from '../lib/bots9WalExclusions.js';
 import { AuditFinalizationPendingError } from '../lib/moderation/pendingOperationsOutbox.js';
 import { hasPermission } from '../lib/permissions.js';
 import type { ReplyService } from '../lib/reply.js';
@@ -92,6 +93,7 @@ export class CommandDispatcher {
     if (!command || !identity) return;
     const t = this.translator(ctx);
     const startedAt = Date.now();
+    const cooldownKey = `${identity.chatId}:${identity.userId}:${command.id}`;
     try {
       if (!(await this.registry.isEnabled(identity.chatId, command.moduleId))) {
         this.logger.warn({ event: 'command.feature_disabled', module: command.moduleId, chatId: identity.chatId, userId: identity.userId, commandName });
@@ -103,7 +105,7 @@ export class CommandDispatcher {
         await this.reply.send(ctx, t('common.permissionDenied'));
         return;
       }
-      if (!this.cooldowns.take(`${identity.chatId}:${identity.userId}:${command.id}`, command.cooldownMs)) {
+      if (!this.cooldowns.take(cooldownKey, command.cooldownMs)) {
         this.logger.warn({ event: 'command.cooldown_denied', module: command.moduleId, chatId: identity.chatId, userId: identity.userId, commandName });
         await this.reply.send(ctx, t('common.cooldown'));
         return;
@@ -139,14 +141,19 @@ export class CommandDispatcher {
       // event, do NOT swallow — rethrow so the durable inbox fails the
       // update and Telegram redelivers it, which completes the audit
       // idempotently.
-      if (error instanceof AuditFinalizationPendingError) throw error;
+      if (error instanceof AuditFinalizationPendingError) {
+        this.cooldowns.release(cooldownKey);
+        throw error;
+      }
       this.logger.error({ event: 'command.failed', module: command.moduleId, chatId: identity.chatId, userId: identity.userId, commandName, error: { name: error instanceof Error ? error.name : 'UnknownError', message: error instanceof Error ? error.message : String(error) } });
       // The failure record is best-effort: if auditing is down, the
       // command's own error handling must still complete.
       try {
         await this.recordCommandExecuted(identity, command, commandName, durationMs, false);
-      } catch {
-        // already failing — nothing more to persist
+      } catch (auditError: unknown) {
+        this.cooldowns.release(cooldownKey);
+        if (auditError instanceof AuditFinalizationPendingError) throw auditError;
+        throw auditError;
       }
       await this.reply.send(ctx, t('common.internalError')).catch((replyError: unknown) => {
         this.logger.error({ event: 'command.error_reply_failed', module: command.moduleId, chatId: identity.chatId, userId: identity.userId, commandName, error: { name: replyError instanceof Error ? replyError.name : 'UnknownError', message: replyError instanceof Error ? replyError.message : String(replyError) } });
@@ -246,6 +253,7 @@ export class CommandDispatcher {
       // on the button the user just pressed; it expires within seconds and
       // has no lasting state. A write-ahead/retry would be pure overhead
       // with a stale-ack as its only possible outcome.
+      void bots9WalExclusion('telegram.answerCallbackQuery');
       await ctx.answerCallbackQuery({ text: t('common.callbackDone') }).catch((error: unknown) => {
         this.logger.error({ event: 'callback.answer_failed', ...(ctx.chat ? { chatId: String(ctx.chat.id) } : {}), ...(ctx.from ? { userId: String(ctx.from.id) } : {}), error: { name: error instanceof Error ? error.name : 'UnknownError', message: error instanceof Error ? error.message : String(error) } });
       });

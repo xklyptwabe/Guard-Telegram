@@ -122,6 +122,18 @@ describe('moderation commands: /restrict', () => {
     expect(context.sentMessages).toEqual([{ key: 'moderation.needsDuration' }]);
   });
 
+  it('rejects a duration below Telegram\'s 30-second minimum', async () => {
+    const moderation = { restrict: vi.fn() } as unknown as ModerationService;
+    const module = createModerationModule(moderation);
+    const restrict = module.commands!.find((c) => c.name === 'restrict')!;
+    const context = fakeContext({ ctx: fakeReplyCtx({ message: { reply_to_message: { from: { id: 3 } } } }) });
+
+    await restrict.execute(context, '10');
+
+    expect(moderation.restrict).not.toHaveBeenCalled();
+    expect(context.sentMessages).toEqual([{ key: 'moderation.needsDuration' }]);
+  });
+
   it('rejects a zero or negative duration', async () => {
     const moderation = { restrict: vi.fn() } as unknown as ModerationService;
     const module = createModerationModule(moderation);

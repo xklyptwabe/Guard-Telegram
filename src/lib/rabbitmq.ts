@@ -4,10 +4,14 @@ import amqp, { type ChannelModel, type ConfirmChannel, type ConsumeMessage } fro
 import { z } from 'zod';
 
 import type { AppConfig } from '../config.js';
+import type { DrizzleDatabase } from '../db/client.js';
+import { consumedEnvelopes } from '../db/schema/core.js';
+import { eq } from 'drizzle-orm';
 import { recordIntegrationAction } from './audit/integrationAudit.js';
 import type { AuditService } from './auditService.js';
 import type { Logger } from './logger.js';
 import type { PendingOperationResolvers, PendingOperationsOutbox } from './moderation/pendingOperationsOutbox.js';
+import { bots9WalExclusion } from './bots9WalExclusions.js';
 import { integrationOperationMetadata } from './integrations/externalOperationGateway.js';
 
 const actionEnvelopeSchema = z.object({
@@ -16,6 +20,17 @@ const actionEnvelopeSchema = z.object({
   attempt: z.number().int().min(0),
   payload: z.unknown(),
 });
+
+/** Built-in payloads the bot itself may publish. Additional types must be registered at bootstrap. */
+export const platformRabbitActionSchemas = {
+  'platform.ping': z.object({ reason: z.string().max(128) }).strict(),
+} as const;
+
+export function registerPlatformRabbitActionSchemas(bridge: { registerActionSchema(type: string, schema: z.ZodType): void }): void {
+  for (const [type, schema] of Object.entries(platformRabbitActionSchemas)) {
+    bridge.registerActionSchema(type, schema);
+  }
+}
 
 type ActionEnvelope = z.infer<typeof actionEnvelopeSchema>;
 export type ActionHandler = (action: ActionEnvelope) => Promise<void>;
@@ -73,11 +88,12 @@ export async function createRabbitMq(
   audit: AuditService,
   outbox?: PendingOperationsOutbox,
   resolvers?: PendingOperationResolvers,
+  db?: DrizzleDatabase,
 ): Promise<RabbitMqBridge> {
   if (!config.rabbitMqEnabled) {
     return {
       enabled: false,
-      publish: () => Promise.resolve(),
+      publish: () => Promise.reject(new Error('RabbitMQ is disabled')),
       consume: () => Promise.resolve(),
       registerActionSchema: () => undefined,
       close: () => Promise.resolve(),
@@ -146,8 +162,11 @@ export async function createRabbitMq(
         return { messageId: envelope.id };
       },
     );
-    if (result.outcome.status === 'failed') {
-      throw new Error(`RabbitMQ publish failed: ${JSON.stringify(result.outcome.result ?? {})}`);
+    if (result.isFinal && !result.auditFinalized) {
+      throw new Error(`RabbitMQ publish audit is still owed for type ${type}`);
+    }
+    if (result.outcome.status !== 'succeeded') {
+      throw new Error(`RabbitMQ publish ${result.outcome.status}: ${JSON.stringify(result.outcome.result ?? {})}`);
     }
   };
 
@@ -182,11 +201,15 @@ export async function createRabbitMq(
 
   // Recovery executor for `rabbitmq.publish` rows found after a restart:
   // republish the STORED envelope — same id, so broker/consumer dedup holds.
-  resolvers?.register('rabbitmq.publish', async (stored) => {
-    const envelope = actionEnvelopeSchema.parse((stored as { envelope: unknown }).envelope);
-    await publishConfirmed(channel, topology.actionsExchange, topology.routingKey, envelope);
-    return { messageId: envelope.id };
-  });
+  resolvers?.register(
+    'rabbitmq.publish',
+    async (stored) => {
+      const envelope = actionEnvelopeSchema.parse((stored as { envelope: unknown }).envelope);
+      await publishConfirmed(channel, topology.actionsExchange, topology.routingKey, envelope);
+      return { messageId: envelope.id };
+    },
+    { retryAfterUnknown: false },
+  );
 
   const sendToQueue = async (queue: string, envelope: ActionEnvelope): Promise<void> => {
     const accepted = channel.sendToQueue(queue, Buffer.from(JSON.stringify(envelope)), {
@@ -227,19 +250,16 @@ export async function createRabbitMq(
       // BOTS-9 review round-2 (BLOCKER-3): inbound payloads for a known
       // action type are normalized through the SAME registered schema —
       // an envelope whose payload violates it is treated as invalid.
-      const payloadSchema = actionSchemas.get(action.type);
-      if (payloadSchema) {
-        const parsedPayload = payloadSchema.safeParse(action.payload);
-        if (!parsedPayload.success) throw new Error(`Invalid payload for registered action type "${action.type}"`);
-        action = { ...action, payload: parsedPayload.data };
-      }
+      action = { ...action, payload: validatePayload(action.type, action.payload) };
     } catch (error: unknown) {
     try {
       await sendToQueue(topology.deadLetterQueue, { id: randomUUID(), type: 'invalid', attempt: 0, payload: { reason: 'invalid_message' } });
       await auditBestEffort({ integrationId: 'rabbitmq', action: 'dlq', targetType: 'queue', targetId: topology.deadLetterQueue, outcome: 'succeeded' });
+      void bots9WalExclusion('rabbitmq.ack');
       channel.ack(message);
       logger.warn({ event: 'rabbitmq.invalid_to_dlq', error: { name: error instanceof Error ? error.name : 'UnknownError', message: error instanceof Error ? error.message : String(error) } });
     } catch {
+      void bots9WalExclusion('rabbitmq.nack');
       channel.nack(message, false, true);
     }
     return;
@@ -247,7 +267,28 @@ export async function createRabbitMq(
     try {
       const handler = handlers.get(action.type);
       if (!handler) throw new Error('No consumer registered for action type');
-      await handler(action);
+      if (db) {
+        const claimed = await db
+          .insert(consumedEnvelopes)
+          .values({ envelopeId: action.id })
+          .onConflictDoNothing({ target: consumedEnvelopes.envelopeId })
+          .returning({ envelopeId: consumedEnvelopes.envelopeId });
+        if (!claimed[0]) {
+          void bots9WalExclusion('rabbitmq.ack');
+          channel.ack(message);
+          logger.info({ event: 'rabbitmq.envelope.duplicate_skipped', details: { envelopeId: action.id, actionType: action.type } });
+          return;
+        }
+      }
+      try {
+        await handler(action);
+      } catch (handlerError: unknown) {
+        if (db) {
+          await db.delete(consumedEnvelopes).where(eq(consumedEnvelopes.envelopeId, action.id));
+        }
+        throw handlerError;
+      }
+      void bots9WalExclusion('rabbitmq.ack');
       channel.ack(message);
     } catch (error: unknown) {
       const next = { ...action, attempt: action.attempt + 1 };
@@ -260,9 +301,11 @@ export async function createRabbitMq(
           await rerouteWithAudit(topology.retryQueue, next, 'retry');
           logger.warn({ event: 'rabbitmq.retry_scheduled', details: { actionType: action.type, attempt: next.attempt } });
         }
+        void bots9WalExclusion('rabbitmq.ack');
         channel.ack(message);
       } catch (publishError: unknown) {
         logger.error({ event: 'rabbitmq.retry_publish_failed', details: { actionType: action.type }, error: { name: publishError instanceof Error ? publishError.name : 'UnknownError', message: publishError instanceof Error ? publishError.message : String(publishError) } });
+        void bots9WalExclusion('rabbitmq.nack');
         channel.nack(message, false, true);
       }
     }

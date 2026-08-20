@@ -41,7 +41,9 @@ const en = {
   moderation: {
     needsTarget: 'Reply to a member\'s message, or give their user_id as the first argument.',
     needsReply: 'This command only works as a reply to the message you want deleted.',
-    needsDuration: 'Give the restriction duration in seconds (a positive integer).',
+    needsDuration: 'Give the restriction duration in seconds (30 to 31622400).',
+    cannotTargetSelf: 'You cannot run this action on yourself.',
+    cannotTargetBot: 'You cannot run this action on the bot.',
     succeeded: 'Action "{{action}}" completed.',
     failed: 'Telegram rejected the "{{action}}" action. Check the bot\'s admin rights in this chat.',
     unknown: 'Could not confirm the result of "{{action}}" — Telegram did not respond in time. It will be retried automatically; check back to confirm the outcome.',

@@ -1,6 +1,6 @@
 import { MODULE_IDS } from '../../constants.js';
 import type { TelegramBotModule } from '../../core/contracts.js';
-import { recordMessageEdited } from '../../lib/audit/messageAudit.js';
+import { recordMessageEdited, recordMessageObserved } from '../../lib/audit/messageAudit.js';
 import type { AuditService } from '../../lib/auditService.js';
 import type { Logger } from '../../lib/logger.js';
 
@@ -27,6 +27,12 @@ export function createMessageAuditModule(audit: AuditService, logger: Logger): T
     global: true,
     defaultEnabled: true,
     updateHandlers: [
+      {
+        id: 'message-audit-observed-message',
+        async handle(ctx): Promise<void> {
+          await recordMessageObserved(audit, logger, ctx);
+        },
+      },
       {
         id: 'message-audit-edited-message',
         async handle(ctx): Promise<void> {

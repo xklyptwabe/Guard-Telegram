@@ -129,6 +129,11 @@ export class AuditFinalizationPendingError extends Error {
   }
 }
 
+export function isAuditPendingError(error: unknown): boolean {
+  if (error instanceof AuditFinalizationPendingError) return true;
+  return error instanceof Error && (error.name === 'AuditFinalizationPendingError' || error.name.endsWith('AuditPendingError'));
+}
+
 /**
  * BOTS-9 review finding (BLOCKER-3): the confirmed-vs-unknown
  * classification must not be Telegram-specific — an S3 4xx/5xx *response*
@@ -196,7 +201,7 @@ export class PendingOperationResolvers {
 
   /** Whether an `unknown` outcome for this kind may schedule a blind retry. Unknown kinds default to safe (true) for forward compatibility. */
   public retryAfterUnknown(kind: string): boolean {
-    return this.resolvers.get(kind)?.retryAfterUnknown ?? true;
+    return this.resolvers.get(kind)?.retryAfterUnknown ?? false;
   }
 }
 
@@ -277,6 +282,7 @@ export class PendingOperationsOutbox {
   private readonly workerId = randomUUID();
   private workerTimer: ReturnType<typeof setTimeout> | undefined;
   private workerStopped = true;
+  private defaultFinalizer: PendingOperationFinalizer | undefined;
   /** Every background sweep currently in flight, so {@link stopAndDrain} can await them before the process tears down its database pool. */
   private readonly activeSweeps = new Set<Promise<unknown>>();
 
@@ -288,6 +294,11 @@ export class PendingOperationsOutbox {
     private readonly callTimeoutMs: number = PENDING_OPERATION_CALL_TIMEOUT_MS,
     private readonly leaseDurationMs: number = PENDING_OPERATION_LEASE_DURATION_MS,
   ) {}
+
+  /** Used when execute()/worker omit onFinal (S3/Rabbit live path). */
+  public setDefaultFinalizer(onFinal: PendingOperationFinalizer): void {
+    this.defaultFinalizer = onFinal;
+  }
 
   /**
    * Writes the operation ahead, then attempts it once. If a row for this
@@ -639,10 +650,11 @@ export class PendingOperationsOutbox {
    * would resurrect the event on redelivery.
    */
   private async finalizeAudit(row: PendingOperationRow, outcome: AttemptOutcome, onFinal: PendingOperationFinalizer | undefined): Promise<AuditFinalizeStatus> {
-    if (!onFinal) return 'failed';
+    const finalizer = onFinal ?? this.defaultFinalizer;
+    if (!finalizer) return 'failed';
     if (row.auditStatus === 'written' || row.auditStatus === 'policy_skipped') return 'recorded';
     try {
-      const result = await onFinal(row, outcome);
+      const result = await finalizer(row, outcome);
       if (result.status === 'policy_skipped') {
         await this.markAuditSkipped(row.id);
         return 'policy_skipped';
@@ -690,20 +702,16 @@ export class PendingOperationsOutbox {
     for (;;) {
       const claimed = await this.claimAuditPending();
       if (!claimed) return;
-      if (!onFinal) {
+      const finalizer = onFinal ?? this.defaultFinalizer;
+      if (!finalizer) {
         await this.releaseAuditClaim(claimed.id);
         this.logger.warn({ event: 'pending_operations.audit.backfill_no_finalizer', details: { kind: claimed.kind, id: claimed.id } });
         return;
       }
       const outcome: AttemptOutcome = claimed.result ? { status: claimed.status as AttemptOutcome['status'], result: claimed.result } : { status: claimed.status as AttemptOutcome['status'] };
-      const status = await this.finalizeAudit(claimed, outcome, onFinal);
+      const status = await this.finalizeAudit(claimed, outcome, finalizer);
       if (status === 'failed') {
-        // Audit still owed and could not be written right now — release the
-        // claim and stop this pass; the next worker tick retries (no tight
-        // failure loop). recorded/policy_skipped both make the row terminal
-        // for audit purposes, so the pass continues.
-        await this.releaseAuditClaim(claimed.id);
-        return;
+        continue;
       }
     }
   }

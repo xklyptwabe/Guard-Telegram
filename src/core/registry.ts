@@ -50,7 +50,7 @@ export class ProtectedModuleDisableError extends Error {
 function moduleStateAuditIdempotencyKey(chatId: string, moduleId: string): string {
   const context = getUpdateContext();
   if (!context) throw new MissingModuleAuditIdempotencyKeyError();
-  return `module.state.changed:telegram-update:${context.updateId}:${chatId}:${moduleId}`;
+  return `module.state.changed:telegram-update:${context.botId ?? 'unscoped-bot'}:${context.updateId}:${chatId}:${moduleId}`;
 }
 
 export class ModuleRegistry {
@@ -115,7 +115,6 @@ export class ModuleRegistry {
     const options = typeof actorIdOrOptions === 'string' ? { actorId: actorIdOrOptions } : actorIdOrOptions;
     const actorId = options?.actorId;
     const idempotencyKey = options?.idempotencyKey ?? moduleStateAuditIdempotencyKey(chatId, moduleId);
-    const afterSource = enabled === module.defaultEnabled ? 'default' : 'override';
     const result = await this.audit.recordEntityChange(
       {
         tenantId: chatId,
@@ -155,20 +154,17 @@ export class ModuleRegistry {
             });
         }
 
-        // Route through BOTS-7's registry: validates against the
-        // module.state.changed schema, applies the allowlist, and strips
-        // forbidden keys, before anything reaches the audit event row.
-        // Previously this callback built before/after by hand and none of
-        // that pipeline ever ran.
-        // A genuine noop requires both the effective value *and* its
-        // source to be unchanged. Value-only comparison misses a real
-        // case: if an admin redundantly overrides a module to its own
-        // default (creating an unnecessary row) and later sets it to the
-        // same value again, the override row above gets deleted as
-        // cleanup — the boolean doesn't change, but the row does, and
-        // source flips override → default. That's a real state change,
-        // not a noop, even though `enabled` alone looks unchanged.
-        const operation = beforeEnabled === enabled && beforeSource === afterSource ? 'noop' : 'update';
+        // BOTS-7: after is the persisted override row (or its absence =
+        // inheriting default), not the argument we meant to write.
+        const persisted = await tx
+          .select({ enabled: chatModuleStates.enabled })
+          .from(chatModuleStates)
+          .where(and(eq(chatModuleStates.chatId, chatId), eq(chatModuleStates.moduleId, moduleId)))
+          .limit(1);
+        const persistedEnabled = resolveModuleEnabled(module.defaultEnabled, persisted[0]?.enabled);
+        const persistedSource = persisted[0] ? 'override' : 'default';
+
+        const operation = beforeEnabled === persistedEnabled && beforeSource === persistedSource ? 'noop' : 'update';
         const record = this.auditProcessor.process({
           name: 'module.state.changed',
           version: 1,
@@ -176,7 +172,7 @@ export class ModuleRegistry {
           chatId,
           ...(actorId !== undefined ? { actorId } : {}),
           before: observed({ chatId, moduleId, enabled: beforeEnabled, source: beforeSource }),
-          after: observed({ chatId, moduleId, enabled, source: afterSource }),
+          after: observed({ chatId, moduleId, enabled: persistedEnabled, source: persistedSource }),
         });
         const mutationResult = toDownstreamMutationResult(record);
 

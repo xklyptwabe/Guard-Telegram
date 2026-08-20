@@ -10,7 +10,7 @@ import { ModuleRegistry } from './core/registry.js';
 import { createTelegramBot } from './core/telegram.js';
 import { registerBotMembershipAudit, registerModuleUpdateHandlers, registerPlatformMiddleware, startLongPolling, startWebhook, type TransportController } from './core/updates.js';
 import { createDatabase } from './db/client.js';
-import { purgeExpiredProcessedUpdates } from './db/retention.js';
+import { purgeExpiredConsumedEnvelopes, purgeExpiredProcessedUpdates } from './db/retention.js';
 import { createRedis } from './db/redis.js';
 import { initializeI18n } from './i18n/index.js';
 import { AuditService } from './lib/auditService.js';
@@ -23,7 +23,7 @@ import { Logger } from './lib/logger.js';
 import { ModerationService } from './lib/moderation/moderationService.js';
 import { PendingOperationResolvers, PendingOperationsOutbox } from './lib/moderation/pendingOperationsOutbox.js';
 import { buildOutboxFinalizer, makeIntegrationAuditFinalizer } from './lib/integrations/externalOperationGateway.js';
-import { createRabbitMq } from './lib/rabbitmq.js';
+import { createRabbitMq, registerPlatformRabbitActionSchemas } from './lib/rabbitmq.js';
 import { ReplyService } from './lib/reply.js';
 import { createStorage } from './lib/storage.js';
 import { createModules } from './modules/index.js';
@@ -70,6 +70,7 @@ async function bootstrap(): Promise<void> {
     await migrate(database.db, { migrationsFolder: 'src/db/migrations' });
     logger.info({ event: 'database.migrations.completed' });
     await purgeExpiredProcessedUpdates(database.db);
+    await purgeExpiredConsumedEnvelopes(database.db);
     redis = await createRedis(config, logger);
     const audit = new AuditService(database.db);
     const bot = createTelegramBot(config, logger);
@@ -83,12 +84,14 @@ async function bootstrap(): Promise<void> {
     const pendingOperationsOutbox = new PendingOperationsOutbox(database.db, logger, pendingOperationResolvers);
     sharedOutbox = pendingOperationsOutbox;
     storage = createStorage(config, logger, pendingOperationsOutbox, pendingOperationResolvers);
-    rabbitMq = await createRabbitMq(config, logger, audit, pendingOperationsOutbox, pendingOperationResolvers);
+    rabbitMq = await createRabbitMq(config, logger, audit, pendingOperationsOutbox, pendingOperationResolvers, database.db);
+    registerPlatformRabbitActionSchemas(rabbitMq);
     const chatSettings = new ChatSettingsService(database.db, audit);
     moderation = new ModerationService(bot, audit, pendingOperationsOutbox, pendingOperationResolvers, logger);
     // One terminal-audit finalizer for every kind: telegram.* → moderation
     // events, everything else → integration.action (BLOCKER-3 + HIGH-3).
     const outboxFinalizer = buildOutboxFinalizer(moderation, makeIntegrationAuditFinalizer(audit, logger));
+    pendingOperationsOutbox.setDefaultFinalizer(outboxFinalizer);
 
     const modules = createModules({ audit, logger, chatSettings, moderation });
     validateModules(modules);

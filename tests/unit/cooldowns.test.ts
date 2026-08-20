@@ -39,4 +39,11 @@ describe('Cooldowns', () => {
     expect(internals.expiresAt.has('fresh')).toBe(true);
     expect(cooldowns.take('fresh', 1_000, 150)).toBe(false); // живой ключ не пострадал
   });
+
+  it('release undoes take so a redelivery can proceed', () => {
+    const cooldowns = new Cooldowns();
+    expect(cooldowns.take('k', 1_000, 10_000)).toBe(true);
+    cooldowns.release('k');
+    expect(cooldowns.take('k', 1_000, 10_100)).toBe(true);
+  });
 });

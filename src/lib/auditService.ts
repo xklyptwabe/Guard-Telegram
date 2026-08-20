@@ -6,9 +6,11 @@ import {
   AUDIT_OPERATIONAL_METADATA_ALLOWLIST,
   applyAllowlist,
   isForbiddenAuditString,
+  stripForbidden,
   type AuditPolicyContext,
 } from './audit/masking.js';
 import { resolveEffectiveAuditPolicy, type EffectiveAuditPolicy } from './audit/policyResolution.js';
+import { AuditSnapshotValidationError } from './audit/errors.js';
 import {
   normalizeAuditMutationForPersistence,
   requireAuditPersistenceDefinition,
@@ -86,6 +88,101 @@ export class ForbiddenAuditValueError extends Error {
 
 export class AuditService {
   public constructor(private readonly db: DrizzleDatabase) {}
+
+  /** Apply BOTS-8 masking to outbox metadata before it is persisted. */
+  public async maskOutboxMetadata(input: {
+    readonly tenantId: string;
+    readonly eventType: string;
+    readonly eventVersion: string;
+    readonly moduleId?: string;
+    readonly metadata: Record<string, unknown>;
+  }): Promise<Record<string, unknown>> {
+    const policy = await resolveEffectiveAuditPolicy(this.db, {
+      eventType: input.eventType,
+      eventVersion: input.eventVersion,
+      chatId: input.tenantId,
+      ...(input.moduleId !== undefined ? { moduleId: input.moduleId } : {}),
+    });
+    const metadata = { ...input.metadata };
+    for (const field of policy.values.masking) {
+      if (field in metadata) metadata[field] = '[redacted]';
+    }
+    return stripForbidden(metadata);
+  }
+
+  /**
+   * Persist the last observed subject snapshot without inventing an audit
+   * event (no message.created in the registry). Used for ordinary `message`
+   * updates so a later edit/delete has a real `before`.
+   */
+  public async observeCurrentSnapshot(input: {
+    readonly tenantId: string;
+    readonly subjectType: string;
+    readonly subjectId: string;
+    readonly eventType: string;
+    readonly eventVersion: string;
+    readonly moduleId?: string;
+    readonly snapshotData: Record<string, unknown>;
+    readonly observedUpdateId: number;
+  }): Promise<void> {
+    const snapshotWhere = and(
+      eq(entitySnapshots.tenantId, input.tenantId),
+      eq(entitySnapshots.entityType, input.subjectType),
+      eq(entitySnapshots.entityId, input.subjectId),
+    );
+    await this.db.transaction(async (tx) => {
+      const policy = await resolveEffectiveAuditPolicy(tx, {
+        eventType: input.eventType,
+        eventVersion: input.eventVersion,
+        chatId: input.tenantId,
+        ...(input.moduleId !== undefined ? { moduleId: input.moduleId } : {}),
+      });
+      const definition = requireAuditPersistenceDefinition({
+        eventType: input.eventType,
+        eventVersion: input.eventVersion,
+        category: 'message',
+      });
+      const schema = definition.sparseSnapshotSchema ?? definition.snapshotSchema;
+      const parsed = schema.safeParse(input.snapshotData);
+      if (!parsed.success) {
+        throw new AuditSnapshotValidationError(definition.name, 'snapshotData', parsed.error.message);
+      }
+      const masked: Record<string, unknown> = applyAllowlist(
+        parsed.data as Record<string, unknown>,
+        definition.allowlist,
+        {
+          allowMessageTextLogging: policy.values.allowlist.includes('text'),
+          ...(policy.values.masking.length > 0 ? { masking: policy.values.masking } : {}),
+        },
+      );
+      await tx
+        .insert(entitySnapshots)
+        .values({
+          tenantId: input.tenantId,
+          entityType: input.subjectType,
+          entityId: input.subjectId,
+          snapshotStatus: 'current',
+          snapshotData: {},
+          lastSubjectSequence: 0,
+        })
+        .onConflictDoNothing({ target: [entitySnapshots.tenantId, entitySnapshots.entityType, entitySnapshots.entityId] });
+      const rows = await tx
+        .select({ snapshotData: entitySnapshots.snapshotData })
+        .from(entitySnapshots)
+        .where(snapshotWhere)
+        .limit(1)
+        .for('update');
+      const existing = rows[0]?.snapshotData as Record<string, unknown> | undefined;
+      const existingId = typeof existing?.observedUpdateId === 'number' ? existing.observedUpdateId : undefined;
+      if (existing && Object.keys(existing).length > 0 && existingId !== undefined && existingId >= input.observedUpdateId) {
+        return;
+      }
+      await tx
+        .update(entitySnapshots)
+        .set({ snapshotStatus: 'current', snapshotData: masked, updatedAt: new Date() })
+        .where(snapshotWhere);
+    });
+  }
 
   public async recordEntityChange<TSnapshot extends Record<string, unknown>>(
     input: AuditEventInput,
