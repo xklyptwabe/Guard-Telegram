@@ -148,6 +148,13 @@
       "when": 1787200000000,
       "tag": "0020_least_privilege_inbox_outbox",
       "breakpoints": true
+    },
+    {
+      "idx": 21,
+      "version": "7",
+      "when": 1787210000000,
+      "tag": "0021_consumed_envelopes",
+      "breakpoints": true
     }
   ]
 }

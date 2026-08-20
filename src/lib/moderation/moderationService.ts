@@ -284,7 +284,13 @@ export class ModerationService {
       ? `moderation.action:telegram-update:${context.botId ?? 'unscoped-bot'}:${context.updateId}:${input.chatId}:${input.targetUserId}:${action}`
       : `moderation.action:${input.chatId}:${input.targetUserId}:${action}${durationKey}`;
     const reason = input.reason !== undefined ? input.reason.slice(0, 500) : undefined;
-    const metadata: Record<string, unknown> = { action, actorUserId: input.actorUserId, targetUserId: input.targetUserId, ...(reason !== undefined && reason.length > 0 ? { reason } : {}) };
+    const metadata = await this.audit.maskOutboxMetadata({
+      tenantId: input.chatId,
+      eventType: 'moderation.action',
+      eventVersion: 'v1',
+      moduleId: MODULE_IDS.moderation,
+      metadata: { action, actorUserId: input.actorUserId, targetUserId: input.targetUserId, ...(reason !== undefined && reason.length > 0 ? { reason } : {}) },
+    });
     return this.outbox.execute(
       { kind, chatId: input.chatId, idempotencyKey, requestPayload, metadata },
       this.resolvers.get(kind)!,

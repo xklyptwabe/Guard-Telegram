@@ -69,6 +69,44 @@ function raiseTextCapableEvent(input: Omit<RaiseAuditEventInput<'message.edited'
  * explicit `no_author` warning per update rather than silently wrong
  * audits. Requires `edited_message` in `TELEGRAM_ALLOWED_UPDATES`.
  */
+export async function recordMessageObserved(audit: AuditService, logger: Logger, ctx: Context): Promise<void> {
+  const message = ctx.message;
+  if (!message || ctx.editedMessage) return;
+  const userId = message.from ? String(message.from.id) : undefined;
+  if (userId === undefined) return;
+  const updateContext = getUpdateContext();
+  if (!updateContext) return;
+  const chatId = String(message.chat.id);
+  const messageId = String(message.message_id);
+  const text = message.text ?? message.caption;
+  const observedAt = new Date(message.date * 1000).toISOString();
+  const rawIncomingUpdateId = Number(updateContext.updateId);
+  const incomingUpdateId = Number.isFinite(rawIncomingUpdateId) ? rawIncomingUpdateId : 0;
+  try {
+    await audit.observeCurrentSnapshot({
+      tenantId: chatId,
+      subjectType: 'message',
+      subjectId: `${chatId}:${messageId}`,
+      eventType: 'message.edited',
+      eventVersion: 'v1',
+      moduleId: MODULE_IDS.messageAudit,
+      snapshotData: {
+        chatId,
+        messageId,
+        userId,
+        editedAt: observedAt,
+        observedUpdateId: incomingUpdateId,
+        textLength: text?.length ?? 0,
+        ...(text !== undefined ? { text } : {}),
+      },
+      observedUpdateId: incomingUpdateId,
+    });
+  } catch (error) {
+    logger.warn({ event: 'audit.message_observed.failed', chatId, details: { messageId }, error: normalizeError(error) });
+    throw new AuditFinalizationPendingError(`message observation snapshot for ${chatId}:${messageId} is still owed`);
+  }
+}
+
 export async function recordMessageEdited(audit: AuditService, logger: Logger, ctx: Context): Promise<void> {
   const message = ctx.editedMessage;
   if (!message) return;

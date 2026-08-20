@@ -4,10 +4,14 @@ import amqp, { type ChannelModel, type ConfirmChannel, type ConsumeMessage } fro
 import { z } from 'zod';
 
 import type { AppConfig } from '../config.js';
+import type { DrizzleDatabase } from '../db/client.js';
+import { consumedEnvelopes } from '../db/schema/core.js';
+import { eq } from 'drizzle-orm';
 import { recordIntegrationAction } from './audit/integrationAudit.js';
 import type { AuditService } from './auditService.js';
 import type { Logger } from './logger.js';
 import type { PendingOperationResolvers, PendingOperationsOutbox } from './moderation/pendingOperationsOutbox.js';
+import { bots9WalExclusion } from './bots9WalExclusions.js';
 import { integrationOperationMetadata } from './integrations/externalOperationGateway.js';
 
 const actionEnvelopeSchema = z.object({
@@ -84,6 +88,7 @@ export async function createRabbitMq(
   audit: AuditService,
   outbox?: PendingOperationsOutbox,
   resolvers?: PendingOperationResolvers,
+  db?: DrizzleDatabase,
 ): Promise<RabbitMqBridge> {
   if (!config.rabbitMqEnabled) {
     return {
@@ -250,9 +255,11 @@ export async function createRabbitMq(
     try {
       await sendToQueue(topology.deadLetterQueue, { id: randomUUID(), type: 'invalid', attempt: 0, payload: { reason: 'invalid_message' } });
       await auditBestEffort({ integrationId: 'rabbitmq', action: 'dlq', targetType: 'queue', targetId: topology.deadLetterQueue, outcome: 'succeeded' });
+      void bots9WalExclusion('rabbitmq.ack');
       channel.ack(message);
       logger.warn({ event: 'rabbitmq.invalid_to_dlq', error: { name: error instanceof Error ? error.name : 'UnknownError', message: error instanceof Error ? error.message : String(error) } });
     } catch {
+      void bots9WalExclusion('rabbitmq.nack');
       channel.nack(message, false, true);
     }
     return;
@@ -260,7 +267,28 @@ export async function createRabbitMq(
     try {
       const handler = handlers.get(action.type);
       if (!handler) throw new Error('No consumer registered for action type');
-      await handler(action);
+      if (db) {
+        const claimed = await db
+          .insert(consumedEnvelopes)
+          .values({ envelopeId: action.id })
+          .onConflictDoNothing({ target: consumedEnvelopes.envelopeId })
+          .returning({ envelopeId: consumedEnvelopes.envelopeId });
+        if (!claimed[0]) {
+          void bots9WalExclusion('rabbitmq.ack');
+          channel.ack(message);
+          logger.info({ event: 'rabbitmq.envelope.duplicate_skipped', details: { envelopeId: action.id, actionType: action.type } });
+          return;
+        }
+      }
+      try {
+        await handler(action);
+      } catch (handlerError: unknown) {
+        if (db) {
+          await db.delete(consumedEnvelopes).where(eq(consumedEnvelopes.envelopeId, action.id));
+        }
+        throw handlerError;
+      }
+      void bots9WalExclusion('rabbitmq.ack');
       channel.ack(message);
     } catch (error: unknown) {
       const next = { ...action, attempt: action.attempt + 1 };
@@ -273,9 +301,11 @@ export async function createRabbitMq(
           await rerouteWithAudit(topology.retryQueue, next, 'retry');
           logger.warn({ event: 'rabbitmq.retry_scheduled', details: { actionType: action.type, attempt: next.attempt } });
         }
+        void bots9WalExclusion('rabbitmq.ack');
         channel.ack(message);
       } catch (publishError: unknown) {
         logger.error({ event: 'rabbitmq.retry_publish_failed', details: { actionType: action.type }, error: { name: publishError instanceof Error ? publishError.name : 'UnknownError', message: publishError instanceof Error ? publishError.message : String(publishError) } });
+        void bots9WalExclusion('rabbitmq.nack');
         channel.nack(message, false, true);
       }
     }

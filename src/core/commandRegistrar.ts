@@ -4,6 +4,7 @@ import type { i18n } from 'i18next';
 
 import type { TelegramBotModule, TelegramCommandDefinition } from './contracts.js';
 import type { CommandDispatcher } from './dispatcher.js';
+import { bots9WalExclusion } from '../lib/bots9WalExclusions.js';
 import type { Logger } from '../lib/logger.js';
 
 export function collectCommands(modules: readonly TelegramBotModule[]): readonly TelegramCommandDefinition[] {
@@ -26,6 +27,7 @@ export async function registerCommands(
 ): Promise<void> {
   const commands = collectCommands(modules);
   const defaultMenu: BotCommand[] = commands.map((command) => ({ command: command.name, description: String(i18n.t(command.descriptionKey, { lng: 'ru' })) }));
+  void bots9WalExclusion('telegram.setMyCommands');
   await bot.api.setMyCommands(defaultMenu);
   for (const languageCode of ['ru', 'en'] as const) {
     const menu: BotCommand[] = commands.map((command) => ({ command: command.name, description: String(i18n.t(command.descriptionKey, { lng: languageCode })) }));

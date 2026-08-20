@@ -83,7 +83,7 @@ async function bootstrap(): Promise<void> {
     const pendingOperationsOutbox = new PendingOperationsOutbox(database.db, logger, pendingOperationResolvers);
     sharedOutbox = pendingOperationsOutbox;
     storage = createStorage(config, logger, pendingOperationsOutbox, pendingOperationResolvers);
-    rabbitMq = await createRabbitMq(config, logger, audit, pendingOperationsOutbox, pendingOperationResolvers);
+    rabbitMq = await createRabbitMq(config, logger, audit, pendingOperationsOutbox, pendingOperationResolvers, database.db);
     registerPlatformRabbitActionSchemas(rabbitMq);
     const chatSettings = new ChatSettingsService(database.db, audit);
     moderation = new ModerationService(bot, audit, pendingOperationsOutbox, pendingOperationResolvers, logger);

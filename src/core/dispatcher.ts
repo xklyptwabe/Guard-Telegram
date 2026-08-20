@@ -11,6 +11,7 @@ import type { Cooldowns } from '../lib/cooldowns.js';
 import { getUpdateContext } from '../lib/context.js';
 import type { EventBus } from '../lib/eventBus.js';
 import type { Logger } from '../lib/logger.js';
+import { bots9WalExclusion } from '../lib/bots9WalExclusions.js';
 import { AuditFinalizationPendingError } from '../lib/moderation/pendingOperationsOutbox.js';
 import { hasPermission } from '../lib/permissions.js';
 import type { ReplyService } from '../lib/reply.js';
@@ -252,6 +253,7 @@ export class CommandDispatcher {
       // on the button the user just pressed; it expires within seconds and
       // has no lasting state. A write-ahead/retry would be pure overhead
       // with a stale-ack as its only possible outcome.
+      void bots9WalExclusion('telegram.answerCallbackQuery');
       await ctx.answerCallbackQuery({ text: t('common.callbackDone') }).catch((error: unknown) => {
         this.logger.error({ event: 'callback.answer_failed', ...(ctx.chat ? { chatId: String(ctx.chat.id) } : {}), ...(ctx.from ? { userId: String(ctx.from.id) } : {}), error: { name: error instanceof Error ? error.name : 'UnknownError', message: error instanceof Error ? error.message : String(error) } });
       });

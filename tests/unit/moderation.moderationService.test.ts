@@ -26,6 +26,7 @@ function fakeAuditService() {
       calls.push({ input, result });
       return { eventId: 'evt', subjectSequence: 1, duplicate: false };
     }),
+    maskOutboxMetadata: vi.fn(async (input: { metadata: Record<string, unknown> }) => input.metadata),
   } as unknown as AuditService;
   return { audit, calls };
 }

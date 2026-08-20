@@ -13,6 +13,7 @@ import { constantTimeEquals } from '../lib/cryptoEquals.js';
 import type { Logger } from '../lib/logger.js';
 import type { ModuleRegistry } from './registry.js';
 import type { TelegramBotModule } from './contracts.js';
+import { bots9WalExclusion } from '../lib/bots9WalExclusions.js';
 import { isAuditPendingError } from '../lib/moderation/pendingOperationsOutbox.js';
 import { UpdateInbox } from './updateInbox.js';
 
@@ -265,6 +266,8 @@ export async function startWebhook(bot: Bot<Context>, config: AppConfig, logger:
   if (!config.telegramWebhookUrl || !config.telegramWebhookSecret) throw new Error('Webhook configuration is incomplete');
   const webhookUrl = new URL(config.telegramWebhookUrl);
   const secret = config.telegramWebhookSecret;
+  // BOTS-9 HIGH-5: bootstrap-only, idempotent; retry-by-restart, not WAL.
+  void bots9WalExclusion('telegram.setWebhook');
   await bot.api.setWebhook(webhookUrl.toString(), {
     secret_token: secret,
     allowed_updates: config.telegramAllowedUpdates,

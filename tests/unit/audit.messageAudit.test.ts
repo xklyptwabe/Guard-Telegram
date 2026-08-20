@@ -3,7 +3,7 @@ import { fileURLToPath } from 'node:url';
 
 import { describe, expect, it, vi } from 'vitest';
 
-import { recordMessageDeleted, recordMessageEdited } from '../../src/lib/audit/messageAudit.js';
+import { recordMessageDeleted, recordMessageEdited, recordMessageObserved } from '../../src/lib/audit/messageAudit.js';
 import type { AuditService } from '../../src/lib/auditService.js';
 import { runWithUpdateContext } from '../../src/lib/context.js';
 import type { Logger } from '../../src/lib/logger.js';
@@ -24,6 +24,8 @@ function fakeAuditService(currentSnapshotRows: Array<Record<string, unknown>> = 
       calls.push({ input, result });
       return { eventId: 'evt-1', subjectSequence: 1, duplicate: false };
     }),
+    observeCurrentSnapshot: vi.fn(async () => undefined),
+    maskOutboxMetadata: vi.fn(async (input: { metadata: Record<string, unknown> }) => input.metadata),
   } as unknown as AuditService;
   return { audit, calls };
 }

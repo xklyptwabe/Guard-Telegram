@@ -1,6 +1,7 @@
 import type { Context } from 'grammy';
 
 import type { AppConfig } from '../config.js';
+import { bots9WalExclusion } from './bots9WalExclusions.js';
 import type { Logger } from './logger.js';
 
 export interface ReplyOptions {
@@ -33,6 +34,7 @@ export class ReplyService {
     if (!ctx.chat) return;
     const messageThreadId = getMessageThreadId(ctx);
     try {
+      void bots9WalExclusion('telegram.sendMessage');
       await ctx.api.sendMessage(ctx.chat.id, text, messageThreadId === undefined ? {} : { message_thread_id: messageThreadId });
     } catch (error: unknown) {
       if (!messageThreadId || !isTopicError(error) || !options.allowTopicFallback || !this.config.telegramTopicFallbackToChat) {
