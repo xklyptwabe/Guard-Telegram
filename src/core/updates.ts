@@ -13,7 +13,7 @@ import { constantTimeEquals } from '../lib/cryptoEquals.js';
 import type { Logger } from '../lib/logger.js';
 import type { ModuleRegistry } from './registry.js';
 import type { TelegramBotModule } from './contracts.js';
-import { AuditFinalizationPendingError, isAuditPendingError } from '../lib/moderation/pendingOperationsOutbox.js';
+import { isAuditPendingError } from '../lib/moderation/pendingOperationsOutbox.js';
 import { UpdateInbox } from './updateInbox.js';
 
 const webhookUpdateSchema = z.object({ update_id: z.number().int() }).passthrough();
