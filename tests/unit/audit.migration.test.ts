@@ -85,4 +85,17 @@ describe('audit migrations', () => {
     expect(sql).toContain('REVOKE INSERT, UPDATE, DELETE ON audit.event_policies FROM audit_retention');
     expect(sql).not.toMatch(/PASSWORD/i);
   });
+
+  it('adds events→event_types FK, audit status CHECKs, and consumed_envelopes horizon index', () => {
+    const sql = readFileSync('src/db/migrations/0022_audit_integrity_and_dedup_horizon.sql', 'utf8');
+    expect(sql).toContain('ADD CONSTRAINT "events_event_type_version_event_types_fk"');
+    expect(sql).toContain('REFERENCES "audit"."event_types"("event_type", "event_version")');
+    expect(sql).toContain('ON DELETE RESTRICT');
+    expect(sql).toContain('ADD CONSTRAINT "events_status_check"');
+    expect(sql).toContain("CHECK (\"status\" IN ('recorded', 'failed'))");
+    expect(sql).toContain('ADD CONSTRAINT "outbox_status_check"');
+    expect(sql).toContain("CHECK (\"status\" IN ('pending', 'delivered', 'failed'))");
+    expect(sql).toContain('ADD CONSTRAINT "entity_snapshots_status_check"');
+    expect(sql).toContain('CREATE INDEX IF NOT EXISTS "consumed_envelopes_consumed_at_idx"');
+  });
 });

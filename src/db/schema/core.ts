@@ -74,10 +74,14 @@ export const processedUpdates = coreSchema.table(
   ],
 );
 
-export const consumedEnvelopes = coreSchema.table('consumed_envelopes', {
-  envelopeId: text('envelope_id').primaryKey(),
-  consumedAt: timestamp('consumed_at', { withTimezone: true }).defaultNow().notNull(),
-});
+export const consumedEnvelopes = coreSchema.table(
+  'consumed_envelopes',
+  {
+    envelopeId: text('envelope_id').primaryKey(),
+    consumedAt: timestamp('consumed_at', { withTimezone: true }).defaultNow().notNull(),
+  },
+  (table) => [index('consumed_envelopes_consumed_at_idx').on(table.consumedAt)],
+);
 
 export const releaseAnnouncements = coreSchema.table('release_announcements', {
   id: uuid('id').defaultRandom().primaryKey(),

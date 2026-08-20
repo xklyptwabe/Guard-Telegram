@@ -30,6 +30,8 @@ describe('audit retention batch job', () => {
 
     expect(query).toContain('LIMIT $2');
     expect(query).toContain('DELETE FROM "audit"."events" AS event');
+    expect(query).toContain('"audit"."outbox"');
+    expect(query).toContain("box.\"status\" <> 'delivered'");
     expect(query).not.toMatch(/\bFOR\s+UPDATE\b/i);
     expect(query).not.toMatch(/\bLOCK\s+TABLE\b/i);
     expect(query).not.toMatch(/\bTRUNCATE\b/i);

@@ -10,7 +10,7 @@ import { ModuleRegistry } from './core/registry.js';
 import { createTelegramBot } from './core/telegram.js';
 import { registerBotMembershipAudit, registerModuleUpdateHandlers, registerPlatformMiddleware, startLongPolling, startWebhook, type TransportController } from './core/updates.js';
 import { createDatabase } from './db/client.js';
-import { purgeExpiredProcessedUpdates } from './db/retention.js';
+import { purgeExpiredConsumedEnvelopes, purgeExpiredProcessedUpdates } from './db/retention.js';
 import { createRedis } from './db/redis.js';
 import { initializeI18n } from './i18n/index.js';
 import { AuditService } from './lib/auditService.js';
@@ -70,6 +70,7 @@ async function bootstrap(): Promise<void> {
     await migrate(database.db, { migrationsFolder: 'src/db/migrations' });
     logger.info({ event: 'database.migrations.completed' });
     await purgeExpiredProcessedUpdates(database.db);
+    await purgeExpiredConsumedEnvelopes(database.db);
     redis = await createRedis(config, logger);
     const audit = new AuditService(database.db);
     const bot = createTelegramBot(config, logger);

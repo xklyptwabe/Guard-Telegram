@@ -299,6 +299,10 @@ describe.skipIf(!testDatabaseUrl)('BOTS-9 round-2 fixes: real-DB verification', 
     let eventsForChat = await client.db.select().from(events).where(eq(events.tenantId, chatId));
     expect(eventsForChat).toHaveLength(1);
 
+    // Downstream already consumed the audit outbox — only then may retention
+    // delete the event (pending outbox must survive CASCADE).
+    await client.db.execute(sql`UPDATE audit.outbox SET status = 'delivered' WHERE event_id = ${eventsForChat[0]!.id}`);
+
     // Retention purges the audit event (backdate it past the policy window).
     await client.db.execute(sql`UPDATE audit.events SET occurred_at = now() - interval '2 days'`);
     const purged = await purgeExpiredAuditEventsBatch(client.db);
