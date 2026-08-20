@@ -5,7 +5,7 @@ import type { AppConfig } from '../config.js';
 import type { Logger } from '../lib/logger.js';
 
 /** Methods that must never be blindly re-issued by the HTTP client. */
-const NON_IDEMPOTENT_API_METHODS = new Set(['deleteMessage']);
+const NON_IDEMPOTENT_API_METHODS = new Set(['deleteMessage', 'getUpdates']);
 
 export function createTelegramBot(config: Pick<AppConfig, 'telegramBotToken'>, logger: Logger): Bot<Context> {
   const bot = new Bot<Context>(config.telegramBotToken);

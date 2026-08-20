@@ -8,6 +8,23 @@ import type { ModerationService } from '../../lib/moderation/moderationService.j
 
 const freeTextArgs = z.string();
 
+/** Telegram restrictChatMember: 30s … 366 days. Shorter values are ignored or error. */
+export const RESTRICT_DURATION_MIN_SECONDS = 30;
+export const RESTRICT_DURATION_MAX_SECONDS = 366 * 24 * 60 * 60;
+
+async function rejectUnsafeTarget(context: CommandExecutionContext, target: ResolvedTarget): Promise<boolean> {
+  if (target.userId === context.userId) {
+    await context.reply.send(context.ctx, context.t('moderation.cannotTargetSelf'));
+    return true;
+  }
+  const botId = context.ctx.me?.id;
+  if (botId !== undefined && target.userId === String(botId)) {
+    await context.reply.send(context.ctx, context.t('moderation.cannotTargetBot'));
+    return true;
+  }
+  return false;
+}
+
 export interface ResolvedTarget {
   readonly userId: string;
   /** Whatever tokens remain in the command's arguments after the target itself was consumed — either all of it (target came from a reply) or everything after a leading numeric user_id. */
@@ -69,6 +86,7 @@ export function createModerationModule(moderation: ModerationService): TelegramB
             await context.reply.send(context.ctx, context.t('moderation.needsTarget'));
             return;
           }
+          if (await rejectUnsafeTarget(context, target)) return;
           const reason = target.rest.join(' ').trim();
           const outcome = await moderation.ban({ chatId: context.chatId, targetUserId: target.userId, actorUserId: context.userId, ...(reason ? { reason } : {}) });
           await reportOutcome(context, 'ban', outcome);
@@ -89,6 +107,7 @@ export function createModerationModule(moderation: ModerationService): TelegramB
             await context.reply.send(context.ctx, context.t('moderation.needsTarget'));
             return;
           }
+          if (await rejectUnsafeTarget(context, target)) return;
           const outcome = await moderation.unban({ chatId: context.chatId, targetUserId: target.userId, actorUserId: context.userId });
           await reportOutcome(context, 'unban', outcome);
         },
@@ -108,9 +127,14 @@ export function createModerationModule(moderation: ModerationService): TelegramB
             await context.reply.send(context.ctx, context.t('moderation.needsTarget'));
             return;
           }
+          if (await rejectUnsafeTarget(context, target)) return;
           const [durationToken, ...reasonTokens] = target.rest;
           const durationSeconds = durationToken !== undefined ? Number(durationToken) : Number.NaN;
-          if (!Number.isInteger(durationSeconds) || durationSeconds <= 0) {
+          if (
+            !Number.isInteger(durationSeconds) ||
+            durationSeconds < RESTRICT_DURATION_MIN_SECONDS ||
+            durationSeconds > RESTRICT_DURATION_MAX_SECONDS
+          ) {
             await context.reply.send(context.ctx, context.t('moderation.needsDuration'));
             return;
           }
@@ -134,6 +158,7 @@ export function createModerationModule(moderation: ModerationService): TelegramB
             await context.reply.send(context.ctx, context.t('moderation.needsTarget'));
             return;
           }
+          if (await rejectUnsafeTarget(context, target)) return;
           const outcome = await moderation.unrestrict({ chatId: context.chatId, targetUserId: target.userId, actorUserId: context.userId });
           await reportOutcome(context, 'unrestrict', outcome);
         },

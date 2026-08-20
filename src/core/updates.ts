@@ -214,7 +214,9 @@ export function startLongPolling(bot: Bot<Context>, config: Pick<AppConfig, 'tel
           event: 'transport.long_polling.fetch_failed',
           error: { name: error instanceof Error ? error.name : 'UnknownError', message: error instanceof Error ? error.message : String(error) },
         });
-        await sleep(2000, abort.signal);
+        const conflict =
+          error instanceof Error && (/409/.test(error.message) || /terminated by other getUpdates/i.test(error.message));
+        await sleep(conflict ? 5_000 : 2_000, abort.signal);
       }
     }
   })();
@@ -248,7 +250,10 @@ function readBody(request: IncomingMessage, maxBytes: number): Promise<string> {
     request.setEncoding('utf8');
     request.on('data', (chunk: string) => {
       body += chunk;
-      if (Buffer.byteLength(body, 'utf8') > maxBytes) reject(new Error('Webhook payload exceeds size limit'));
+      if (Buffer.byteLength(body, 'utf8') > maxBytes) {
+        request.destroy();
+        reject(new Error('Webhook payload exceeds size limit'));
+      }
     });
     request.on('end', () => resolve(body));
     request.on('error', reject);

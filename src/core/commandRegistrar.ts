@@ -32,7 +32,7 @@ export async function registerCommands(
     await bot.api.setMyCommands(menu, { language_code: languageCode });
   }
   for (const command of commands) {
-    bot.command(command.name, (ctx) => dispatcher.dispatchCommand(ctx, command.name, ctx.match));
+    bot.command(command.name, (ctx) => dispatcher.dispatchCommand(ctx, command.name, typeof ctx.match === 'string' ? ctx.match : ''));
   }
   bot.on('callback_query:data', (ctx) => dispatcher.dispatchCallback(ctx));
   logger.info({ event: 'telegram.command_menu.registered', details: { commandCount: commands.length } });
