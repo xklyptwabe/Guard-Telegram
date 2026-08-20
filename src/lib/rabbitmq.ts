@@ -196,11 +196,15 @@ export async function createRabbitMq(
 
   // Recovery executor for `rabbitmq.publish` rows found after a restart:
   // republish the STORED envelope — same id, so broker/consumer dedup holds.
-  resolvers?.register('rabbitmq.publish', async (stored) => {
-    const envelope = actionEnvelopeSchema.parse((stored as { envelope: unknown }).envelope);
-    await publishConfirmed(channel, topology.actionsExchange, topology.routingKey, envelope);
-    return { messageId: envelope.id };
-  });
+  resolvers?.register(
+    'rabbitmq.publish',
+    async (stored) => {
+      const envelope = actionEnvelopeSchema.parse((stored as { envelope: unknown }).envelope);
+      await publishConfirmed(channel, topology.actionsExchange, topology.routingKey, envelope);
+      return { messageId: envelope.id };
+    },
+    { retryAfterUnknown: true },
+  );
 
   const sendToQueue = async (queue: string, envelope: ActionEnvelope): Promise<void> => {
     const accepted = channel.sendToQueue(queue, Buffer.from(JSON.stringify(envelope)), {
