@@ -50,7 +50,7 @@ export class ProtectedModuleDisableError extends Error {
 function moduleStateAuditIdempotencyKey(chatId: string, moduleId: string): string {
   const context = getUpdateContext();
   if (!context) throw new MissingModuleAuditIdempotencyKeyError();
-  return `module.state.changed:telegram-update:${context.updateId}:${chatId}:${moduleId}`;
+  return `module.state.changed:telegram-update:${context.botId ?? 'unscoped-bot'}:${context.updateId}:${chatId}:${moduleId}`;
 }
 
 export class ModuleRegistry {

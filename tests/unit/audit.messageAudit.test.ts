@@ -81,7 +81,7 @@ describe('recordMessageEdited', () => {
     expect(call.result.metadata).toMatchObject({ operation: 'noop', outOfOrder: true });
     // The snapshot keeps the NEWER data — the stale edit did not regress it.
     expect(call.result.snapshotData).toMatchObject({ editedAt: '2033-01-01T00:00:00.000Z', text: 'newer version' });
-    expect(call.result.after).toMatchObject({ editedAt: '2033-01-01T00:00:00.000Z' });
+    expect(call.result.after).toMatchObject({ editedAt: '2001-01-01T00:00:00.000Z' });
   });
 
   it('BOTS-9 review HIGH-1: a genuinely newer edit still updates the snapshot normally', async () => {

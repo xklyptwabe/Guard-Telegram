@@ -141,7 +141,7 @@ export async function recordMessageEdited(audit: AuditService, logger: Logger, c
         const isStale =
           previousEditedAt !== undefined &&
           (previousEditedAt > editedAt || (previousEditedAt === editedAt && (previousUpdateId ?? 0) >= incomingUpdateId));
-        const afterData = isStale ? previous : { chatId, messageId, userId, editedAt, observedUpdateId: incomingUpdateId, textLength: text?.length ?? 0, ...(text !== undefined ? { text } : {}) };
+        const incomingAfter = { chatId, messageId, userId, editedAt, observedUpdateId: incomingUpdateId, textLength: text?.length ?? 0, ...(text !== undefined ? { text } : {}) };
         const operation = isStale ? 'noop' : previous ? 'update' : 'create';
 
         const record = raiseTextCapableEvent({
@@ -151,11 +151,15 @@ export async function recordMessageEdited(audit: AuditService, logger: Logger, c
           chatId,
           actorId: userId,
           before: previous ? observed(previous) : notObserved(),
-          after: observed(afterData),
+          after: observed(incomingAfter),
         });
         const mutationResult = toDownstreamMutationResult(record);
 
-        return { ...mutationResult, metadata: { operation, ...(isStale ? { outOfOrder: true } : {}) } };
+        return {
+          ...mutationResult,
+          metadata: { operation, ...(isStale ? { outOfOrder: true } : {}) },
+          snapshotData: isStale && previous ? previous : incomingAfter,
+        };
       },
     );
   } catch (error) {

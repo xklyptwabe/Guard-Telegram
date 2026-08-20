@@ -55,6 +55,7 @@ export class ChatSettingsService {
         source: 'telegram.command',
         idempotencyKey,
         ...(actorId !== undefined ? { actorId, actorType: 'telegram_user' } : {}),
+        moduleId: 'chat-settings',
       },
       async (tx) => {
         const current = await tx.select({ locale: chatSettings.locale }).from(chatSettings).where(eq(chatSettings.chatId, chatId)).limit(1).for('update');

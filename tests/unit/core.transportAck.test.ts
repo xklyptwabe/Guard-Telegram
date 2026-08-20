@@ -56,7 +56,7 @@ describe('startLongPolling offset (round-5)', () => {
     expect(bot.handleUpdate).toHaveBeenCalledTimes(1);
   });
 
-  it('advances offset on a non-transient handler error so one poison update cannot stall the queue', async () => {
+  it('does not advance offset on a generic handler error — Telegram must redeliver', async () => {
     const offsets: number[] = [];
     let releaseSecond: (() => void) | undefined;
     const secondFetch = new Promise<void>((resolve) => {
@@ -88,8 +88,8 @@ describe('startLongPolling offset (round-5)', () => {
     await secondFetch;
     await transport.stop();
 
-    expect(offsets.at(-1)).toBeGreaterThanOrEqual(11);
-    expect(bot.handleUpdate).toHaveBeenCalledTimes(2);
+    expect(offsets[1]).toBe(0);
+    expect(bot.handleUpdate).toHaveBeenCalledTimes(1);
   });
 });
 

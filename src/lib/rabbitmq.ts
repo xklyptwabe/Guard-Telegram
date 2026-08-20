@@ -203,7 +203,7 @@ export async function createRabbitMq(
       await publishConfirmed(channel, topology.actionsExchange, topology.routingKey, envelope);
       return { messageId: envelope.id };
     },
-    { retryAfterUnknown: true },
+    { retryAfterUnknown: false },
   );
 
   const sendToQueue = async (queue: string, envelope: ActionEnvelope): Promise<void> => {

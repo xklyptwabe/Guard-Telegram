@@ -95,17 +95,6 @@ export function registerPlatformMiddleware(bot: Bot<Context>, database: DrizzleD
     await runWithUpdateContext(
       { updateId, ...(botId ? { botId } : {}), ...(chatId ? { chatId } : {}), ...(userId ? { userId } : {}), ...(threadId ? { messageThreadId: threadId } : {}) },
       async () => {
-        if (ctx.chat) await registry.ensureChat(chatId!, ctx.chat.type, chatTitle(ctx));
-        if (ctx.from) {
-          const now = new Date();
-          await database
-            .insert(telegramUsers)
-            .values({ userId: String(ctx.from.id), ...(ctx.from.language_code ? { languageCode: ctx.from.language_code } : {}), updatedAt: now })
-            .onConflictDoUpdate({
-              target: telegramUsers.userId,
-              set: { ...(ctx.from.language_code ? { languageCode: ctx.from.language_code } : {}), updatedAt: now },
-            });
-        }
         const { claim, attemptCount, busyReason } = await inbox.begin(String(ctx.me.id), updateId);
         if (claim === 'completed') {
           logger.info({ event: 'update.duplicate_skipped' });
@@ -117,6 +106,17 @@ export function registerPlatformMiddleware(bot: Bot<Context>, database: DrizzleD
             throw new UpdateExhaustedError(updateId);
           }
           throw new UpdateBusyError(updateId, busyReason ?? 'unknown');
+        }
+        if (ctx.chat) await registry.ensureChat(chatId!, ctx.chat.type, chatTitle(ctx));
+        if (ctx.from) {
+          const now = new Date();
+          await database
+            .insert(telegramUsers)
+            .values({ userId: String(ctx.from.id), ...(ctx.from.language_code ? { languageCode: ctx.from.language_code } : {}), updatedAt: now })
+            .onConflictDoUpdate({
+              target: telegramUsers.userId,
+              set: { ...(ctx.from.language_code ? { languageCode: ctx.from.language_code } : {}), updatedAt: now },
+            });
         }
         logger.debug({ event: 'update.received' });
         try {
@@ -191,21 +191,13 @@ export function startLongPolling(bot: Bot<Context>, config: Pick<AppConfig, 'tel
               offset = update.update_id + 1;
               continue;
             }
-            if (isTransientUpdateError(error)) {
-              logger.warn({
-                event: 'transport.long_polling.will_retry',
-                details: { updateId: update.update_id, offset },
-                error: { name: error instanceof Error ? error.name : 'UnknownError', message: error instanceof Error ? error.message : String(error) },
-              });
-              await sleep(500, abort.signal);
-              break;
-            }
-            logger.error({
-              event: 'transport.long_polling.poison_skip',
+            logger.warn({
+              event: 'transport.long_polling.will_retry',
               details: { updateId: update.update_id, offset },
               error: { name: error instanceof Error ? error.name : 'UnknownError', message: error instanceof Error ? error.message : String(error) },
             });
-            offset = update.update_id + 1;
+            await sleep(500, abort.signal);
+            break;
           }
         }
       } catch (error: unknown) {

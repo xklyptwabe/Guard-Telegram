@@ -90,6 +90,7 @@ async function bootstrap(): Promise<void> {
     // One terminal-audit finalizer for every kind: telegram.* → moderation
     // events, everything else → integration.action (BLOCKER-3 + HIGH-3).
     const outboxFinalizer = buildOutboxFinalizer(moderation, makeIntegrationAuditFinalizer(audit, logger));
+    pendingOperationsOutbox.setDefaultFinalizer(outboxFinalizer);
 
     const modules = createModules({ audit, logger, chatSettings, moderation });
     validateModules(modules);

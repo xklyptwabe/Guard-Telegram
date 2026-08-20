@@ -149,8 +149,10 @@ export class CommandDispatcher {
       // command's own error handling must still complete.
       try {
         await this.recordCommandExecuted(identity, command, commandName, durationMs, false);
-      } catch {
-        // already failing — nothing more to persist
+      } catch (auditError: unknown) {
+        this.cooldowns.release(cooldownKey);
+        if (auditError instanceof AuditFinalizationPendingError) throw auditError;
+        throw auditError;
       }
       await this.reply.send(ctx, t('common.internalError')).catch((replyError: unknown) => {
         this.logger.error({ event: 'command.error_reply_failed', module: command.moduleId, chatId: identity.chatId, userId: identity.userId, commandName, error: { name: replyError instanceof Error ? replyError.name : 'UnknownError', message: replyError instanceof Error ? replyError.message : String(replyError) } });

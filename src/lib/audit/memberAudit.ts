@@ -1,5 +1,6 @@
 import type { Context } from 'grammy';
 
+import { MODULE_IDS } from '../../constants.js';
 import { AuditPolicyDisabledError, type AuditService } from '../auditService.js';
 import { getUpdateContext } from '../context.js';
 import type { Logger } from '../logger.js';
@@ -74,6 +75,7 @@ export async function recordMemberStatusChanged(audit: AuditService, logger: Log
         source: 'telegram.chat_member_update',
         idempotencyKey,
         ...(actorId !== undefined ? { actorId, actorType: 'telegram_user' } : {}),
+        moduleId: MODULE_IDS.membershipAudit,
       },
       async (tx) => {
         const current = (await readCurrentSnapshotData(tx, chatId, subjectType, subjectId)) as Partial<MemberSnapshotData> | undefined;
@@ -103,7 +105,7 @@ export async function recordMemberStatusChanged(audit: AuditService, logger: Log
           chatId,
           ...(actorId !== undefined ? { actorId } : {}),
           before: oldStatusParsed.success ? observed({ chatId, userId, status: oldStatusParsed.data }) : notObserved(),
-          after: observed({ chatId, userId, status: afterStatus }),
+          after: observed({ chatId, userId, status: newStatusParsed.data }),
         });
         const mutationResult = toDownstreamMutationResult(record);
 
@@ -111,7 +113,13 @@ export async function recordMemberStatusChanged(audit: AuditService, logger: Log
           ...mutationResult,
           metadata: { operation, ...(isStale ? { outOfOrder: true } : {}) },
           snapshotStatus: mutationResult.snapshotStatus,
-          snapshotData: { ...mutationResult.snapshotData, observedAt: effectiveObservedAt, observedUpdateId: effectiveObservedUpdateId },
+          snapshotData: {
+            chatId,
+            userId,
+            status: isStale && current?.status !== undefined ? current.status : newStatusParsed.data,
+            observedAt: effectiveObservedAt,
+            observedUpdateId: effectiveObservedUpdateId,
+          },
         };
       },
     );
