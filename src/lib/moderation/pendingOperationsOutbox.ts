@@ -157,6 +157,7 @@ export interface EnqueueExternalOperationInput {
   readonly chatId: string;
   readonly idempotencyKey: string;
   readonly requestPayload: Record<string, unknown>;
+  readonly auditEvent?: PendingOperationAuditEventContext;
   /**
    * Actor/target/action/reason needed to write the eventual audit record —
    * kept separate from requestPayload (which is exactly what's forwarded to
@@ -165,6 +166,20 @@ export interface EnqueueExternalOperationInput {
    */
   readonly metadata?: Record<string, unknown>;
 }
+
+export interface PendingOperationAuditEventContext {
+  readonly eventType: string;
+  readonly eventVersion: string;
+  readonly moduleId?: string;
+}
+
+export type PendingOperationMetadataSanitizer = (input: {
+  readonly kind: string;
+  readonly chatId: string;
+  readonly idempotencyKey: string;
+  readonly auditEvent: PendingOperationAuditEventContext;
+  readonly metadata: Record<string, unknown>;
+}) => Promise<Record<string, unknown>>;
 
 /**
  * Registry of "how to actually perform operation kind X" — keyed the same
@@ -283,6 +298,7 @@ export class PendingOperationsOutbox {
   private workerTimer: ReturnType<typeof setTimeout> | undefined;
   private workerStopped = true;
   private defaultFinalizer: PendingOperationFinalizer | undefined;
+  private metadataSanitizer: PendingOperationMetadataSanitizer | undefined;
   /** Every background sweep currently in flight, so {@link stopAndDrain} can await them before the process tears down its database pool. */
   private readonly activeSweeps = new Set<Promise<unknown>>();
 
@@ -298,6 +314,11 @@ export class PendingOperationsOutbox {
   /** Used when execute()/worker omit onFinal (S3/Rabbit live path). */
   public setDefaultFinalizer(onFinal: PendingOperationFinalizer): void {
     this.defaultFinalizer = onFinal;
+  }
+
+  /** Applies policy-aware metadata filtering before WAL rows are inserted. */
+  public setMetadataSanitizer(sanitizer: PendingOperationMetadataSanitizer): void {
+    this.metadataSanitizer = sanitizer;
   }
 
   /**
@@ -449,7 +470,7 @@ export class PendingOperationsOutbox {
         chatId: input.chatId,
         idempotencyKey: input.idempotencyKey,
         requestPayload: stripForbidden(input.requestPayload),
-        metadata: input.metadata ? stripForbidden(input.metadata) : {},
+        metadata: await this.sanitizeMetadata(input),
         status: 'pending',
       })
       .onConflictDoNothing({ target: pendingOperations.idempotencyKey })
@@ -460,6 +481,20 @@ export class PendingOperationsOutbox {
     const [row] = await this.db.select().from(pendingOperations).where(eq(pendingOperations.idempotencyKey, input.idempotencyKey)).limit(1);
     if (!row) throw new Error(`PendingOperationsOutbox: failed to write ahead operation "${input.idempotencyKey}"`);
     return toRow(row);
+  }
+
+  private async sanitizeMetadata(input: EnqueueExternalOperationInput): Promise<Record<string, unknown>> {
+    const metadata = input.metadata ? stripForbidden(input.metadata) : {};
+    if (!this.metadataSanitizer || input.auditEvent === undefined) return metadata;
+    return stripForbidden(
+      await this.metadataSanitizer({
+        kind: input.kind,
+        chatId: input.chatId,
+        idempotencyKey: input.idempotencyKey,
+        auditEvent: input.auditEvent,
+        metadata,
+      }),
+    );
   }
 
   /** Eligibility shared by both claim paths: `pending` outright; an `unknown` only once its backoff elapsed AND attempts remain; an `in_progress` only once its lease has expired (or, for pre-lease rows, was never set). An *exhausted* `unknown` (`next_attempt_at` null) is deliberately NOT claimable — see the class doc's LATE COMPLETION note: never blindly re-run a possibly non-idempotent call that already timed out. */

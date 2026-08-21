@@ -36,6 +36,37 @@ describe('PendingOperationsOutbox', () => {
     expect(db.rows).toHaveLength(1);
   });
 
+  it('sanitizes WAL metadata through the configured policy-aware sanitizer before insert', async () => {
+    const outbox = new PendingOperationsOutbox(db as never, logger(), resolvers);
+    outbox.setMetadataSanitizer(async (input) => ({
+      action: input.metadata.action,
+      actorUserId: '[redacted]',
+      targetUserId: input.metadata.targetUserId,
+    }));
+
+    await outbox.execute(
+      {
+        kind: 'telegram.banChatMember',
+        chatId: 'chat-1',
+        idempotencyKey: 'key-policy-metadata',
+        requestPayload: { chat_id: 1, user_id: 2 },
+        metadata: {
+          action: 'ban',
+          actorUserId: '9',
+          targetUserId: '2',
+          reason: 'policy-hidden-reason',
+          arbitrary: 'policy-hidden-arbitrary',
+        },
+        auditEvent: { eventType: 'moderation.action', eventVersion: 'v1', moduleId: 'moderation' },
+      },
+      async () => undefined,
+    );
+
+    expect(db.rows[0]?.metadata).toEqual({ action: 'ban', actorUserId: '[redacted]', targetUserId: '2' });
+    expect(JSON.stringify(db.rows[0]?.metadata)).not.toContain('policy-hidden-reason');
+    expect(JSON.stringify(db.rows[0]?.metadata)).not.toContain('policy-hidden-arbitrary');
+  });
+
   it('a confirmed GrammyError is terminal and status "failed" — never retried', async () => {
     const outbox = new PendingOperationsOutbox(db as never, logger(), resolvers);
     const error = new GrammyError('Bad Request: not enough rights', { ok: false, error_code: 400, description: 'Bad Request: not enough rights' } as never, 'banChatMember', {});

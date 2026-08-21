@@ -82,6 +82,15 @@ async function bootstrap(): Promise<void> {
     // kinds/executors on it.
     const pendingOperationResolvers = new PendingOperationResolvers();
     const pendingOperationsOutbox = new PendingOperationsOutbox(database.db, logger, pendingOperationResolvers);
+    pendingOperationsOutbox.setMetadataSanitizer((input) =>
+      audit.maskOutboxMetadata({
+        tenantId: input.chatId,
+        eventType: input.auditEvent.eventType,
+        eventVersion: input.auditEvent.eventVersion,
+        ...(input.auditEvent.moduleId !== undefined ? { moduleId: input.auditEvent.moduleId } : {}),
+        metadata: input.metadata,
+      }),
+    );
     sharedOutbox = pendingOperationsOutbox;
     storage = createStorage(config, logger, pendingOperationsOutbox, pendingOperationResolvers);
     rabbitMq = await createRabbitMq(config, logger, audit, pendingOperationsOutbox, pendingOperationResolvers, database.db);

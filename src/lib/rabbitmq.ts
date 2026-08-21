@@ -154,6 +154,7 @@ export async function createRabbitMq(
         chatId: 'platform',
         idempotencyKey: `rabbitmq.publish:${envelope.id}`,
         requestPayload: { envelope },
+        auditEvent: { eventType: 'integration.action', eventVersion: 'v1' },
         metadata: integrationOperationMetadata({ integrationId: 'rabbitmq', action: type, targetType: 'queue', targetId: topology.actionQueue }),
       },
       async () => {

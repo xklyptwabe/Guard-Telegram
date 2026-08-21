@@ -81,6 +81,7 @@ export function createStorage(
             chatId: 'platform',
             idempotencyKey: `s3.putObject:${key}:${bodyDigest}`,
             requestPayload: { key, contentType, bodyDigest, sizeBytes: body.byteLength },
+            auditEvent: { eventType: 'integration.action', eventVersion: 'v1' },
             metadata: integrationOperationMetadata({ integrationId: 's3', action: 'put', targetType: 'object', targetId: key }),
           },
           async (payload) => {

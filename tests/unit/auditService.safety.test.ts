@@ -125,6 +125,32 @@ describe('AuditService persistence safety', () => {
     expect(JSON.stringify(database.captured.event)).not.toContain('policy-sensitive-reason');
   });
 
+  it('applies effective policy allowlist and masking before outbox metadata is persisted', async () => {
+    const database = fakePolicyReader({
+      allowlist: ['action', 'actorUserId', 'targetUserId'],
+      masking: ['actorUserId'],
+    });
+    const audit = new AuditService(database as never);
+
+    const metadata = await audit.maskOutboxMetadata({
+      tenantId: 'chat-1',
+      eventType: 'moderation.action',
+      eventVersion: 'v1',
+      moduleId: 'moderation',
+      metadata: {
+        action: 'ban',
+        actorUserId: '9',
+        targetUserId: '2',
+        reason: 'policy-hidden-reason',
+        arbitrary: 'policy-hidden-arbitrary',
+      },
+    });
+
+    expect(metadata).toEqual({ action: 'ban', actorUserId: '[redacted]', targetUserId: '2' });
+    expect(JSON.stringify(metadata)).not.toContain('policy-hidden-reason');
+    expect(JSON.stringify(metadata)).not.toContain('policy-hidden-arbitrary');
+  });
+
   it('redacts forbidden values nested below allowed metadata and drops unsafe Telegram identifiers', async () => {
     const database = fakeAuditDatabase();
     const audit = new AuditService(database.db as never);
@@ -289,5 +315,29 @@ function fakeAuditDatabase(policyOverrides: Partial<AuditPolicyResolutionRow> = 
   return {
     captured,
     db: { transaction: async (operation: (tx: typeof transaction) => Promise<unknown>) => operation(transaction) },
+  };
+}
+
+function fakePolicyReader(policyOverrides: Partial<AuditPolicyResolutionRow> = {}) {
+  const policy: AuditPolicyResolutionRow = {
+    policyId: 'unit:outbox-policy',
+    chatId: 'chat-1',
+    eventType: 'moderation.action',
+    eventVersion: 'v1',
+    moduleId: null,
+    enabled: true,
+    siteVisible: null,
+    snapshotMode: null,
+    allowlist: null,
+    masking: null,
+    retentionDays: null,
+    severity: null,
+    exportAllowed: null,
+    ...policyOverrides,
+  };
+  return {
+    select: () => ({
+      from: async () => [policy],
+    }),
   };
 }

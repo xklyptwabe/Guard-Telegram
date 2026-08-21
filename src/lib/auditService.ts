@@ -6,7 +6,6 @@ import {
   AUDIT_OPERATIONAL_METADATA_ALLOWLIST,
   applyAllowlist,
   isForbiddenAuditString,
-  stripForbidden,
   type AuditPolicyContext,
 } from './audit/masking.js';
 import { resolveEffectiveAuditPolicy, type EffectiveAuditPolicy } from './audit/policyResolution.js';
@@ -16,6 +15,7 @@ import {
   requireAuditPersistenceDefinition,
   type NormalizedAuditPersistenceMutation,
 } from './audit/persistenceValidation.js';
+import { auditEventRegistry } from './audit/registry.js';
 import type { DrizzleDatabase } from '../db/client.js';
 import { entitySnapshots, events, outbox } from '../db/schema/audit.js';
 
@@ -103,11 +103,16 @@ export class AuditService {
       chatId: input.tenantId,
       ...(input.moduleId !== undefined ? { moduleId: input.moduleId } : {}),
     });
-    const metadata = { ...input.metadata };
-    for (const field of policy.values.masking) {
-      if (field in metadata) metadata[field] = '[redacted]';
-    }
-    return stripForbidden(metadata);
+    const definition = requireAuditPersistenceDefinition({
+      eventType: input.eventType,
+      eventVersion: input.eventVersion,
+      category: policyCategory(input.eventType, input.eventVersion),
+    });
+    return applyAllowlist(input.metadata, definition.allowlist, {
+      allowMessageTextLogging: policy.values.allowlist.includes('text'),
+      allowlist: policy.values.allowlist,
+      ...(policy.values.masking.length > 0 ? { masking: policy.values.masking } : {}),
+    });
   }
 
   /**
@@ -365,6 +370,12 @@ function sameIdempotentOperation(
     existing.subjectType === input.subjectType &&
     existing.subjectId === input.subjectId
   );
+}
+
+function policyCategory(eventType: string, eventVersion: string): string {
+  const match = /^v(\d+)$/.exec(eventVersion);
+  if (!match) throw new Error(`Audit event version must use v<number> format, received "${eventVersion}"`);
+  return auditEventRegistry.requireSupportedVersion(eventType, Number(match[1])).category;
 }
 
 function buildPersistencePolicy(

@@ -61,7 +61,7 @@ export function makeIntegrationAuditFinalizer(audit: AuditService, logger: Logge
       throw new Error(`pending_operations row ${row.id} (${row.kind}) reached terminal state without the integration metadata needed to finalize its audit record`);
     }
     const statusCode = typeof outcome.result?.statusCode === 'number' ? outcome.result.statusCode : undefined;
-    const chatId = typeof row.metadata.chatId === 'string' ? row.metadata.chatId : undefined;
+    const chatId = typeof row.metadata.chatId === 'string' ? row.metadata.chatId : row.chatId === 'platform' ? undefined : row.chatId;
     return recordIntegrationAction(audit, logger, {
       integrationId,
       action,

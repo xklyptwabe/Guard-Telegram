@@ -165,6 +165,7 @@ export class ModerationService {
         chatId,
         idempotencyKey,
         requestPayload: { chat_id: Number(chatId), message_id: Number(messageId) },
+        auditEvent: { eventType: 'message.deleted', eventVersion: 'v1', moduleId: MODULE_IDS.moderation },
         metadata: { deletedBy: actorUserId, ...(knownAuthorUserId !== undefined ? { knownAuthorUserId } : {}) },
       },
       this.resolvers.get(kind)!,
@@ -292,7 +293,14 @@ export class ModerationService {
       metadata: { action, actorUserId: input.actorUserId, targetUserId: input.targetUserId, ...(reason !== undefined && reason.length > 0 ? { reason } : {}) },
     });
     return this.outbox.execute(
-      { kind, chatId: input.chatId, idempotencyKey, requestPayload, metadata },
+      {
+        kind,
+        chatId: input.chatId,
+        idempotencyKey,
+        requestPayload,
+        auditEvent: { eventType: 'moderation.action', eventVersion: 'v1', moduleId: MODULE_IDS.moderation },
+        metadata,
+      },
       this.resolvers.get(kind)!,
       // HIGH-3: audit-finalization is the outbox's durable responsibility —
       // see deleteMessage's note. auditRecoveredOperation dispatches on
