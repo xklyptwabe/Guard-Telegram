@@ -78,9 +78,16 @@ export const consumedEnvelopes = coreSchema.table(
   'consumed_envelopes',
   {
     envelopeId: text('envelope_id').primaryKey(),
+    status: text('status', { enum: ['received', 'processing', 'completed', 'failed'] }).notNull().default('received'),
+    attemptCount: integer('attempt_count').notNull().default(0),
+    workerId: text('worker_id'),
+    leaseExpiresAt: timestamp('lease_expires_at', { withTimezone: true }),
+    lastError: jsonb('last_error'),
     consumedAt: timestamp('consumed_at', { withTimezone: true }).defaultNow().notNull(),
+    createdAt: createdAt(),
+    updatedAt: updatedAt(),
   },
-  (table) => [index('consumed_envelopes_consumed_at_idx').on(table.consumedAt)],
+  (table) => [index('consumed_envelopes_consumed_at_idx').on(table.consumedAt), index('consumed_envelopes_status_lease_idx').on(table.status, table.leaseExpiresAt)],
 );
 
 export const releaseAnnouncements = coreSchema.table('release_announcements', {

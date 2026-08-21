@@ -21,7 +21,7 @@ export async function purgeExpiredConsumedEnvelopes(
   retentionDays = CONSUMED_ENVELOPE_RETENTION_DAYS,
 ): Promise<void> {
   const cutoff = new Date(Date.now() - retentionDays * 24 * 60 * 60 * 1000);
-  await database.delete(consumedEnvelopes).where(lt(consumedEnvelopes.consumedAt, cutoff));
+  await database.delete(consumedEnvelopes).where(and(eq(consumedEnvelopes.status, 'completed'), lt(consumedEnvelopes.consumedAt, cutoff)));
 }
 
 export const AUDIT_RETENTION_DEFAULT_BATCH_SIZE = 500;

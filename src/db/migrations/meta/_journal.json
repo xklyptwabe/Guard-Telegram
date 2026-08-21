@@ -162,6 +162,13 @@
       "when": 1787220000000,
       "tag": "0022_audit_integrity_and_dedup_horizon",
       "breakpoints": true
+    },
+    {
+      "idx": 23,
+      "version": "7",
+      "when": 1787221000000,
+      "tag": "0023_consumed_envelope_state_machine",
+      "breakpoints": true
     }
   ]
 }

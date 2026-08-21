@@ -5,14 +5,13 @@ import { z } from 'zod';
 
 import type { AppConfig } from '../config.js';
 import type { DrizzleDatabase } from '../db/client.js';
-import { consumedEnvelopes } from '../db/schema/core.js';
-import { eq } from 'drizzle-orm';
 import { recordIntegrationAction } from './audit/integrationAudit.js';
 import type { AuditService } from './auditService.js';
 import type { Logger } from './logger.js';
 import type { PendingOperationResolvers, PendingOperationsOutbox } from './moderation/pendingOperationsOutbox.js';
 import { bots9WalExclusion } from './bots9WalExclusions.js';
 import { integrationOperationMetadata } from './integrations/externalOperationGateway.js';
+import { RabbitEnvelopeInbox } from './rabbitmqConsumerInbox.js';
 
 const actionEnvelopeSchema = z.object({
   id: z.string().uuid(),
@@ -243,6 +242,7 @@ export async function createRabbitMq(
   };
 
   const handlers = new Map<string, ActionHandler>();
+  const envelopeInbox = db ? new RabbitEnvelopeInbox(db, logger) : undefined;
   const handleMessage = async (message: ConsumeMessage): Promise<void> => {
     let action: ActionEnvelope;
     try {
@@ -267,26 +267,38 @@ export async function createRabbitMq(
     try {
       const handler = handlers.get(action.type);
       if (!handler) throw new Error('No consumer registered for action type');
-      if (db) {
-        const claimed = await db
-          .insert(consumedEnvelopes)
-          .values({ envelopeId: action.id })
-          .onConflictDoNothing({ target: consumedEnvelopes.envelopeId })
-          .returning({ envelopeId: consumedEnvelopes.envelopeId });
-        if (!claimed[0]) {
+      if (envelopeInbox) {
+        const claimed = await envelopeInbox.begin(action.id);
+        if (claimed.claim === 'completed') {
           void bots9WalExclusion('rabbitmq.ack');
           channel.ack(message);
           logger.info({ event: 'rabbitmq.envelope.duplicate_skipped', details: { envelopeId: action.id, actionType: action.type } });
+          return;
+        }
+        if (claimed.claim === 'busy') {
+          void bots9WalExclusion('rabbitmq.nack');
+          channel.nack(message, false, true);
+          logger.info({ event: 'rabbitmq.envelope.busy_requeued', details: { envelopeId: action.id, actionType: action.type, attemptCount: claimed.attemptCount } });
           return;
         }
       }
       try {
         await handler(action);
       } catch (handlerError: unknown) {
-        if (db) {
-          await db.delete(consumedEnvelopes).where(eq(consumedEnvelopes.envelopeId, action.id));
+        if (envelopeInbox) {
+          const released = await envelopeInbox.fail(action.id, handlerError);
+          if (!released) {
+            void bots9WalExclusion('rabbitmq.nack');
+            channel.nack(message, false, true);
+            logger.warn({ event: 'rabbitmq.envelope.fail_lease_lost', details: { envelopeId: action.id, actionType: action.type } });
+            return;
+          }
         }
         throw handlerError;
+      }
+      if (envelopeInbox) {
+        const completed = await envelopeInbox.complete(action.id);
+        if (!completed) throw new Error('RabbitMQ consumer envelope lease lost before completion');
       }
       void bots9WalExclusion('rabbitmq.ack');
       channel.ack(message);

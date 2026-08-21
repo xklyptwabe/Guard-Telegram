@@ -98,4 +98,20 @@ describe('audit migrations', () => {
     expect(sql).toContain('ADD CONSTRAINT "entity_snapshots_status_check"');
     expect(sql).toContain('CREATE INDEX IF NOT EXISTS "consumed_envelopes_consumed_at_idx"');
   });
+
+  it('turns consumed_envelopes into a completed-only Rabbit consumer dedup state machine', () => {
+    const sql = readFileSync('src/db/migrations/0023_consumed_envelope_state_machine.sql', 'utf8');
+
+    expect(sql).toContain('ADD COLUMN IF NOT EXISTS "status" text NOT NULL DEFAULT \'received\'');
+    expect(sql).toContain('ADD COLUMN IF NOT EXISTS "attempt_count" integer NOT NULL DEFAULT 0');
+    expect(sql).toContain('ADD COLUMN IF NOT EXISTS "worker_id" text');
+    expect(sql).toContain('ADD COLUMN IF NOT EXISTS "lease_expires_at" timestamp with time zone');
+    expect(sql).toContain('ADD CONSTRAINT "consumed_envelopes_status_check"');
+    expect(sql).toContain("CHECK (\"status\" IN ('received', 'processing', 'completed', 'failed'))");
+    expect(sql).toContain('ADD CONSTRAINT "consumed_envelopes_worker_status_check"');
+    expect(sql).toContain('CREATE INDEX IF NOT EXISTS "consumed_envelopes_status_lease_idx"');
+    expect(sql).toContain('REVOKE UPDATE ON core.consumed_envelopes FROM telegram_bot');
+    expect(sql).toContain('GRANT UPDATE (');
+    expect(sql).not.toMatch(/GRANT\s+UPDATE\s+ON\s+core\.consumed_envelopes/i);
+  });
 });
