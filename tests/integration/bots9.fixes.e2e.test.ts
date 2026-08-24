@@ -15,7 +15,7 @@ import { runWithUpdateContext } from '../../src/lib/context.js';
 import { makeIntegrationAuditFinalizer } from '../../src/lib/integrations/externalOperationGateway.js';
 import type { Logger } from '../../src/lib/logger.js';
 import { ModerationService } from '../../src/lib/moderation/moderationService.js';
-import { ConfirmedExternalError, PendingOperationResolvers, PendingOperationsOutbox } from '../../src/lib/moderation/pendingOperationsOutbox.js';
+import { PendingOperationResolvers, PendingOperationsOutbox } from '../../src/lib/moderation/pendingOperationsOutbox.js';
 
 const testDatabaseUrl = process.env.TEST_DATABASE_URL;
 
@@ -323,12 +323,12 @@ describe.skipIf(!testDatabaseUrl)('BOTS-9 round-2 fixes: real-DB verification', 
     expect(eventsForChat).toHaveLength(0); // no resurrection
   });
 
-  it('S3: an unrecoverable recovery (HEAD 404) is a confirmed failed outcome with an explicit non-retryable marker', async () => {
+  it('S3: exhausted HEAD 404 reconciliation remains unknown and writes one terminal audit', async () => {
     const resolvers = new PendingOperationResolvers();
     resolvers.register('s3.putObject', async () => {
-      throw new ConfirmedExternalError('object absent after unrecoverable upload — body is never stored in the outbox', { errorCode: 404, unrecoverable: true, reason: 'put_intent_unrecoverable' });
-    });
-    const outbox = new PendingOperationsOutbox(client.db, silentLogger(), resolvers);
+      throw new Error('s3 HEAD 404 — object not visible yet');
+    }, { retryAfterUnknown: true });
+    const outbox = new PendingOperationsOutbox(client.db, silentLogger(), resolvers, 1);
     const finalizer = makeIntegrationAuditFinalizer(audit, silentLogger());
     await client.db.insert(pendingOperations).values({
       kind: 's3.putObject',
@@ -343,10 +343,11 @@ describe.skipIf(!testDatabaseUrl)('BOTS-9 round-2 fixes: real-DB verification', 
     await outbox.recoverPending(finalizer);
 
     const row = await client.db.select().from(pendingOperations).where(eq(pendingOperations.idempotencyKey, 's3-unrecoverable-1')).limit(1);
-    expect(row[0]?.status).toBe('failed');
-    expect((row[0]?.result as Record<string, unknown>).unrecoverable).toBe(true);
+    expect(row[0]?.status).toBe('unknown');
+    expect(row[0]?.nextAttemptAt).toBeNull();
     expect(row[0]?.auditStatus).toBe('written');
     const eventRows = await client.db.select().from(events).where(eq(events.eventType, 'integration.action'));
-    expect((eventRows[0]?.after as Record<string, unknown>).outcome).toBe('failed');
+    expect(eventRows).toHaveLength(1);
+    expect((eventRows[0]?.after as Record<string, unknown>).outcome).toBe('unknown');
   });
 });

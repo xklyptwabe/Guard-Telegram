@@ -39,11 +39,11 @@ export function createStorage(
   if (outbox && resolvers) {
     // Recovery executor (BOTS-9 review BLOCKER-3): a row found after a
     // restart has no body to re-upload — files must never be persisted to
-    // the outbox (BLOCKER-4). Instead it RECONCILES: S3 objects are atomic,
-    // so a HEAD either proves the original upload landed (→ succeeded) or
-    // proves it never did (→ confirmed failed; the intent is unrecoverable
-    // without the caller, which the audit trail now states explicitly). A
-    // network-level HEAD failure stays `unknown` and retries — HEAD is
+    // the outbox (BLOCKER-4). Instead it RECONCILES: a successful HEAD proves
+    // the original upload landed. A 404 only proves that the object is not
+    // visible at that instant; the timed-out PUT may still be in flight, and
+    // custom S3-compatible endpoints need not share AWS S3's exact consistency
+    // contract. HEAD failures therefore stay `unknown` and retry — HEAD is
     // read-only, so retrying it is always safe.
     resolvers.register(
       kind,
