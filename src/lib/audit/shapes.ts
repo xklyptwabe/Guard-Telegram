@@ -158,7 +158,10 @@ export const moderationActionSchema = z.object({
 export const messageEditedSchema = z.object({
   chatId: z.string().min(1),
   messageId: z.string().min(1),
-  userId: z.string().min(1),
+  // Channel posts and anonymous-admin messages legitimately have no `from`.
+  // The message state remains observable even when Telegram does not expose
+  // an actor, so omit the author rather than fabricating one.
+  userId: z.string().min(1).optional(),
   editedAt: z.string(),
   /** Round-2 (HIGH): Telegram's strictly-increasing update_id, the tie-breaker when two edits share the same second-precision `editedAt`. */
   observedUpdateId: z.number().int().optional(),
@@ -169,11 +172,10 @@ export const messageEditedSchema = z.object({
 export const messageDeletedSchema = z.object({
   chatId: z.string().min(1),
   messageId: z.string().min(1),
-  // Optional (unlike `message.edited`'s `userId`, which is always known from
-  // the incoming update): the Bot API sends no payload at all for a
-  // deletion, so the original author is only known if this message was
-  // previously observed (an earlier `message.edited`, or the delete was
-  // triggered by replying to the message, which still carries its author).
+  // The Bot API sends no payload at all for a deletion, so the original
+  // author is only known if this message was previously observed (an earlier
+  // message or edit, or the delete was triggered by replying to the message,
+  // which still carries its author).
   // When neither is true, `before` is `not_observed` and this is omitted —
   // never fabricated. See the module doc in `src/lib/audit/messageAudit.ts`.
   userId: z.string().min(1).optional(),

@@ -7,11 +7,12 @@ import type { Logger } from '../../lib/logger.js';
 /**
  * BOTS-9: `message.edited` existed as BOTS-7 scaffolding with no real
  * Telegram update handler anywhere in the app. This module is that
- * handler — for `edited_message` updates only. `edited_channel_post` is
- * deliberately unsupported (BOTS-9 review MEDIUM-1/MEDIUM-2): channel
- * posts carry no `from`, so the editor's identity is unknowable without
- * fabricating an actor. Requires `edited_message` in
- * `TELEGRAM_ALLOWED_UPDATES` (see `src/config.ts`).
+ * handler for both `edited_message` and `edited_channel_post`. Actor fields
+ * are omitted when Telegram does not expose `from`; message state is still
+ * recorded without fabricating an identity. Ordinary `message` and
+ * `channel_post` updates also refresh the last policy-allowed snapshot.
+ * Requires all four update types in `TELEGRAM_ALLOWED_UPDATES` (see
+ * `src/config.ts`).
  *
  * There is deliberately no `message.deleted` handler here. The Telegram
  * Bot API has no update for a message someone else deleted — see
@@ -23,7 +24,7 @@ export function createMessageAuditModule(audit: AuditService, logger: Logger): T
   return {
     id: MODULE_IDS.messageAudit,
     name: 'Message audit',
-    description: 'Audits message edits as observed via real Telegram edited_message updates. Deletions by anyone other than this bot are not observable via the Bot API and are not audited — see src/lib/audit/messageAudit.ts.',
+    description: 'Audits message edits observed via real Telegram edited_message and edited_channel_post updates. Deletions by anyone other than this bot are not observable via the Bot API and are not audited — see src/lib/audit/messageAudit.ts.',
     global: true,
     defaultEnabled: true,
     updateHandlers: [

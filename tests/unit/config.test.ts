@@ -13,7 +13,15 @@ describe('validateConfig', () => {
     const config = validateConfig(baseEnv);
     expect(config.telegramTransport).toBe('long_polling');
     expect(config.redisEnabled).toBe(false);
-    expect(config.telegramAllowedUpdates).toEqual(['message', 'edited_message', 'callback_query', 'my_chat_member', 'chat_member']);
+    expect(config.telegramAllowedUpdates).toEqual([
+      'message',
+      'edited_message',
+      'channel_post',
+      'edited_channel_post',
+      'callback_query',
+      'my_chat_member',
+      'chat_member',
+    ]);
   });
 
   it('rejects an insecure RabbitMQ endpoint before startup', () => {

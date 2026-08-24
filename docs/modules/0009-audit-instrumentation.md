@@ -9,11 +9,11 @@ BOTS-7 defined the full audit event registry (`src/lib/audit/definitions.ts`) �
 | `member.status.changed` | a real `chat_member` update | `src/lib/audit/memberAudit.ts`, via the `membership-audit` module |
 | `bot.membership.changed` | a real `my_chat_member` update | `src/lib/audit/botMembershipAudit.ts`, registered directly in `core/updates.ts` |
 | `moderation.action` | `/ban`, `/unban`, `/restrict`, `/unrestrict`, `/kick` | `src/lib/moderation/moderationService.ts`, via the `moderation` module |
-| `message.edited` | a real `edited_message` update only — `edited_channel_post` is unsupported (channel posts carry no `from`, so the editor is unknowable without fabricating an actor) | `src/lib/audit/messageAudit.ts`, via the `message-audit` module |
+| `message.edited` | a real `edited_message` or `edited_channel_post` update; actor fields are omitted when Telegram does not expose `from` | `src/lib/audit/messageAudit.ts`, via the `message-audit` module |
 | `message.deleted` | the bot's own `deleteMessage` call (`/delmsg`) | `src/lib/audit/messageAudit.ts`, called from `ModerationService.deleteMessage` |
 | `chat.settings.changed` | `/setlocale` | `src/lib/chatSettings.ts`, via the `chat-settings` module |
 
-`chat_member` and `edited_message` are **not** sent by Telegram unless listed in `TELEGRAM_ALLOWED_UPDATES` — the default in `src/config.ts`/`.env.example` now includes both, but a deployment that overrides that variable must keep them if it wants these two events to fire at all.
+`chat_member`, `edited_message`, `channel_post`, and `edited_channel_post` are **not** sent by Telegram unless listed in `TELEGRAM_ALLOWED_UPDATES` — the default in `src/config.ts`/`.env.example` includes all four, but a deployment that overrides that variable must keep the update types it wants to observe.
 
 ## `bot.membership.changed` is never module-gated
 
@@ -21,7 +21,7 @@ Every other event above is produced from inside a toggleable module's `updateHan
 
 ## `entity_snapshots`, "the last allowed version", and `before_status = not_observed`
 
-`AuditService.recordEntityChange` keeps one row per subject in `audit.entity_snapshots` holding the most recent state we're allowed to know about that subject — "allowed" meaning it has already passed the same per-chat, per-event-type field allowlist (`allowMessageTextLogging`, etc.) that governs the `events` table itself. `message.edited` updates that row every time; a later `message.deleted` or another `message.edited` reads it back via `src/lib/audit/entitySnapshotLookup.ts`.
+`AuditService.recordEntityChange` keeps one row per subject in `audit.entity_snapshots` holding the most recent state we're allowed to know about that subject — "allowed" meaning it has already passed the same per-chat, per-event-type field allowlist (`allowMessageTextLogging`, etc.) that governs the `events` table itself. Ordinary `message` and `channel_post` updates refresh that row without creating a synthetic audit event; `message.edited` updates it as part of its event. A later `message.deleted` or another `message.edited` reads it back via `src/lib/audit/entitySnapshotLookup.ts`.
 
 When nothing has ever been recorded for a subject — a message deleted before any edit was observed, a member whose very first `chat_member` update this bot ever saw — `before` is `not_observed`, never a fabricated guess. This is deliberate and shows up in `events.before_snapshot_status`.
 

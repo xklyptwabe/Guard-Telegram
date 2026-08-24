@@ -61,19 +61,14 @@ function raiseTextCapableEvent(input: Omit<RaiseAuditEventInput<'message.edited'
 }
 
 /**
- * BOTS-9 review finding (MEDIUM-1/MEDIUM-2): audits Telegram's
- * `edited_message` update as `message.edited`. `edited_channel_post` is
- * deliberately NOT claimed: channel posts carry no `from`, so the editor's
- * identity is unknowable without fabricating an actor — exactly what the
- * snapshot contract forbids. Operators enabling that update type get an
- * explicit `no_author` warning per update rather than silently wrong
- * audits. Requires `edited_message` in `TELEGRAM_ALLOWED_UPDATES`.
+ * Stores the latest policy-allowed state observed in ordinary `message` and
+ * `channel_post` updates. This does not create a synthetic message event; it
+ * only gives a later edit or observed bot-side deletion a real `before`.
  */
 export async function recordMessageObserved(audit: AuditService, logger: Logger, ctx: Context): Promise<void> {
-  const message = ctx.message;
-  if (!message || ctx.editedMessage) return;
+  const message = ctx.message ?? ctx.channelPost;
+  if (!message) return;
   const userId = message.from ? String(message.from.id) : undefined;
-  if (userId === undefined) return;
   const updateContext = getUpdateContext();
   if (!updateContext) return;
   const chatId = String(message.chat.id);
@@ -93,7 +88,7 @@ export async function recordMessageObserved(audit: AuditService, logger: Logger,
       snapshotData: {
         chatId,
         messageId,
-        userId,
+        ...(userId !== undefined ? { userId } : {}),
         editedAt: observedAt,
         observedUpdateId: incomingUpdateId,
         textLength: text?.length ?? 0,
@@ -108,7 +103,7 @@ export async function recordMessageObserved(audit: AuditService, logger: Logger,
 }
 
 export async function recordMessageEdited(audit: AuditService, logger: Logger, ctx: Context): Promise<void> {
-  const message = ctx.editedMessage;
+  const message = ctx.editedMessage ?? ctx.editedChannelPost;
   if (!message) return;
   if (message.edit_date === undefined) {
     logger.warn({ event: 'audit.message_edited.incomplete_update', details: { hasMessage: true } });
@@ -118,13 +113,6 @@ export async function recordMessageEdited(audit: AuditService, logger: Logger, c
   const chatId = String(message.chat.id);
   const messageId = String(message.message_id);
   const userId = message.from ? String(message.from.id) : undefined;
-  if (userId === undefined) {
-    // Anonymous admin posts and channel posts have no `from` — we cannot
-    // satisfy `messageEditedSchema.userId` (always required, unlike the
-    // deletion schema) without fabricating one.
-    logger.warn({ event: 'audit.message_edited.no_author', chatId, details: { messageId } });
-    return;
-  }
 
   const updateContext = getUpdateContext();
   if (!updateContext) {
@@ -134,6 +122,7 @@ export async function recordMessageEdited(audit: AuditService, logger: Logger, c
 
   const text = message.text ?? message.caption;
   const editedAt = new Date(message.edit_date * 1000).toISOString();
+  const source = ctx.editedChannelPost ? 'telegram.edited_channel_post_update' : 'telegram.edited_message_update';
   const idempotencyKey = `message.edited:telegram-update:${updateContext.botId ?? 'unscoped-bot'}:${updateContext.updateId}:${chatId}:${messageId}`;
   const subjectType = 'message';
   const subjectId = `${chatId}:${messageId}`;
@@ -147,10 +136,9 @@ export async function recordMessageEdited(audit: AuditService, logger: Logger, c
         eventType: 'message.edited',
         eventVersion: 'v1',
         category: 'message',
-        source: 'telegram.edited_message_update',
+        source,
         idempotencyKey,
-        actorId: userId,
-        actorType: 'telegram_user',
+        ...(userId !== undefined ? { actorId: userId, actorType: 'telegram_user' } : {}),
         // Round-2 (HIGH): canonical module id so BOTS-8 module policy applies.
         moduleId: MODULE_IDS.messageAudit,
       },
@@ -179,7 +167,15 @@ export async function recordMessageEdited(audit: AuditService, logger: Logger, c
         const isStale =
           previousEditedAt !== undefined &&
           (previousEditedAt > editedAt || (previousEditedAt === editedAt && (previousUpdateId ?? 0) >= incomingUpdateId));
-        const incomingAfter = { chatId, messageId, userId, editedAt, observedUpdateId: incomingUpdateId, textLength: text?.length ?? 0, ...(text !== undefined ? { text } : {}) };
+        const incomingAfter = {
+          chatId,
+          messageId,
+          ...(userId !== undefined ? { userId } : {}),
+          editedAt,
+          observedUpdateId: incomingUpdateId,
+          textLength: text?.length ?? 0,
+          ...(text !== undefined ? { text } : {}),
+        };
         const operation = isStale ? 'noop' : previous ? 'update' : 'create';
 
         const record = raiseTextCapableEvent({
@@ -187,7 +183,7 @@ export async function recordMessageEdited(audit: AuditService, logger: Logger, c
           version: 1,
           operation,
           chatId,
-          actorId: userId,
+          ...(userId !== undefined ? { actorId: userId } : {}),
           before: previous ? observed(previous) : notObserved(),
           after: observed(incomingAfter),
         });

@@ -62,6 +62,32 @@ describe('recordMessageObserved', () => {
     });
     expect(calls).toHaveLength(0);
   });
+
+  it('stores an ordinary channel post without fabricating a user through the production module handler', async () => {
+    const fixture = loadFixture('bots9/edited_channel_post.json');
+    const { audit, calls, observations } = fakeAuditService();
+    const module = createMessageAuditModule(audit, logger());
+    const handler = module.updateHandlers?.find((candidate) => candidate.id === 'message-audit-observed-message');
+    const { edit_date: _editDate, ...channelPost } = fixture.edited_channel_post;
+
+    await runWithUpdateContext(
+      { updateId: String(fixture.update_id - 1), chatId: String(channelPost.chat.id), botId: '42' },
+      async () => handler?.handle({ channelPost } as never),
+    );
+
+    expect(observations).toHaveLength(1);
+    expect(observations[0]).toMatchObject({
+      tenantId: String(channelPost.chat.id),
+      subjectId: `${String(channelPost.chat.id)}:${String(channelPost.message_id)}`,
+      snapshotData: {
+        chatId: String(channelPost.chat.id),
+        messageId: String(channelPost.message_id),
+        text: channelPost.text,
+      },
+    });
+    expect((observations[0] as { snapshotData: Record<string, unknown> }).snapshotData).not.toHaveProperty('userId');
+    expect(calls).toHaveLength(0);
+  });
 });
 
 describe('recordMessageEdited', () => {
@@ -86,15 +112,45 @@ describe('recordMessageEdited', () => {
     expect(calls).toHaveLength(0);
   });
 
-  it('logs and skips rather than fabricating an author when the update has no from (e.g. anonymous admin post)', async () => {
+  it('audits an edited message without from using the actor-optional contract', async () => {
     const { audit, calls } = fakeAuditService();
     const testLogger = logger();
     const ctx = { editedMessage: { message_id: 1, chat: { id: -100 }, edit_date: 123, text: 'x' } } as never;
 
     await runWithUpdateContext({ updateId: '1', chatId: '-100' }, () => recordMessageEdited(audit, testLogger, ctx));
 
-    expect(calls).toHaveLength(0);
-    expect(testLogger.warn).toHaveBeenCalledWith(expect.objectContaining({ event: 'audit.message_edited.no_author' }));
+    expect(calls).toHaveLength(1);
+    const call = calls[0] as { input: { actorId?: string }; result: { after?: Record<string, unknown> } };
+    expect(call.input).not.toHaveProperty('actorId');
+    expect(call.result.after).not.toHaveProperty('userId');
+    expect(testLogger.warn).not.toHaveBeenCalled();
+  });
+
+  it('audits edited_channel_post through the production module handler with an optional actor', async () => {
+    const fixture = loadFixture('bots9/edited_channel_post.json');
+    const { audit, calls } = fakeAuditService();
+    const module = createMessageAuditModule(audit, logger());
+    const handler = module.updateHandlers?.find((candidate) => candidate.id === 'message-audit-edited-message');
+
+    await runWithUpdateContext(
+      { updateId: String(fixture.update_id), chatId: String(fixture.edited_channel_post.chat.id), botId: '42' },
+      async () => handler?.handle({ editedChannelPost: fixture.edited_channel_post } as never),
+    );
+
+    expect(calls).toHaveLength(1);
+    const call = calls[0] as {
+      input: { actorId?: string; source: string };
+      result: { after?: Record<string, unknown>; snapshotData?: Record<string, unknown> };
+    };
+    expect(call.input).not.toHaveProperty('actorId');
+    expect(call.input.source).toBe('telegram.edited_channel_post_update');
+    expect(call.result.after).toMatchObject({
+      chatId: '-1002222222222',
+      messageId: '905',
+      textLength: 27,
+    });
+    expect(call.result.after).not.toHaveProperty('userId');
+    expect(call.result.snapshotData).not.toHaveProperty('userId');
   });
 
   it('BOTS-9 review HIGH-1: an OLDER edit arriving after a newer one is audited as a noop and never regresses the current snapshot', async () => {
