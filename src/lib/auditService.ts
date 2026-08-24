@@ -142,6 +142,7 @@ export class AuditService {
         chatId: input.tenantId,
         ...(input.moduleId !== undefined ? { moduleId: input.moduleId } : {}),
       });
+      if (!policy.values.enabled || policy.values.snapshotMode !== 'snapshot') return;
       const definition = requireAuditPersistenceDefinition({
         eventType: input.eventType,
         eventVersion: input.eventVersion,
@@ -157,6 +158,7 @@ export class AuditService {
         definition.allowlist,
         {
           allowMessageTextLogging: policy.values.allowlist.includes('text'),
+          allowlist: policy.values.allowlist,
           ...(policy.values.masking.length > 0 ? { masking: policy.values.masking } : {}),
         },
       );

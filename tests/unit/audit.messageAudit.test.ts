@@ -7,6 +7,7 @@ import { recordMessageDeleted, recordMessageEdited, recordMessageObserved } from
 import type { AuditService } from '../../src/lib/auditService.js';
 import { runWithUpdateContext } from '../../src/lib/context.js';
 import type { Logger } from '../../src/lib/logger.js';
+import { createMessageAuditModule } from '../../src/modules/global/messageAudit.js';
 
 function loadFixture(name: string): any {
   const path = fileURLToPath(new URL(`../fixtures/updates/${name}`, import.meta.url));
@@ -15,6 +16,7 @@ function loadFixture(name: string): any {
 
 function fakeAuditService(currentSnapshotRows: Array<Record<string, unknown>> = []) {
   const calls: Array<{ input: unknown; result: unknown }> = [];
+  const observations: unknown[] = [];
   const fakeTx = {
     select: () => ({ from: () => ({ where: () => ({ limit: () => Promise.resolve(currentSnapshotRows) }) }) }),
   };
@@ -24,15 +26,43 @@ function fakeAuditService(currentSnapshotRows: Array<Record<string, unknown>> = 
       calls.push({ input, result });
       return { eventId: 'evt-1', subjectSequence: 1, duplicate: false };
     }),
-    observeCurrentSnapshot: vi.fn(async () => undefined),
+    observeCurrentSnapshot: vi.fn(async (input: unknown) => {
+      observations.push(input);
+    }),
     maskOutboxMetadata: vi.fn(async (input: { metadata: Record<string, unknown> }) => input.metadata),
   } as unknown as AuditService;
-  return { audit, calls };
+  return { audit, calls, observations };
 }
 
 function logger(): Logger {
   return { info: vi.fn(), debug: vi.fn(), warn: vi.fn(), error: vi.fn() } as unknown as Logger;
 }
+
+describe('recordMessageObserved', () => {
+  it('stores an ordinary message through the production module handler without creating a synthetic event', async () => {
+    const fixture = loadFixture('message.command.json');
+    const { audit, calls, observations } = fakeAuditService();
+    const module = createMessageAuditModule(audit, logger());
+    const handler = module.updateHandlers?.find((candidate) => candidate.id === 'message-audit-observed-message');
+
+    await runWithUpdateContext(
+      { updateId: String(fixture.update_id), chatId: String(fixture.message.chat.id), botId: '42' },
+      async () => handler?.handle({ message: fixture.message } as never),
+    );
+
+    expect(observations).toHaveLength(1);
+    expect(observations[0]).toMatchObject({
+      tenantId: String(fixture.message.chat.id),
+      subjectType: 'message',
+      subjectId: `${String(fixture.message.chat.id)}:${String(fixture.message.message_id)}`,
+      eventType: 'message.edited',
+      eventVersion: 'v1',
+      moduleId: 'message-audit',
+      observedUpdateId: fixture.update_id,
+    });
+    expect(calls).toHaveLength(0);
+  });
+});
 
 describe('recordMessageEdited', () => {
   it('audits a real edited_message update, with before_status not_observed for a message never seen before', async () => {
