@@ -33,6 +33,7 @@ function fakeAuditService() {
 
 function fakeBot() {
   return {
+    botInfo: { id: 777 },
     api: {
       raw: {
         banChatMember: vi.fn(async () => true),
@@ -110,6 +111,44 @@ describe('ModerationService', () => {
     expect(calls).toHaveLength(1);
     const call = calls[0] as { result: { after?: Record<string, unknown> } };
     expect(call.result.after).toMatchObject({ action: 'kick' });
+  });
+
+  it.each([
+    ['the acting user', '9'],
+    ['the bot itself', '777'],
+  ])('kick(): rejects %s before WAL, Telegram, or audit work', async (_case, targetUserId) => {
+    const bot = fakeBot();
+    const { audit, calls } = fakeAuditService();
+    const service = new ModerationService(bot as never, audit, outbox, resolvers, logger());
+
+    await expect(
+      runWithUpdateContext({ updateId: 'unsafe-kick', chatId: '-100111', botId: '777' }, () =>
+        service.kick({ chatId: '-100111', targetUserId, actorUserId: '9' }),
+      ),
+    ).rejects.toThrow(/unsafe moderation target/i);
+
+    expect(bot.api.raw.banChatMember).not.toHaveBeenCalled();
+    expect(bot.api.raw.unbanChatMember).not.toHaveBeenCalled();
+    expect(audit.maskOutboxMetadata).not.toHaveBeenCalled();
+    expect(calls).toHaveLength(0);
+    expect(db.rows).toHaveLength(0);
+  });
+
+  it('applies the same service-level self-target guard to non-kick moderation paths', async () => {
+    const bot = fakeBot();
+    const { audit, calls } = fakeAuditService();
+    const service = new ModerationService(bot as never, audit, outbox, resolvers, logger());
+
+    await expect(
+      runWithUpdateContext({ updateId: 'unsafe-ban', chatId: '-100111', botId: '777' }, () =>
+        service.ban({ chatId: '-100111', targetUserId: '9', actorUserId: '9' }),
+      ),
+    ).rejects.toThrow(/unsafe moderation target/i);
+
+    expect(bot.api.raw.banChatMember).not.toHaveBeenCalled();
+    expect(audit.maskOutboxMetadata).not.toHaveBeenCalled();
+    expect(calls).toHaveLength(0);
+    expect(db.rows).toHaveLength(0);
   });
 
   it('kick(): stops after a confirmed ban failure and never attempts the unban step', async () => {

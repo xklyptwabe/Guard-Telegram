@@ -158,6 +158,30 @@ describe('moderation commands: /restrict', () => {
   });
 });
 
+describe('moderation commands: /kick', () => {
+  it.each([
+    ['the acting user', 9, 'moderation.cannotTargetSelf'],
+    ['the bot itself', 777, 'moderation.cannotTargetBot'],
+  ] as const)('rejects %s before calling ModerationService', async (_case, targetUserId, expectedKey) => {
+    const moderation = {
+      kick: vi.fn(async (): Promise<ModerationOutcome> => ({ status: 'succeeded', willRetry: false })),
+    } as unknown as ModerationService;
+    const module = createModerationModule(moderation);
+    const kick = module.commands!.find((command) => command.name === 'kick')!;
+    const context = fakeContext({
+      ctx: fakeReplyCtx({
+        me: { id: 777 },
+        message: { reply_to_message: { from: { id: targetUserId } } },
+      }),
+    });
+
+    await kick.execute(context, 'reason');
+
+    expect(moderation.kick).not.toHaveBeenCalled();
+    expect(context.sentMessages).toEqual([{ key: expectedKey }]);
+  });
+});
+
 describe('moderation commands: /delmsg', () => {
   it('requires a reply and never calls the service without one', async () => {
     const moderation = { deleteMessage: vi.fn() } as unknown as ModerationService;

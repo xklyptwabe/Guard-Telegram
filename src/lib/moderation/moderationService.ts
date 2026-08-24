@@ -28,6 +28,15 @@ export class ModerationAuditPendingError extends AuditFinalizationPendingError {
   }
 }
 
+export type UnsafeModerationTargetReason = 'actor' | 'bot';
+
+export class UnsafeModerationTargetError extends Error {
+  public constructor(public readonly reason: UnsafeModerationTargetReason) {
+    super(`Unsafe moderation target: ${reason}`);
+    this.name = 'UnsafeModerationTargetError';
+  }
+}
+
 export type ModerationAction = 'ban' | 'kick' | 'mute' | 'unban' | 'unmute';
 
 export interface ModerationActionInput {
@@ -310,10 +319,16 @@ export class ModerationService {
   }
 
   private async performAndAudit(action: ModerationAction, input: ModerationActionInput, kind: string, requestPayload: Record<string, unknown>): Promise<ModerationOutcome> {
+    this.assertSafeTarget(input);
     const result = await this.dispatch(action, input, kind, requestPayload);
     // BLOCKER-4: same mandatory-audit propagation as deleteMessage.
     if (result.isFinal && !result.auditFinalized) throw new ModerationAuditPendingError(result.row.id, kind);
     return result.isFinal ? this.toOutcome(result.outcome) : { status: 'unknown', willRetry: true };
+  }
+
+  private assertSafeTarget(input: ModerationActionInput): void {
+    if (input.targetUserId === input.actorUserId) throw new UnsafeModerationTargetError('actor');
+    if (input.targetUserId === String(this.bot.botInfo.id)) throw new UnsafeModerationTargetError('bot');
   }
 
   private toOutcome(outcome: AttemptOutcome): ModerationOutcome {
