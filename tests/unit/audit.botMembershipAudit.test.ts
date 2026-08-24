@@ -38,12 +38,13 @@ describe('recordBotMembershipChanged', () => {
     const { audit, calls } = fakeAuditService();
     const ctx = { myChatMember: fixture.my_chat_member } as never;
 
-    await runWithUpdateContext({ updateId: String(fixture.update_id), chatId: '-1001111111111' }, () => recordBotMembershipChanged(audit, logger(), ctx));
+    await runWithUpdateContext({ updateId: String(fixture.update_id), botId: 'bot-42', chatId: '-1001111111111' }, () => recordBotMembershipChanged(audit, logger(), ctx));
 
     expect(calls).toHaveLength(1);
-    const call = calls[0] as { input: { eventType: string; subjectId: string }; result: { before?: Record<string, unknown>; after?: Record<string, unknown> } };
+    const call = calls[0] as { input: { eventType: string; subjectId: string; idempotencyKey: string }; result: { before?: Record<string, unknown>; after?: Record<string, unknown> } };
     expect(call.input.eventType).toBe('bot.membership.changed');
     expect(call.input.subjectId).toBe('-1001111111111');
+    expect(call.input.idempotencyKey).toBe('bot.membership.changed:telegram-update:bot-42:100005:-1001111111111');
     expect(call.result.before).toMatchObject({ status: 'member' });
     expect(call.result.after).toMatchObject({ status: 'administrator' });
   });

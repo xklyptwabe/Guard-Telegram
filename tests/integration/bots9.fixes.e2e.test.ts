@@ -272,6 +272,32 @@ describe.skipIf(!testDatabaseUrl)('BOTS-9 round-2 fixes: real-DB verification', 
     expect((snap[0]?.snapshotData as Record<string, unknown>).status).toBe('administrator');
   });
 
+  it('HIGH: scopes update-derived idempotency by bot while deduplicating redelivery for the same bot', async () => {
+    const updateId = 960003;
+    const memberChatId = '-1001111111111';
+    const subjectId = `${memberChatId}:888888`;
+    const ctx = memberFixture(updateId, 1770001000, 'member', 'administrator', { can_manage_chat: true });
+
+    await runWithUpdateContext({ updateId: String(updateId), botId: 'bot-41', chatId: memberChatId }, () =>
+      recordMemberStatusChanged(audit, silentLogger(), ctx),
+    );
+    await runWithUpdateContext({ updateId: String(updateId), botId: 'bot-42', chatId: memberChatId }, () =>
+      recordMemberStatusChanged(audit, silentLogger(), ctx),
+    );
+    await runWithUpdateContext({ updateId: String(updateId), botId: 'bot-41', chatId: memberChatId }, () =>
+      recordMemberStatusChanged(audit, silentLogger(), ctx),
+    );
+
+    const rows = await client.db
+      .select({ idempotencyKey: events.idempotencyKey })
+      .from(events)
+      .where(and(eq(events.eventType, 'member.status.changed'), eq(events.subjectId, subjectId)));
+    expect(rows.map((row) => row.idempotencyKey).sort()).toEqual([
+      `member.status.changed:telegram-update:bot-41:${updateId}:${subjectId}`,
+      `member.status.changed:telegram-update:bot-42:${updateId}:${subjectId}`,
+    ]);
+  });
+
   it('HIGH-2: integration.action carries the first-class outcome — failed and unknown are distinguishable', async () => {
     await recordIntegrationAction(audit, silentLogger(), { integrationId: 's3', action: 'put', targetType: 'object', targetId: 'k1', outcome: 'failed', statusCode: 403 });
     await recordIntegrationAction(audit, silentLogger(), { integrationId: 's3', action: 'put', targetType: 'object', targetId: 'k2', outcome: 'unknown' });

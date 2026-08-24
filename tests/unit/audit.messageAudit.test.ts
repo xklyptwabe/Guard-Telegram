@@ -96,12 +96,13 @@ describe('recordMessageEdited', () => {
     const { audit, calls } = fakeAuditService([]); // no prior snapshot
     const ctx = { editedMessage: fixture.edited_message } as never;
 
-    await runWithUpdateContext({ updateId: String(fixture.update_id), chatId: '-1001111111111' }, () => recordMessageEdited(audit, logger(), ctx));
+    await runWithUpdateContext({ updateId: String(fixture.update_id), botId: 'bot-42', chatId: '-1001111111111' }, () => recordMessageEdited(audit, logger(), ctx));
 
     expect(calls).toHaveLength(1);
-    const call = calls[0] as { input: { eventType: string; subjectId: string }; result: { beforeSnapshotStatus?: string; metadata?: Record<string, unknown> } };
+    const call = calls[0] as { input: { eventType: string; subjectId: string; idempotencyKey: string }; result: { beforeSnapshotStatus?: string; metadata?: Record<string, unknown> } };
     expect(call.input.eventType).toBe('message.edited');
     expect(call.input.subjectId).toBe('-1001111111111:503');
+    expect(call.input.idempotencyKey).toBe('message.edited:telegram-update:bot-42:100007:-1001111111111:503');
     expect(call.result.beforeSnapshotStatus).toBe('not_observed');
     expect(call.result.metadata).toMatchObject({ operation: 'create' });
   });

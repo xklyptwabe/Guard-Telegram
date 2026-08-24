@@ -61,11 +61,12 @@ describe('ModerationService', () => {
     const { audit, calls } = fakeAuditService();
     const service = new ModerationService(bot as never, audit, outbox, resolvers, logger());
 
-    const outcome = await runWithUpdateContext({ updateId: '1', chatId: '-100111' }, () => service.ban({ chatId: '-100111', targetUserId: '2', actorUserId: '9', reason: 'spam' }));
+    const outcome = await runWithUpdateContext({ updateId: '1', botId: 'bot-42', chatId: '-100111' }, () => service.ban({ chatId: '-100111', targetUserId: '2', actorUserId: '9', reason: 'spam' }));
 
     expect(outcome).toEqual({ status: 'succeeded', willRetry: false, detail: {} });
     expect(bot.api.raw.banChatMember).toHaveBeenCalledTimes(1);
     expect(bot.api.raw.banChatMember).toHaveBeenCalledWith({ chat_id: -100111, user_id: 2 });
+    expect(db.rows[0]?.idempotencyKey).toBe('moderation.action:telegram-update:bot-42:1:-100111:2:ban');
     expect(calls).toHaveLength(1);
     const call = calls[0] as { input: { eventType: string }; result: { after?: Record<string, unknown>; metadata?: Record<string, unknown> } };
     expect(call.input.eventType).toBe('moderation.action');
@@ -221,10 +222,11 @@ describe('ModerationService', () => {
     const { audit, calls } = fakeAuditService();
     const service = new ModerationService(bot as never, audit, outbox, resolvers, logger());
 
-    const outcome = await runWithUpdateContext({ updateId: '1', chatId: '-100111' }, () => service.deleteMessage('-100111', '55', '9', '2'));
+    const outcome = await runWithUpdateContext({ updateId: '1', botId: 'bot-42', chatId: '-100111' }, () => service.deleteMessage('-100111', '55', '9', '2'));
 
     expect(outcome.status).toBe('succeeded');
     expect(bot.api.raw.deleteMessage).toHaveBeenCalledWith({ chat_id: -100111, message_id: 55 });
+    expect(db.rows[0]?.idempotencyKey).toBe('moderation.delete:telegram-update:bot-42:1:-100111:55');
     expect(calls).toHaveLength(1);
     const call = calls[0] as unknown as { input: { eventType: string } };
     expect(call.input.eventType).toBe('message.deleted');
