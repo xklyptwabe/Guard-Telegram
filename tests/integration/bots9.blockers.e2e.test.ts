@@ -34,6 +34,37 @@ async function expectDbError(query: Promise<unknown>, pattern: RegExp): Promise<
   throw new Error(`Expected a database error matching ${pattern}, but the query succeeded`);
 }
 
+async function expectTelegramBotPermissionDenied(
+  client: DatabaseClient,
+  query: string,
+  values: readonly unknown[] = [],
+): Promise<void> {
+  const connection = await client.pool.connect();
+  let denied: unknown;
+  try {
+    await connection.query('BEGIN');
+    await connection.query('SET LOCAL ROLE telegram_bot');
+    try {
+      await connection.query(query, [...values]);
+    } catch (error: unknown) {
+      denied = error;
+    }
+  } finally {
+    await connection.query('ROLLBACK');
+    connection.release();
+  }
+  expect((denied as { code?: string } | undefined)?.code).toBe('42501');
+}
+
+async function canSetTelegramBotRole(client: DatabaseClient): Promise<boolean> {
+  const result = await client.pool.query<{ canSetRole: boolean }>(`
+    SELECT rolsuper OR pg_has_role(current_user, 'telegram_bot', 'SET') AS "canSetRole"
+    FROM pg_roles
+    WHERE rolname = current_user
+  `);
+  return result.rows[0]?.canSetRole ?? false;
+}
+
 function fakeBot() {
   return {
     api: {
@@ -234,48 +265,48 @@ describe.skipIf(!testDatabaseUrl)('BOTS-9 blockers: real-DB verification', () =>
     expect(row?.workerId).toBeNull();
   });
 
-  it('HIGH-4 DoD: telegram_bot runtime role — required DML allowed, DELETE denied (migrations 0014/0015/0016/0017 grants)', async () => {
-    // Ensure the role exists locally (idempotent; migrations grant to it
-    // only if present, mirroring production provisioning).
-    await client.db.execute(sql`DO $$ BEGIN
-      IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'telegram_bot') THEN
-        CREATE ROLE telegram_bot NOLOGIN;
-      END IF;
-    END $$;`);
-    // Re-apply the grants (they were skipped if the role was created after
-    // the migrations ran).
-    await client.db.execute(sql`GRANT USAGE ON SCHEMA moderation TO telegram_bot`);
-    await client.db.execute(sql`GRANT SELECT, INSERT ON moderation.pending_operations TO telegram_bot`);
-    await client.db.execute(sql`GRANT UPDATE (status, attempt_count, last_attempt_at, next_attempt_at, result, updated_at, worker_id, lease_expires_at, audit_status, audit_worker_id, audit_lease_expires_at) ON moderation.pending_operations TO telegram_bot`);
-    await client.db.execute(sql`GRANT USAGE ON SCHEMA core TO telegram_bot`);
-    await client.db.execute(sql`GRANT SELECT, INSERT, UPDATE ON core.processed_updates TO telegram_bot`);
+  it('HIGH-4 DoD: telegram_bot can advance state machines but cannot rewrite inbox/outbox identity or payload', async ({ skip }) => {
+    if (!(await canSetTelegramBotRole(client))) skip();
 
     await client.db.execute(sql`INSERT INTO moderation.pending_operations (kind, chat_id, request_payload, metadata, idempotency_key, status) VALUES ('telegram.banChatMember', '-100900', '{}', '{}', 'bots9-role-1', 'pending')`);
+    await client.db.execute(sql`INSERT INTO core.processed_updates (bot_id, update_id, status) VALUES ('42','7002','received')`);
 
-    await client.db.execute(sql`SET ROLE telegram_bot`);
+    const connection = await client.pool.connect();
     try {
+      await connection.query('BEGIN');
+      await connection.query('SET LOCAL ROLE telegram_bot');
       // Claim + resolve shape (worker_id/lease/audit_status columns included).
-      await client.db.execute(sql`UPDATE moderation.pending_operations SET status='in_progress', worker_id='w', lease_expires_at=now()+interval '45 seconds', attempt_count=attempt_count+1, audit_status='pending' WHERE idempotency_key='bots9-role-1'`);
-      await client.db.execute(sql`UPDATE moderation.pending_operations SET status='succeeded', worker_id=NULL, lease_expires_at=NULL, audit_status='written' WHERE idempotency_key='bots9-role-1'`);
+      await connection.query(`UPDATE moderation.pending_operations SET status='in_progress', worker_id='w', lease_expires_at=now()+interval '45 seconds', attempt_count=attempt_count+1, audit_status='pending' WHERE idempotency_key='bots9-role-1'`);
+      await connection.query(`UPDATE moderation.pending_operations SET status='succeeded', worker_id=NULL, lease_expires_at=NULL, audit_status='written' WHERE idempotency_key='bots9-role-1'`);
       // Inbox claim shape.
-      await client.db.execute(sql`INSERT INTO core.processed_updates (bot_id, update_id, status) VALUES ('42','7002','received') ON CONFLICT DO NOTHING`);
-      await client.db.execute(sql`UPDATE core.processed_updates SET status='processing', worker_id='w', lease_expires_at=now()+interval '45 seconds', attempt_count=attempt_count+1 WHERE bot_id='42' AND update_id='7002'`);
-      // DELETE must be denied — audit/outbox history is not deletable by the
-      // app role. The server's message locale varies (EN "permission
-      // denied", RU "нет доступа"), so assert the denial happened and — the
-      // actual security property — that the row survived it.
-      let deleteWasDenied = false;
-      try {
-        await client.db.execute(sql`DELETE FROM moderation.pending_operations WHERE idempotency_key='bots9-role-1'`);
-      } catch {
-        deleteWasDenied = true;
-      }
-      expect(deleteWasDenied).toBe(true);
+      await connection.query(`UPDATE core.processed_updates SET status='processing', worker_id='w', lease_expires_at=now()+interval '45 seconds', attempt_count=attempt_count+1 WHERE bot_id='42' AND update_id='7002'`);
+
+      const allowedOutbox = await connection.query<{ status: string }>(`SELECT status FROM moderation.pending_operations WHERE idempotency_key='bots9-role-1'`);
+      const allowedInbox = await connection.query<{ status: string }>(`SELECT status FROM core.processed_updates WHERE bot_id='42' AND update_id='7002'`);
+      expect(allowedOutbox.rows[0]?.status).toBe('succeeded');
+      expect(allowedInbox.rows[0]?.status).toBe('processing');
     } finally {
-      await client.db.execute(sql`RESET ROLE`);
+      await connection.query('ROLLBACK');
+      connection.release();
     }
+
+    const forbiddenUpdates: ReadonlyArray<readonly [string, readonly unknown[]]> = [
+      ['UPDATE moderation.pending_operations SET id = id WHERE idempotency_key = $1', ['bots9-role-1']],
+      ['UPDATE moderation.pending_operations SET kind = kind WHERE idempotency_key = $1', ['bots9-role-1']],
+      ['UPDATE moderation.pending_operations SET chat_id = chat_id WHERE idempotency_key = $1', ['bots9-role-1']],
+      ['UPDATE moderation.pending_operations SET request_payload = request_payload WHERE idempotency_key = $1', ['bots9-role-1']],
+      ['UPDATE moderation.pending_operations SET metadata = metadata WHERE idempotency_key = $1', ['bots9-role-1']],
+      ['UPDATE moderation.pending_operations SET idempotency_key = idempotency_key WHERE idempotency_key = $1', ['bots9-role-1']],
+      ['UPDATE core.processed_updates SET bot_id = bot_id WHERE bot_id = $1 AND update_id = $2', ['42', '7002']],
+      ['UPDATE core.processed_updates SET update_id = update_id WHERE bot_id = $1 AND update_id = $2', ['42', '7002']],
+      ['DELETE FROM moderation.pending_operations WHERE idempotency_key = $1', ['bots9-role-1']],
+    ];
+    for (const [query, values] of forbiddenUpdates) {
+      await expectTelegramBotPermissionDenied(client, query, values);
+    }
+
     const [survivor] = await client.db.select().from(pendingOperations).where(eq(pendingOperations.idempotencyKey, 'bots9-role-1'));
-    expect(survivor?.status).toBe('succeeded');
+    expect(survivor).toMatchObject({ kind: 'telegram.banChatMember', chatId: '-100900', idempotencyKey: 'bots9-role-1', status: 'pending' });
   });
 
   it('MEDIUM-3 DoD: DB-level invariants reject illegal state (CHECK constraints from migration 0016)', async () => {

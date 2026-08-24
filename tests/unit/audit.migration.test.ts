@@ -114,4 +114,15 @@ describe('audit migrations', () => {
     expect(sql).toContain('GRANT UPDATE (');
     expect(sql).not.toMatch(/GRANT\s+UPDATE\s+ON\s+core\.consumed_envelopes/i);
   });
+
+  it('restores column-only UPDATE privileges for the external-operation outbox and Telegram inbox', () => {
+    const sql = readFileSync('src/db/migrations/0020_least_privilege_inbox_outbox.sql', 'utf8');
+
+    expect(sql).toContain('REVOKE UPDATE ON moderation.pending_operations FROM telegram_bot');
+    expect(sql).toContain('REVOKE UPDATE ON core.processed_updates FROM telegram_bot');
+    expect(sql).toContain('GRANT UPDATE (');
+    expect(sql).toContain('audit_lease_expires_at');
+    expect(sql).toContain('last_error');
+    expect(sql).not.toMatch(/GRANT\s+UPDATE\s+ON\s+(?:moderation\.pending_operations|core\.processed_updates)/i);
+  });
 });

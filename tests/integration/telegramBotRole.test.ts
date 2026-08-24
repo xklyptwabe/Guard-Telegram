@@ -6,7 +6,7 @@ import { createDatabase, type DatabaseClient } from '../../src/db/client.js';
 
 const testDatabaseUrl = process.env.TEST_DATABASE_URL;
 
-describe.skipIf(!testDatabaseUrl)('telegram_bot role privileges (0019)', () => {
+describe.skipIf(!testDatabaseUrl)('telegram_bot role privileges (0019/0020/0023)', () => {
   let client: DatabaseClient;
 
   beforeAll(() => {
@@ -35,5 +35,43 @@ describe.skipIf(!testDatabaseUrl)('telegram_bot role privileges (0019)', () => {
     expect(flag(update as never)).toBe(false);
     expect(flag(del as never)).toBe(false);
     expect(flag(insert as never)).toBe(true);
+  });
+
+  it('grants state-machine updates without mutable inbox/outbox identity or payload', async () => {
+    const privileges = await client.db.execute(sql`
+      SELECT
+        has_table_privilege('telegram_bot', 'moderation.pending_operations', 'UPDATE') AS "pendingTableUpdate",
+        has_column_privilege('telegram_bot', 'moderation.pending_operations', 'status', 'UPDATE') AS "pendingStatusUpdate",
+        has_column_privilege('telegram_bot', 'moderation.pending_operations', 'kind', 'UPDATE') AS "pendingKindUpdate",
+        has_column_privilege('telegram_bot', 'moderation.pending_operations', 'chat_id', 'UPDATE') AS "pendingChatUpdate",
+        has_column_privilege('telegram_bot', 'moderation.pending_operations', 'request_payload', 'UPDATE') AS "pendingRequestUpdate",
+        has_column_privilege('telegram_bot', 'moderation.pending_operations', 'metadata', 'UPDATE') AS "pendingMetadataUpdate",
+        has_column_privilege('telegram_bot', 'moderation.pending_operations', 'idempotency_key', 'UPDATE') AS "pendingKeyUpdate",
+        has_table_privilege('telegram_bot', 'core.processed_updates', 'UPDATE') AS "inboxTableUpdate",
+        has_column_privilege('telegram_bot', 'core.processed_updates', 'status', 'UPDATE') AS "inboxStatusUpdate",
+        has_column_privilege('telegram_bot', 'core.processed_updates', 'bot_id', 'UPDATE') AS "inboxBotUpdate",
+        has_column_privilege('telegram_bot', 'core.processed_updates', 'update_id', 'UPDATE') AS "inboxUpdateIdUpdate",
+        has_table_privilege('telegram_bot', 'core.consumed_envelopes', 'UPDATE') AS "envelopeTableUpdate",
+        has_column_privilege('telegram_bot', 'core.consumed_envelopes', 'status', 'UPDATE') AS "envelopeStatusUpdate",
+        has_column_privilege('telegram_bot', 'core.consumed_envelopes', 'envelope_id', 'UPDATE') AS "envelopeIdUpdate"
+    `);
+    const row = (privileges as { rows?: Array<Record<string, boolean>> }).rows?.[0];
+
+    expect(row).toMatchObject({
+      pendingTableUpdate: false,
+      pendingStatusUpdate: true,
+      pendingKindUpdate: false,
+      pendingChatUpdate: false,
+      pendingRequestUpdate: false,
+      pendingMetadataUpdate: false,
+      pendingKeyUpdate: false,
+      inboxTableUpdate: false,
+      inboxStatusUpdate: true,
+      inboxBotUpdate: false,
+      inboxUpdateIdUpdate: false,
+      envelopeTableUpdate: false,
+      envelopeStatusUpdate: true,
+      envelopeIdUpdate: false,
+    });
   });
 });
