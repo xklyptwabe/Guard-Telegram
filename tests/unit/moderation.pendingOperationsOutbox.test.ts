@@ -154,6 +154,42 @@ describe('PendingOperationsOutbox', () => {
     expect(onFinal.mock.calls[0]?.[1]).toEqual({ status: 'succeeded', result: { ok: true } });
   });
 
+  it('recoverPending() finalizes an interrupted non-retryable operation as unknown without re-running it', async () => {
+    const executor = vi.fn(async () => ({ ok: true }));
+    resolvers.register('telegram.deleteMessage', executor, { retryAfterUnknown: false });
+    db.rows.push({
+      id: 'row-crashed-delete',
+      kind: 'telegram.deleteMessage',
+      chatId: 'chat-1',
+      requestPayload: { chat_id: 1, message_id: 5 },
+      metadata: { deletedBy: '9' },
+      idempotencyKey: 'key-crashed-delete',
+      status: 'in_progress',
+      attemptCount: 1,
+      lastAttemptAt: new Date(Date.now() - 60_000),
+      nextAttemptAt: null,
+      workerId: 'stopped-worker',
+      leaseExpiresAt: new Date(Date.now() - 1),
+      auditStatus: 'pending',
+      auditWorkerId: null,
+      auditLeaseExpiresAt: null,
+      result: null,
+      createdAt: new Date(),
+      updatedAt: new Date(),
+    });
+    const outbox = new PendingOperationsOutbox(db as never, logger(), resolvers);
+    const onFinal = vi.fn(async (_row: unknown, _outcome: unknown) => ({ status: 'recorded' as const }));
+
+    await outbox.recoverPending(onFinal);
+
+    expect(executor).not.toHaveBeenCalled();
+    expect(db.rows[0]?.status).toBe('unknown');
+    expect(db.rows[0]?.attemptCount).toBe(1);
+    expect(db.rows[0]?.nextAttemptAt).toBeNull();
+    expect(onFinal).toHaveBeenCalledTimes(1);
+    expect(onFinal.mock.calls[0]?.[1]).toMatchObject({ status: 'unknown' });
+  });
+
   it('recoverPending() with no resolver for a kind: releases the claim with a fresh lease — no tight claim/release loop, self-heals after the lease', async () => {
     db.rows.push({
       id: 'row-orphan',

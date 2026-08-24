@@ -203,6 +203,13 @@ export interface PendingOperationResolver {
   readonly retryAfterUnknown: boolean;
 }
 
+interface ClaimedPendingOperation {
+  readonly row: PendingOperationRow;
+  readonly interruptedNonRetryable: boolean;
+}
+
+const interruptedOperationResult = { reason: 'worker_lease_expired' } as const;
+
 export class PendingOperationResolvers {
   private readonly resolvers = new Map<string, PendingOperationResolver>();
 
@@ -371,8 +378,18 @@ export class PendingOperationsOutbox {
    */
   public async recoverPending(onFinal?: PendingOperationFinalizer): Promise<void> {
     for (;;) {
-      const claimed = await this.claimNextDue();
-      if (!claimed) break; // nothing eligible left this sweep
+      const claim = await this.claimNextDue();
+      if (!claim) break; // nothing eligible left this sweep
+      const claimed = claim.row;
+      if (claim.interruptedNonRetryable) {
+        const outcome: AttemptOutcome = { status: 'unknown', result: interruptedOperationResult };
+        this.logger.warn({
+          event: 'pending_operations.recover.unknown_non_retryable',
+          details: { kind: claimed.kind, id: claimed.id, attemptCount: claimed.attemptCount },
+        });
+        await this.finalizeAudit(claimed, outcome, onFinal);
+        continue;
+      }
       const executor = this.resolvers.get(claimed.kind);
       if (!executor) {
         // Claimed but nothing knows how to run it — release the claim
@@ -537,25 +554,35 @@ export class PendingOperationsOutbox {
    * or double-claim the same row — a locked-by-someone-else row is simply
    * skipped, not waited for.
    */
-  private async claimNextDue(): Promise<PendingOperationRow | undefined> {
+  private async claimNextDue(): Promise<ClaimedPendingOperation | undefined> {
     return this.db.transaction(async (tx) => {
       const now = new Date();
       const candidates = await tx
-        .select({ id: pendingOperations.id })
+        .select({ id: pendingOperations.id, kind: pendingOperations.kind, status: pendingOperations.status })
         .from(pendingOperations)
         .where(this.eligibilityCondition(now))
         .orderBy(pendingOperations.createdAt)
         .limit(1)
         .for('update', { skipLocked: true });
-      const candidateId = candidates[0]?.id;
-      if (!candidateId) return undefined;
+      const candidate = candidates[0];
+      if (!candidate) return undefined;
+
+      if (candidate.status === 'in_progress' && this.resolvers.get(candidate.kind) && !this.resolvers.retryAfterUnknown(candidate.kind)) {
+        const interrupted = await tx
+          .update(pendingOperations)
+          .set({ status: 'unknown', nextAttemptAt: null, result: interruptedOperationResult, workerId: null, leaseExpiresAt: null, updatedAt: now })
+          .where(eq(pendingOperations.id, candidate.id))
+          .returning();
+        if (!interrupted[0]) return undefined;
+        return { row: toRow(interrupted[0]), interruptedNonRetryable: true };
+      }
 
       const claimed = await tx
         .update(pendingOperations)
         .set({ status: 'in_progress', workerId: this.workerId, leaseExpiresAt: new Date(now.getTime() + this.leaseDurationMs), attemptCount: sql`${pendingOperations.attemptCount} + 1`, lastAttemptAt: now, updatedAt: now })
-        .where(eq(pendingOperations.id, candidateId))
+        .where(eq(pendingOperations.id, candidate.id))
         .returning();
-      return claimed[0] ? toRow(claimed[0]) : undefined;
+      return claimed[0] ? { row: toRow(claimed[0]), interruptedNonRetryable: false } : undefined;
     });
   }
 

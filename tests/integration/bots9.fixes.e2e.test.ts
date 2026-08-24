@@ -124,6 +124,36 @@ describe.skipIf(!testDatabaseUrl)('BOTS-9 round-2 fixes: real-DB verification', 
     expect(after[0]?.attemptCount).toBe(1);
   });
 
+  it('BLOCKER-2: an expired in-progress delete becomes terminal unknown after restart without another Telegram call', async () => {
+    const executor = vi.fn(async () => ({ ok: true }));
+    const resolvers = new PendingOperationResolvers();
+    resolvers.register('telegram.deleteMessage', executor, { retryAfterUnknown: false });
+    const outbox = new PendingOperationsOutbox(client.db, silentLogger(), resolvers);
+    await client.db.insert(pendingOperations).values({
+      kind: 'telegram.deleteMessage',
+      chatId,
+      idempotencyKey: 'del-crashed-in-progress-1',
+      requestPayload: { chat_id: -100900, message_id: 8 },
+      metadata: { deletedBy: '456' },
+      status: 'in_progress',
+      attemptCount: 1,
+      lastAttemptAt: new Date(Date.now() - 60_000),
+      workerId: 'stopped-worker',
+      leaseExpiresAt: new Date(Date.now() - 1),
+    });
+    const finalizer = vi.fn(async (_row: unknown, _outcome: unknown) => ({ status: 'recorded' as const }));
+
+    await outbox.recoverPending(finalizer);
+
+    expect(executor).not.toHaveBeenCalled();
+    const row = await client.db.select().from(pendingOperations).where(eq(pendingOperations.idempotencyKey, 'del-crashed-in-progress-1')).limit(1);
+    expect(row[0]?.status).toBe('unknown');
+    expect(row[0]?.attemptCount).toBe(1);
+    expect(row[0]?.nextAttemptAt).toBeNull();
+    expect(finalizer).toHaveBeenCalledTimes(1);
+    expect(finalizer.mock.calls[0]?.[1]).toMatchObject({ status: 'unknown' });
+  });
+
   it('BLOCKER-1/4: a terminal moderation op with a failing audit leaves audit_status=pending AND throws — the backfill later completes it WITHOUT re-running Telegram', async () => {
     const bot = fakeBot();
     const resolvers = new PendingOperationResolvers();
