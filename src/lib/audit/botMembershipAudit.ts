@@ -138,12 +138,12 @@ export async function recordBotMembershipChanged(audit: AuditService, logger: Lo
           current?.observedAt !== undefined &&
           (current.observedAt > observedAt || (current.observedAt === observedAt && (current.observedUpdateId ?? 0) >= incomingUpdateId));
 
-        const afterStatus = isStale && current?.status !== undefined ? current.status : newStatusParsed.data;
-        const afterRights = isStale ? current?.rights : newRights;
+        const snapshotStatus = isStale && current?.status !== undefined ? current.status : newStatusParsed.data;
+        const snapshotRights = isStale ? current?.rights : newRights;
         const effectiveObservedAt = isStale && current?.observedAt !== undefined ? current.observedAt : observedAt;
         const effectiveObservedUpdateId = isStale ? (current?.observedUpdateId ?? incomingUpdateId) : incomingUpdateId;
-        const statusChanged = oldStatusParsed.success ? oldStatusParsed.data !== afterStatus : true;
-        const rightsChanged = !rightsEqual(oldRights, afterRights);
+        const statusChanged = oldStatusParsed.success ? oldStatusParsed.data !== newStatusParsed.data : true;
+        const rightsChanged = !rightsEqual(oldRights, newRights);
         const operation = isStale ? 'noop' : statusChanged || rightsChanged ? 'update' : 'noop';
 
         const record = auditProcessor.process({
@@ -153,7 +153,7 @@ export async function recordBotMembershipChanged(audit: AuditService, logger: Lo
           chatId,
           ...(actorId !== undefined ? { actorId } : {}),
           before: oldStatusParsed.success ? observed({ chatId, status: oldStatusParsed.data, ...(oldRights ? { rights: oldRights } : {}) }) : notObserved(),
-          after: observed({ chatId, status: afterStatus, ...(afterRights ? { rights: afterRights } : {}) }),
+          after: observed({ chatId, status: newStatusParsed.data, ...(newRights ? { rights: newRights } : {}) }),
         });
         const mutationResult = toDownstreamMutationResult(record);
 
@@ -161,7 +161,13 @@ export async function recordBotMembershipChanged(audit: AuditService, logger: Lo
           ...mutationResult,
           metadata: { operation, ...(isStale ? { outOfOrder: true } : {}) },
           snapshotStatus: mutationResult.snapshotStatus,
-          snapshotData: { ...mutationResult.snapshotData, observedAt: effectiveObservedAt, observedUpdateId: effectiveObservedUpdateId },
+          snapshotData: {
+            chatId,
+            status: snapshotStatus,
+            ...(snapshotRights ? { rights: snapshotRights } : {}),
+            observedAt: effectiveObservedAt,
+            observedUpdateId: effectiveObservedUpdateId,
+          },
         };
       },
     );

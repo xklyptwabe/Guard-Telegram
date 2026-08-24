@@ -72,6 +72,91 @@ describe('recordBotMembershipChanged', () => {
     expect((call.result.after as { rights?: { canRestrictMembers?: boolean } })?.rights?.canRestrictMembers).toBe(false);
   });
 
+  it('records the incoming after state for an older update without regressing the current snapshot', async () => {
+    const currentObservedAt = new Date(2_000_000_000 * 1000).toISOString();
+    const { audit, calls } = fakeAuditService([
+      {
+        snapshotData: {
+          chatId: '-1001111111111',
+          status: 'kicked',
+          observedAt: currentObservedAt,
+          observedUpdateId: 200,
+        },
+      },
+    ]);
+    const fixture = loadFixture('my_chat_member.promoted.json');
+    const ctx = {
+      myChatMember: {
+        ...fixture.my_chat_member,
+        date: 1_000_000_000,
+      },
+    } as never;
+
+    await runWithUpdateContext({ updateId: '100', chatId: '-1001111111111', botId: '42' }, () =>
+      recordBotMembershipChanged(audit, logger(), ctx),
+    );
+
+    const call = calls[0] as {
+      result: {
+        after?: Record<string, unknown>;
+        metadata?: Record<string, unknown>;
+        snapshotData?: Record<string, unknown>;
+      };
+    };
+    expect(call.result.after).toMatchObject({ status: 'administrator' });
+    expect(call.result.snapshotData).toMatchObject({
+      status: 'kicked',
+      observedAt: currentObservedAt,
+      observedUpdateId: 200,
+    });
+    expect(call.result.metadata).toMatchObject({ operation: 'noop', outOfOrder: true });
+  });
+
+  it('keeps newer bot rights in the snapshot while auditing rights from the stale update', async () => {
+    const currentObservedAt = new Date(2_000_000_000 * 1000).toISOString();
+    const currentRights = {
+      canManageChat: true,
+      canDeleteMessages: true,
+      canManageVideoChats: true,
+      canRestrictMembers: true,
+      canPromoteMembers: false,
+      canChangeInfo: true,
+      canInviteUsers: true,
+      isAnonymous: false,
+    };
+    const { audit, calls } = fakeAuditService([
+      {
+        snapshotData: {
+          chatId: '-1001111111111',
+          status: 'administrator',
+          rights: currentRights,
+          observedAt: currentObservedAt,
+          observedUpdateId: 200,
+        },
+      },
+    ]);
+    const fixture = loadFixture('my_chat_member.rights_changed.json');
+    const ctx = {
+      myChatMember: {
+        ...fixture.my_chat_member,
+        date: 1_000_000_000,
+      },
+    } as never;
+
+    await runWithUpdateContext({ updateId: '100', chatId: '-1001111111111', botId: '42' }, () =>
+      recordBotMembershipChanged(audit, logger(), ctx),
+    );
+
+    const call = calls[0] as {
+      result: {
+        after?: { rights?: { canRestrictMembers?: boolean } };
+        snapshotData?: { rights?: { canRestrictMembers?: boolean } };
+      };
+    };
+    expect(call.result.after?.rights?.canRestrictMembers).toBe(false);
+    expect(call.result.snapshotData?.rights?.canRestrictMembers).toBe(true);
+  });
+
   it('is never gated by any module — this test calls it directly, matching how it is wired in core/updates.ts (registerBotMembershipAudit), not through registerModuleUpdateHandlers', async () => {
     // Documentation-as-test: there is no `enabled` check anywhere in this
     // producer's own logic, unlike module-gated producers.
