@@ -215,6 +215,9 @@ describe.skipIf(!testDatabaseUrl)('BOTS-9 round-2 fixes: real-DB verification', 
     const row = await client.db.select().from(pendingOperations).where(eq(pendingOperations.idempotencyKey, 'rabbit.policy-skipped-1')).limit(1);
     expect(row[0]?.status).toBe('succeeded');
     expect(row[0]?.auditStatus).toBe('policy_skipped');
+    expect(row[0]?.requestPayload).toEqual({});
+    expect(row[0]?.metadata).toEqual({});
+    expect(row[0]?.result).toBeNull();
     const integrationEvents = await client.db.select().from(events).where(eq(events.eventType, 'integration.action'));
     expect(integrationEvents).toHaveLength(0);
 

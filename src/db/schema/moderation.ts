@@ -42,9 +42,9 @@ export const pendingOperations = moderationSchema.table(
     /** Dot-separated operation kind, e.g. `telegram.banChatMember` — used to look up the retry handler on restart. */
     kind: text('kind').notNull(),
     chatId: text('chat_id').notNull(),
-    /** The Telegram API call's own arguments, exactly as they will be/were sent. Never contains secrets — enforced by the same forbidden-key scan the audit layer uses. */
+    /** The Telegram API call's own arguments, exactly as they will be/were sent. Retained only while execution or audit recovery is still owed, then minimized to an empty tombstone payload. */
     requestPayload: jsonb('request_payload').notNull(),
-    /** Everything needed to reconstruct the eventual audit record (actor, target, action, reason) — deliberately kept separate from requestPayload so requestPayload always stays exactly what gets forwarded to Telegram. Read by PendingOperationsOutbox.recoverPending()'s callers after a restart, when there is no live Update/actor on the call stack to ask. */
+    /** Everything needed to reconstruct the eventual audit record — deliberately kept separate from requestPayload and cleared by the DB once terminal audit finalization succeeds or is deliberately policy-skipped. */
     metadata: jsonb('metadata'),
     idempotencyKey: text('idempotency_key').notNull(),
     status: text('status', { enum: ['pending', 'in_progress', 'succeeded', 'failed', 'unknown'] }).notNull().default('pending'),
@@ -75,7 +75,7 @@ export const pendingOperations = moderationSchema.table(
     /** Lease pair for the audit-backfill claim — separate from the operation's own worker_id so backfilling a terminal row never looks like an operation retry. */
     auditWorkerId: text('audit_worker_id'),
     auditLeaseExpiresAt: timestamp('audit_lease_expires_at', { withTimezone: true }),
-    /** Telegram's own response once confirmed (success payload, or a GrammyError's error_code/description). Never the raw HTTP transport error, which may carry connection details. */
+    /** Telegram's own response once confirmed. Available to the audit finalizer, then cleared together with the recovery payload once no audit debt remains. */
     result: jsonb('result'),
     createdAt: createdAt(),
     updatedAt: updatedAt(),

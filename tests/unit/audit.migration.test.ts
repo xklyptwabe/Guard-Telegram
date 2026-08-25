@@ -115,6 +115,23 @@ describe('audit migrations', () => {
     expect(sql).not.toMatch(/GRANT\s+UPDATE\s+ON\s+core\.consumed_envelopes/i);
   });
 
+  it('minimizes finalized external-operation payloads without broadening runtime UPDATE grants', () => {
+    const sql = readFileSync('src/db/migrations/0024_minimize_finalized_pending_operations.sql', 'utf8');
+
+    expect(sql).toContain('CREATE OR REPLACE FUNCTION "moderation"."minimize_finalized_pending_operation"()');
+    expect(sql).toContain('SECURITY INVOKER');
+    expect(sql).toContain('REVOKE ALL ON FUNCTION "moderation"."minimize_finalized_pending_operation"() FROM PUBLIC');
+    expect(sql).toContain('CREATE TRIGGER "pending_operations_minimize_finalized_payload"');
+    expect(sql).toContain('NEW."audit_status" IN (\'written\', \'policy_skipped\')');
+    expect(sql).toContain('NEW."status" = \'unknown\' AND NEW."next_attempt_at" IS NULL');
+    expect(sql).toContain('NEW."request_payload" := \'{}\'::jsonb');
+    expect(sql).toContain('NEW."metadata" := \'{}\'::jsonb');
+    expect(sql).toContain('NEW."result" := NULL');
+    expect(sql).toContain('ADD CONSTRAINT "pending_operations_finalized_payload_minimized_check"');
+    expect(sql).toContain('UPDATE "moderation"."pending_operations"');
+    expect(sql).not.toMatch(/GRANT\s+UPDATE/i);
+  });
+
   it('restores column-only UPDATE privileges for the external-operation outbox and Telegram inbox', () => {
     const sql = readFileSync('src/db/migrations/0020_least_privilege_inbox_outbox.sql', 'utf8');
 
