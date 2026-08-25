@@ -1,9 +1,10 @@
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import { migrate } from 'drizzle-orm/node-postgres/migrator';
-import { and, eq } from 'drizzle-orm';
+import { and, eq, sql } from 'drizzle-orm';
 
 import { validateConfig } from '../../src/config.js';
 import { createDatabase, type DatabaseClient } from '../../src/db/client.js';
+import { purgeExpiredAuditEventsBatch } from '../../src/db/retention.js';
 import { chatModuleStates, telegramChats } from '../../src/db/schema/core.js';
 import { AuditService, ForbiddenAuditValueError } from '../../src/lib/auditService.js';
 import { events, entitySnapshots, eventPolicies, outbox } from '../../src/db/schema/audit.js';
@@ -245,6 +246,50 @@ describe.skipIf(!testDatabaseUrl)('Audit transaction integration', () => {
     });
   });
 
+  it('expires an event even when its audit delivery outbox is still pending', async () => {
+    await database!.db.insert(eventPolicies).values({
+      policyId: 'audit-retention-pending-outbox',
+      chatId: '1010',
+      eventType: 'module.state.changed',
+      eventVersion: 'v1',
+      enabled: true,
+      retentionDays: 1,
+    });
+    const recorded = await audit!.recordEntityChange(
+      {
+        tenantId: '1010',
+        subjectType: 'chat_module_state',
+        subjectId: '1010:module-admin',
+        eventType: 'module.state.changed',
+        eventVersion: 'v1',
+        category: 'module',
+        source: 'retention-test',
+        moduleId: 'module-admin',
+        idempotencyKey: 'audit:test:1010:pending-outbox-retention',
+      },
+      async () => ({
+        before: undefined,
+        after: { enabled: true, source: 'override' },
+        snapshotData: { chatId: '1010', moduleId: 'module-admin', enabled: true, source: 'override' },
+      }),
+    );
+
+    const pendingRows = await database!.db.select().from(outbox).where(eq(outbox.eventId, recorded.eventId));
+    expect(pendingRows).toHaveLength(1);
+    expect(pendingRows[0]?.status).toBe('pending');
+
+    await database!.db.execute(sql`
+      UPDATE audit.events
+      SET occurred_at = now() - interval '2 days'
+      WHERE id = ${recorded.eventId}
+    `);
+
+    const result = await purgeExpiredAuditEventsBatch(database!.db, { batchSize: 10, now: new Date() });
+    expect(result.deletedEventIds).toContain(recorded.eventId);
+    expect(await database!.db.select().from(events).where(eq(events.id, recorded.eventId))).toHaveLength(0);
+    expect(await database!.db.select().from(outbox).where(eq(outbox.eventId, recorded.eventId))).toHaveLength(0);
+  });
+
   it('keeps input.moduleId canonical in event and outbox metadata', async () => {
     await audit!.recordEntityChange(
       {
@@ -421,4 +466,5 @@ async function cleanup(): Promise<void> {
   await database.db.delete(outbox);
   await database.db.delete(events);
   await database.db.delete(entitySnapshots);
+  await database.db.delete(eventPolicies).where(eq(eventPolicies.policyId, 'audit-retention-pending-outbox'));
 }

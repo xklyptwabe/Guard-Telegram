@@ -4,6 +4,8 @@ External calls — the Telegram Bot API (moderation actions), S3 (`PutObject`), 
 
 This is a distinct concern from `audit.outbox` (BOTS-6/7), which delivers an *already-recorded* audit event onward to a destination. `moderation.pending_operations` makes an external call—or an audit debt left immediately after observable work—recoverable before the final audit event exists.
 
+An `audit.outbox` delivery row does not extend the event's configured retention period. When retention deletes an expired `audit.events` row, its delivery copy is removed by the foreign-key cascade as well; otherwise an unavailable or unconfigured downstream consumer would retain the audit payload indefinitely. This does not apply to unfinished `moderation.pending_operations`, which are independent write-ahead records for external work.
+
 Operation kinds are namespaced — `telegram.*` (registered by `ModerationService`), `s3.putObject` (`lib/storage.ts`), `rabbitmq.publish` / `rabbitmq.reroute.audit` (`lib/rabbitmq.ts`), and `command.audit` (`core/dispatcher.ts`) — one table, one worker, one terminal-audit pipeline for all of them (BOTS-9 review BLOCKER-3).
 
 ## Contract
