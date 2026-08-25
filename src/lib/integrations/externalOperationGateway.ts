@@ -79,15 +79,21 @@ export function makeIntegrationAuditFinalizer(audit: AuditService, logger: Logge
 
 /**
  * One finalizer for the whole outbox, routing on the kind namespace:
- * `telegram.*` rows complete their audit via ModerationService (which
- * dispatches moderation.action vs message.deleted on its own), everything
- * else via the integration finalizer. Installed once at bootstrap for both
- * the boot sweep and the persistent worker.
+ * `telegram.*` rows complete via ModerationService, `command.audit` via the
+ * command finalizer, and provider operations via the integration finalizer.
+ * Installed once for both the boot sweep and the persistent worker.
  */
-export function buildOutboxFinalizer(moderation: ModerationService, integration: PendingOperationFinalizer): PendingOperationFinalizer {
+export function buildOutboxFinalizer(
+  moderation: ModerationService,
+  integration: PendingOperationFinalizer,
+  command: PendingOperationFinalizer,
+): PendingOperationFinalizer {
   return async (row, outcome) => {
     if (row.kind.startsWith('telegram.')) {
       return moderation.auditRecoveredOperation(row, outcome);
+    }
+    if (row.kind === 'command.audit') {
+      return command(row, outcome);
     }
     return integration(row, outcome);
   };

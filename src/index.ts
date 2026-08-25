@@ -23,6 +23,7 @@ import { Logger } from './lib/logger.js';
 import { ModerationService } from './lib/moderation/moderationService.js';
 import { PendingOperationResolvers, PendingOperationsOutbox } from './lib/moderation/pendingOperationsOutbox.js';
 import { buildOutboxFinalizer, makeIntegrationAuditFinalizer } from './lib/integrations/externalOperationGateway.js';
+import { makeCommandAuditFinalizer, registerCommandAuditResolver } from './lib/audit/commandAudit.js';
 import { createRabbitMq, registerPlatformRabbitActionSchemas } from './lib/rabbitmq.js';
 import { ReplyService } from './lib/reply.js';
 import { createStorage } from './lib/storage.js';
@@ -97,9 +98,10 @@ async function bootstrap(): Promise<void> {
     registerPlatformRabbitActionSchemas(rabbitMq);
     const chatSettings = new ChatSettingsService(database.db, audit);
     moderation = new ModerationService(bot, audit, pendingOperationsOutbox, pendingOperationResolvers, logger);
-    // One terminal-audit finalizer for every kind: telegram.* → moderation
-    // events, everything else → integration.action (BLOCKER-3 + HIGH-3).
-    const outboxFinalizer = buildOutboxFinalizer(moderation, makeIntegrationAuditFinalizer(audit, logger));
+    registerCommandAuditResolver(pendingOperationResolvers);
+    // One terminal-audit finalizer for every kind: telegram.* → moderation,
+    // command.audit → command.executed, provider kinds → integration.action.
+    const outboxFinalizer = buildOutboxFinalizer(moderation, makeIntegrationAuditFinalizer(audit, logger), makeCommandAuditFinalizer(audit, logger));
     pendingOperationsOutbox.setDefaultFinalizer(outboxFinalizer);
 
     const modules = createModules({ audit, logger, chatSettings, moderation });
@@ -107,7 +109,7 @@ async function bootstrap(): Promise<void> {
     const events = new EventBus(logger);
     const registry = new ModuleRegistry(modules, database.db, audit, events, logger);
     const reply = new ReplyService(config, logger);
-    const dispatcher = new CommandDispatcher(collectCommands(modules), registry, new Cooldowns(), reply, events, i18n, logger, audit);
+    const dispatcher = new CommandDispatcher(collectCommands(modules), registry, new Cooldowns(), reply, events, i18n, logger, audit, pendingOperationsOutbox);
     registerPlatformMiddleware(bot, database.db, registry, logger, config.telegramTransport);
     registerBotMembershipAudit(bot, audit, logger);
     registerModuleUpdateHandlers(bot, modules, registry, logger);

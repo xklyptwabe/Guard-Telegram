@@ -1,19 +1,27 @@
 import { and, eq, isNull, sql } from 'drizzle-orm';
 import { migrate } from 'drizzle-orm/node-postgres/migrator';
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
+import { z } from 'zod';
 
 import { validateConfig } from '../../src/config.js';
+import type { TelegramCommandDefinition } from '../../src/core/contracts.js';
+import { CommandDispatcher } from '../../src/core/dispatcher.js';
+import type { ModuleRegistry } from '../../src/core/registry.js';
 import { createDatabase, type DatabaseClient } from '../../src/db/client.js';
 import { eventPolicies, events, entitySnapshots } from '../../src/db/schema/audit.js';
 import { pendingOperations } from '../../src/db/schema/moderation.js';
 import { purgeExpiredAuditEventsBatch } from '../../src/db/retention.js';
 import { AuditService } from '../../src/lib/auditService.js';
+import { makeCommandAuditFinalizer, registerCommandAuditResolver } from '../../src/lib/audit/commandAudit.js';
 import { recordMessageDeleted } from '../../src/lib/audit/messageAudit.js';
 import { recordMemberStatusChanged } from '../../src/lib/audit/memberAudit.js';
 import { recordIntegrationAction } from '../../src/lib/audit/integrationAudit.js';
 import { runWithUpdateContext } from '../../src/lib/context.js';
 import { makeIntegrationAuditFinalizer } from '../../src/lib/integrations/externalOperationGateway.js';
 import type { Logger } from '../../src/lib/logger.js';
+import type { Cooldowns } from '../../src/lib/cooldowns.js';
+import type { EventBus } from '../../src/lib/eventBus.js';
+import type { ReplyService } from '../../src/lib/reply.js';
 import { ModerationService } from '../../src/lib/moderation/moderationService.js';
 import { PendingOperationResolvers, PendingOperationsOutbox } from '../../src/lib/moderation/pendingOperationsOutbox.js';
 
@@ -94,6 +102,69 @@ describe.skipIf(!testDatabaseUrl)('BOTS-9 round-2 fixes: real-DB verification', 
     await client.db.execute(sql`DELETE FROM core.chat_module_states`);
     await client.db.execute(sql`DELETE FROM public.telegram_chats`);
     await client.db.execute(sql`INSERT INTO public.telegram_chats (chat_id, type) VALUES ('${sql.raw(chatId)}', 'supergroup') ON CONFLICT DO NOTHING`);
+  });
+
+  it('HIGH-6: command audit recovery never re-executes the command or its reply', async () => {
+    const command: TelegramCommandDefinition = {
+      id: 'test-command-audit-recovery',
+      name: 'audit_recovery',
+      moduleId: 'test-module',
+      descriptionKey: 'test.description',
+      permission: 'none',
+      cooldownMs: 0,
+      argsSchema: z.string(),
+      execute: vi.fn(async ({ ctx, reply }) => {
+        await reply.send(ctx, 'visible command reply');
+      }),
+    };
+    const flakyAudit = {
+      recordEntityChange: vi
+        .fn()
+        .mockRejectedValueOnce(new Error('audit database unavailable'))
+        .mockImplementation((input, mutate) => audit.recordEntityChange(input, mutate)),
+    } as unknown as AuditService;
+    const resolvers = new PendingOperationResolvers();
+    registerCommandAuditResolver(resolvers);
+    const outbox = new PendingOperationsOutbox(client.db, silentLogger(), resolvers);
+    outbox.setMetadataSanitizer((input) =>
+      audit.maskOutboxMetadata({
+        tenantId: input.chatId,
+        eventType: input.auditEvent.eventType,
+        eventVersion: input.auditEvent.eventVersion,
+        ...(input.auditEvent.moduleId !== undefined ? { moduleId: input.auditEvent.moduleId } : {}),
+        metadata: input.metadata,
+      }),
+    );
+    outbox.setDefaultFinalizer(makeCommandAuditFinalizer(flakyAudit, silentLogger()));
+    const registry = { isEnabled: vi.fn(async () => true) } as unknown as ModuleRegistry;
+    const cooldowns = { take: vi.fn(() => true), release: vi.fn() } as unknown as Cooldowns;
+    const reply = { send: vi.fn(async () => undefined) } as unknown as ReplyService;
+    const eventBus = { publish: vi.fn() } as unknown as EventBus;
+    const testI18n = { t: vi.fn((key: string) => key) } as unknown as import('i18next').i18n;
+    const dispatcher = new CommandDispatcher([command], registry, cooldowns, reply, eventBus, testI18n, silentLogger(), flakyAudit, outbox);
+    const ctx = { chat: { id: Number(chatId), type: 'supergroup' }, from: { id: 700006, language_code: 'en' } } as never;
+    const dispatch = () => runWithUpdateContext({ updateId: 'command-audit-redelivery', botId: '42' }, () => dispatcher.dispatchCommand(ctx, command.name, ''));
+    const idempotencyKey = `command.executed:telegram-update:42:command-audit-redelivery:${chatId}:700006:${command.name}`;
+
+    await expect(dispatch()).resolves.toBeUndefined();
+    const pending = await client.db.select().from(pendingOperations).where(eq(pendingOperations.idempotencyKey, idempotencyKey)).limit(1);
+    expect(pending[0]).toMatchObject({ kind: 'command.audit', status: 'succeeded', auditStatus: 'pending', requestPayload: {} });
+    expect(pending[0]?.metadata).toMatchObject({ recovery: { action: command.name, actorUserId: '700006', moduleId: command.moduleId, success: true } });
+    expect(JSON.stringify(pending[0])).not.toContain('visible command reply');
+    expect(await client.db.select().from(events).where(eq(events.idempotencyKey, idempotencyKey))).toHaveLength(0);
+
+    const restartedResolvers = new PendingOperationResolvers();
+    registerCommandAuditResolver(restartedResolvers);
+    const restartedOutbox = new PendingOperationsOutbox(client.db, silentLogger(), restartedResolvers);
+    restartedOutbox.setDefaultFinalizer(makeCommandAuditFinalizer(flakyAudit, silentLogger()));
+    await restartedOutbox.recoverPending();
+    const written = await client.db.select().from(pendingOperations).where(eq(pendingOperations.idempotencyKey, idempotencyKey)).limit(1);
+    expect(written[0]).toMatchObject({ auditStatus: 'written', requestPayload: {}, metadata: {}, result: null });
+    await expect(dispatch()).resolves.toBeUndefined();
+
+    expect(command.execute).toHaveBeenCalledTimes(1);
+    expect(reply.send).toHaveBeenCalledTimes(1);
+    expect(await client.db.select().from(events).where(eq(events.idempotencyKey, idempotencyKey))).toHaveLength(1);
   });
 
   it('BLOCKER-2: deleteMessage unknown is TERMINAL — the worker never blindly re-runs a destructive call', async () => {

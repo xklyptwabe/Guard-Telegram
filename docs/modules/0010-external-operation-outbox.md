@@ -2,9 +2,9 @@
 
 External calls — the Telegram Bot API (moderation actions), S3 (`PutObject`), RabbitMQ (publish) — can fail in ways a normal database transaction can't paper over: the process can crash mid-call, the network can drop the response after the external system already applied the change, or the call can take longer than we're willing to wait. `moderation.pending_operations` (`src/db/schema/moderation.ts`) and `PendingOperationsOutbox` (`src/lib/moderation/pendingOperationsOutbox.ts`) exist to make these calls reliable and their outcome auditable, without ever claiming to know something we don't.
 
-This is a distinct concern from `audit.outbox` (BOTS-6/7), which delivers an *already-recorded* audit event onward to a destination. `moderation.pending_operations` exists to make the *external call itself* reliable, before any audit event exists.
+This is a distinct concern from `audit.outbox` (BOTS-6/7), which delivers an *already-recorded* audit event onward to a destination. `moderation.pending_operations` makes an external call—or an audit debt left immediately after observable work—recoverable before the final audit event exists.
 
-Operation kinds are namespaced — `telegram.*` (registered by `ModerationService`), `s3.putObject` (`lib/storage.ts`), `rabbitmq.publish` and `rabbitmq.reroute.audit` (`lib/rabbitmq.ts`) — one table, one worker, one terminal-audit pipeline for all of them (BOTS-9 review BLOCKER-3).
+Operation kinds are namespaced — `telegram.*` (registered by `ModerationService`), `s3.putObject` (`lib/storage.ts`), `rabbitmq.publish` / `rabbitmq.reroute.audit` (`lib/rabbitmq.ts`), and `command.audit` (`core/dispatcher.ts`) — one table, one worker, one terminal-audit pipeline for all of them (BOTS-9 review BLOCKER-3).
 
 ## Contract
 
@@ -27,12 +27,13 @@ The one thing this doesn't paper over: a **confirmed** rejection on the unban ha
 - **S3 `PutObject`** — the body is never written ahead (files are forbidden in the outbox). A live call executes with the caller's body in scope; recovery can't re-upload, so it *reconciles*: a successful `HEAD` proves the object exists (→ `succeeded`, recorded as reconciled). A `HEAD 404` only proves that the object is not visible at that instant: the timed-out `PUT` may still be completing, and a configured S3-compatible endpoint is not guaranteed to have AWS S3's exact consistency contract. It therefore remains `unknown` and is retried until the attempt limit; exhausted reconciliation remains terminal `unknown`, never a fabricated confirmed failure. `HEAD` is read-only, so retrying it is safe.
 - **RabbitMQ publish** — the envelope, including its id, is created *before* write-ahead and stored in `request_payload`; every retry republishes the same envelope id, making consumer-side dedup possible. Publish failures are unconfirmed from this side and stay `unknown`, retried with the identical envelope.
 - **RabbitMQ DLQ/retry rerouting** uses the unacked source delivery as its durable write-ahead and RabbitMQ redelivery as its operation retry. After the target publish is confirmed, `rabbitmq.reroute.audit` persists the terminal outcome before the source is acknowledged. An audit failure leaves `audit_status = 'pending'`; the shared outbox worker finalizes that audit after restart without publishing the envelope again.
+- **Command completion** writes a `command.audit` checkpoint after `command.execute()` returns and before finalizing `command.executed`. The checkpoint contains only the allowed command identity and outcome—never arguments, command text, reply text, callback payload, or the raw Update. If AuditService is unavailable, the update may complete because the shared worker now owns a durable audit debt. A rare redelivery that reaches the dispatcher while that checkpoint exists resumes only the audit and never invokes the command handler or its replies again.
 
 ## Documented exclusions (BOTS-9 review HIGH-5)
 
 These external mutations are deliberately **not** routed through the outbox; each exclusion is marked at its call site in code:
 
-- `sendMessage` / replies and `answerCallbackQuery` — user-facing UX feedback whose value decays in seconds; a post-restart retry would deliver stale responses, which is worse than a rare lost reply. The command outcome and its `command.executed` audit are independent of reply delivery.
+- `sendMessage` / replies and `answerCallbackQuery` — user-facing UX feedback whose value decays in seconds; a post-restart retry would deliver stale responses, which is worse than a rare lost reply. Replies have no independent WAL, while the command completion checkpoint prevents an audit-only failure from replaying them.
 - `setMyCommands` / `setWebhook` — bootstrap-only, idempotent, inherently retried by the next restart (retry-by-restart).
 - RabbitMQ `ack` / `nack` — protocol-level acknowledgements; see the rerouting note above.
 - Redis cache-aside writes — reproducible from the PostgreSQL source of truth; a missed fill self-heals on the next read.

@@ -3,14 +3,23 @@ import { describe, expect, it, vi } from 'vitest';
 import { z } from 'zod';
 
 import type { TelegramCommandDefinition } from '../../src/core/contracts.js';
-import { CommandDispatcher } from '../../src/core/dispatcher.js';
 import type { ModuleRegistry } from '../../src/core/registry.js';
-import { AuditPolicyDisabledError, type AuditService } from '../../src/lib/auditService.js';
+import type { AuditService } from '../../src/lib/auditService.js';
 import type { Cooldowns } from '../../src/lib/cooldowns.js';
-import { runWithUpdateContext } from '../../src/lib/context.js';
 import type { EventBus } from '../../src/lib/eventBus.js';
 import type { Logger } from '../../src/lib/logger.js';
+import type { PendingOperationsOutbox } from '../../src/lib/moderation/pendingOperationsOutbox.js';
 import type { ReplyService } from '../../src/lib/reply.js';
+import { buildDrizzleOrmMock, FakePendingOperationsDb, fakeLogger } from './testUtils/fakePendingOperationsDb.js';
+
+vi.mock('drizzle-orm', async (importOriginal) => buildDrizzleOrmMock(await importOriginal<typeof import('drizzle-orm')>()));
+
+const { CommandDispatcher } = await import('../../src/core/dispatcher.js');
+const { AuditPolicyDisabledError } = await import('../../src/lib/auditService.js');
+const { runWithUpdateContext } = await import('../../src/lib/context.js');
+const { pendingOperations } = await import('../../src/db/schema/moderation.js');
+const { makeCommandAuditFinalizer, registerCommandAuditResolver } = await import('../../src/lib/audit/commandAudit.js');
+const { PendingOperationResolvers, PendingOperationsOutbox: Outbox } = await import('../../src/lib/moderation/pendingOperationsOutbox.js');
 
 function fakeCtx(chatId: number, userId: number): Context {
   return {
@@ -49,14 +58,14 @@ function fakeAuditService(options: { alwaysDuplicate?: boolean; throwOnRecord?: 
   return { audit, calls };
 }
 
-function fakeDispatcher(command: TelegramCommandDefinition, audit: AuditService) {
+function fakeDispatcher(command: TelegramCommandDefinition, audit: AuditService, outbox?: PendingOperationsOutbox) {
   const registry = { isEnabled: vi.fn(async () => true) } as unknown as ModuleRegistry;
   const cooldowns = { take: vi.fn(() => true), release: vi.fn() } as unknown as Cooldowns;
   const reply = { send: vi.fn(async () => undefined) } as unknown as ReplyService;
   const events = { publish: vi.fn() } as unknown as EventBus;
   const logger = { info: vi.fn(), debug: vi.fn(), warn: vi.fn(), error: vi.fn() } as unknown as Logger;
   const i18n = { t: vi.fn((key: string) => key) } as unknown as import('i18next').i18n;
-  const dispatcher = new CommandDispatcher([command], registry, cooldowns, reply, events, i18n, logger, audit);
+  const dispatcher = new CommandDispatcher([command], registry, cooldowns, reply, events, i18n, logger, audit, outbox);
   return { dispatcher, reply, logger };
 }
 
@@ -146,7 +155,7 @@ describe('CommandDispatcher — command.executed audit wiring', () => {
     expect(reply.send).not.toHaveBeenCalledWith(ctx, 'common.internalError'); // success path, not the error path
   });
 
-  it('BOTS-9 round-2 BLOCKER-4/HIGH-8: an INFRASTRUCTURE audit failure propagates so the durable inbox retries until the record lands', async () => {
+  it('without the production outbox, an infrastructure audit failure still propagates instead of being swallowed', async () => {
     const command = fakeCommand();
     const { audit } = fakeAuditService({ throwOnRecord: true });
     const { dispatcher, reply, logger } = fakeDispatcher(command, audit);
@@ -157,6 +166,55 @@ describe('CommandDispatcher — command.executed audit wiring', () => {
     expect(command.execute).toHaveBeenCalled(); // the command itself ran
     expect(reply.send).not.toHaveBeenCalledWith(ctx, 'common.internalError'); // no misleading error reply — the command succeeded
     expect(logger.warn).toHaveBeenCalledWith(expect.objectContaining({ event: 'audit.command_executed.failed' }));
+  });
+
+  it('does not execute the command or send its reply again when only command audit finalization needs recovery', async () => {
+    const command = fakeCommand({
+      execute: vi.fn(async ({ ctx, reply }) => {
+        await reply.send(ctx, 'visible command reply');
+      }),
+    });
+    const { audit } = fakeAuditService();
+    vi.mocked(audit.recordEntityChange).mockRejectedValueOnce(new Error('audit database unavailable'));
+    const operationDb = new FakePendingOperationsDb(pendingOperations);
+    const resolvers = new PendingOperationResolvers();
+    registerCommandAuditResolver(resolvers);
+    const outbox = new Outbox(operationDb as never, fakeLogger() as never, resolvers);
+    outbox.setDefaultFinalizer(makeCommandAuditFinalizer(audit, fakeLogger() as never));
+    const { dispatcher, reply } = fakeDispatcher(command, audit, outbox);
+    const ctx = fakeCtx(1, 2);
+    const dispatch = () => runWithUpdateContext({ updateId: 'upd-redelivery', botId: 'bot-42' }, () => dispatcher.dispatchCommand(ctx, 'test', ''));
+
+    await expect(dispatch()).resolves.toBeUndefined();
+    expect(operationDb.rows[0]).toMatchObject({
+      kind: 'command.audit',
+      idempotencyKey: 'command.executed:telegram-update:bot-42:upd-redelivery:1:2:test',
+      status: 'succeeded',
+      auditStatus: 'pending',
+      requestPayload: {},
+      metadata: {
+        recovery: {
+          action: 'test',
+          actorUserId: '2',
+          moduleId: 'test-module',
+          success: true,
+        },
+      },
+    });
+    expect(JSON.stringify(operationDb.rows[0])).not.toContain('visible command reply');
+
+    const restartedResolvers = new PendingOperationResolvers();
+    registerCommandAuditResolver(restartedResolvers);
+    const restartedOutbox = new Outbox(operationDb as never, fakeLogger() as never, restartedResolvers);
+    restartedOutbox.setDefaultFinalizer(makeCommandAuditFinalizer(audit, fakeLogger() as never));
+    await restartedOutbox.recoverPending();
+    expect(operationDb.rows[0]?.auditStatus).toBe('written');
+
+    await expect(dispatch()).resolves.toBeUndefined();
+
+    expect(command.execute).toHaveBeenCalledTimes(1);
+    expect(reply.send).toHaveBeenCalledTimes(1);
+    expect(audit.recordEntityChange).toHaveBeenCalledTimes(2);
   });
 
   it('does not audit commands rejected before execution (feature disabled)', async () => {

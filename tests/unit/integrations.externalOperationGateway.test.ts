@@ -134,20 +134,24 @@ describe('integration write-ahead gateway (BOTS-9 review BLOCKER-3)', () => {
     expect(db.rows[0]?.metadata).toEqual({ formatVersion: 1, audit: {}, recovery: recoveryMetadata });
   });
 
-  it('buildOutboxFinalizer routes telegram.* to ModerationService and everything else to the integration finalizer', async () => {
+  it('buildOutboxFinalizer routes telegram, command audit, and integration rows to their own finalizers', async () => {
     const moderationAudit = vi.fn(async () => ({ status: 'recorded' as const }));
     const moderation = { auditRecoveredOperation: moderationAudit } as unknown as ModerationService;
     const integration: PendingOperationFinalizer = vi.fn(async () => ({ status: 'recorded' as const }));
-    const finalizer = buildOutboxFinalizer(moderation, integration);
+    const command: PendingOperationFinalizer = vi.fn(async () => ({ status: 'recorded' as const }));
+    const finalizer = buildOutboxFinalizer(moderation, integration, command);
 
     const telegramRow = { id: 'r1', kind: 'telegram.banChatMember', chatId: 'c', requestPayload: {}, metadata: {}, recoveryMetadata: {}, idempotencyKey: 'k1', status: 'succeeded' as const, attemptCount: 1, result: null, auditStatus: 'pending' };
     const s3Row = { id: 'r2', kind: 's3.putObject', chatId: 'platform', requestPayload: {}, metadata: {}, recoveryMetadata: {}, idempotencyKey: 'k2', status: 'succeeded' as const, attemptCount: 1, result: null, auditStatus: 'pending' };
+    const commandRow = { ...s3Row, id: 'r3', kind: 'command.audit', chatId: 'c', idempotencyKey: 'k3' };
     const outcome = { status: 'succeeded' as const };
 
     await finalizer(telegramRow, outcome);
     await finalizer(s3Row, outcome);
+    await finalizer(commandRow, outcome);
 
     expect(moderationAudit).toHaveBeenCalledTimes(1);
     expect(integration).toHaveBeenCalledTimes(1);
+    expect(command).toHaveBeenCalledTimes(1);
   });
 });

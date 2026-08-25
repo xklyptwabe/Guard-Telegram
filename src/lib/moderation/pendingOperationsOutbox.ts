@@ -178,6 +178,9 @@ export interface PendingOperationRecoveryMetadata {
   readonly integrationId?: string;
   readonly targetType?: string;
   readonly targetId?: string;
+  readonly moduleId?: string;
+  readonly durationMs?: number;
+  readonly success?: boolean;
 }
 
 export interface PendingOperationAuditEventContext {
@@ -249,7 +252,7 @@ function withTimeout<T>(promise: Promise<T>, ms: number): Promise<T> {
 }
 
 const pendingOperationMetadataFormatVersion = 1;
-const pendingOperationRecoveryMetadataFields = ['action', 'actorUserId', 'targetUserId', 'integrationId', 'targetType', 'targetId'] as const;
+const pendingOperationRecoveryMetadataStringFields = ['action', 'actorUserId', 'targetUserId', 'integrationId', 'targetType', 'targetId', 'moduleId'] as const;
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === 'object' && !Array.isArray(value);
@@ -273,7 +276,11 @@ function decodeStoredMetadata(value: unknown): { readonly metadata: Record<strin
 
 function sanitizeRecoveryMetadata(metadata: PendingOperationRecoveryMetadata): Record<string, unknown> {
   const sanitized = stripForbidden(metadata) as Record<string, unknown>;
-  return Object.fromEntries(pendingOperationRecoveryMetadataFields.flatMap((field) => (typeof sanitized[field] === 'string' ? [[field, sanitized[field]]] : [])));
+  return {
+    ...Object.fromEntries(pendingOperationRecoveryMetadataStringFields.flatMap((field) => (typeof sanitized[field] === 'string' ? [[field, sanitized[field]]] : []))),
+    ...(typeof sanitized.durationMs === 'number' && Number.isFinite(sanitized.durationMs) && sanitized.durationMs >= 0 ? { durationMs: sanitized.durationMs } : {}),
+    ...(typeof sanitized.success === 'boolean' ? { success: sanitized.success } : {}),
+  };
 }
 
 function toRow(row: typeof pendingOperations.$inferSelect): PendingOperationRow {
@@ -295,13 +302,14 @@ function toRow(row: typeof pendingOperations.$inferSelect): PendingOperationRow 
 
 /**
  * ============================================================================
- * BOTS-9: write-ahead log / outbox for external operations.
+ * BOTS-9: shared write-ahead and durable audit-debt outbox.
  * ============================================================================
- * `execute()` is the write-ahead: the intent to call an external system
- * (currently: the Telegram Bot API for moderation actions) is durably
- * recorded in `moderation.pending_operations` *before* the call happens, so
- * a crash mid-call is recoverable — {@link PendingOperationsOutbox.recoverPending}/
- * {@link PendingOperationsOutbox.startWorker} find it again and retry, per
+ * For external operations, `execute()` durably records the intent in
+ * `moderation.pending_operations` before the call. For audit-only rows, the
+ * already-observable operation remains represented by its upstream durable
+ * source until `execute()` stores the finalization debt. Once the row exists,
+ * {@link PendingOperationsOutbox.recoverPending}/
+ * {@link PendingOperationsOutbox.startWorker} find it again and recover, per
  * the "outbox продолжает обработку после рестарта" acceptance criterion.
  *
  * LEASE-BASED CLAIMING (BOTS-9 review BLOCKER-2 fix): a row is never acted
@@ -387,6 +395,21 @@ export class PendingOperationsOutbox {
    */
   public async execute(input: EnqueueExternalOperationInput, executor: PendingOperationExecutor, onFinal?: PendingOperationFinalizer): Promise<PendingOperationResult> {
     const row = await this.writeAhead(input);
+    return this.executeRow(row, executor, onFinal);
+  }
+
+  /**
+   * Resumes an already-written operation without creating a new intent.
+   * Audit-only checkpoints use this on upstream redelivery: the existence of
+   * the row proves the observable work already completed, so only its durable
+   * finalization may run again.
+   */
+  public async resume(idempotencyKey: string, executor: PendingOperationExecutor, onFinal?: PendingOperationFinalizer): Promise<PendingOperationResult | undefined> {
+    const row = await this.findByIdempotencyKey(idempotencyKey);
+    return row ? this.executeRow(row, executor, onFinal) : undefined;
+  }
+
+  private async executeRow(row: PendingOperationRow, executor: PendingOperationExecutor, onFinal?: PendingOperationFinalizer): Promise<PendingOperationResult> {
     if (row.status === 'succeeded' || row.status === 'failed' || (row.status === 'unknown' && row.attemptCount >= this.maxAttempts)) {
       const outcome: AttemptOutcome = row.result ? { status: row.status, result: row.result } : { status: row.status };
       // The original attempt resolved earlier — possibly with an audit that
@@ -516,12 +539,8 @@ export class PendingOperationsOutbox {
   }
 
   private async writeAhead(input: EnqueueExternalOperationInput): Promise<PendingOperationRow> {
-    const existing = await this.db
-      .select()
-      .from(pendingOperations)
-      .where(eq(pendingOperations.idempotencyKey, input.idempotencyKey))
-      .limit(1);
-    if (existing[0]) return toRow(existing[0]);
+    const existing = await this.findByIdempotencyKey(input.idempotencyKey);
+    if (existing) return existing;
 
     const inserted = await this.db
       .insert(pendingOperations)
@@ -541,6 +560,11 @@ export class PendingOperationsOutbox {
     const [row] = await this.db.select().from(pendingOperations).where(eq(pendingOperations.idempotencyKey, input.idempotencyKey)).limit(1);
     if (!row) throw new Error(`PendingOperationsOutbox: failed to write ahead operation "${input.idempotencyKey}"`);
     return toRow(row);
+  }
+
+  private async findByIdempotencyKey(idempotencyKey: string): Promise<PendingOperationRow | undefined> {
+    const [row] = await this.db.select().from(pendingOperations).where(eq(pendingOperations.idempotencyKey, idempotencyKey)).limit(1);
+    return row ? toRow(row) : undefined;
   }
 
   private async prepareStoredMetadata(input: EnqueueExternalOperationInput): Promise<Record<string, unknown>> {

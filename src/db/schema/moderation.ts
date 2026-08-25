@@ -6,10 +6,10 @@ const updatedAt = () => timestamp('updated_at', { withTimezone: true }).defaultN
 export const moderationSchema = pgSchema('moderation');
 
 /**
- * BOTS-9's write-ahead log / outbox for *external* operations — currently
- * Telegram Bot API calls that change moderation state (ban, unban, restrict,
- * unrestrict, kick, and the bot's own message deletions). This is a
- * different concern from `audit.outbox` (BOTS-6/7), which delivers an
+ * BOTS-9's shared durable operation/audit-debt outbox. It writes ahead
+ * external operations such as Telegram moderation calls, and retains
+ * audit-only checkpoints after already-observable command/Rabbit work. This
+ * is a different concern from `audit.outbox` (BOTS-6/7), which delivers an
  * *already-recorded* audit event onward to a destination. This table exists
  * to make the external call itself reliable:
  *
@@ -39,7 +39,7 @@ export const pendingOperations = moderationSchema.table(
   'pending_operations',
   {
     id: uuid('id').defaultRandom().primaryKey(),
-    /** Dot-separated operation kind, e.g. `telegram.banChatMember` — used to look up the retry handler on restart. */
+    /** Dot-separated operation kind, e.g. `telegram.banChatMember` or `command.audit` — used to look up the recovery handler after restart. */
     kind: text('kind').notNull(),
     chatId: text('chat_id').notNull(),
     /** The Telegram API call's own arguments, exactly as they will be/were sent. Retained only while execution or audit recovery is still owed, then minimized to an empty tombstone payload. */
