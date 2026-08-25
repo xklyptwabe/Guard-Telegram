@@ -108,14 +108,40 @@ describe('integration write-ahead gateway (BOTS-9 review BLOCKER-3)', () => {
     expect(calls).toHaveLength(1); // tombstone — no re-finalization
   });
 
+  it('finalizes integration.action from recovery metadata when the effective policy removes every audit metadata field', async () => {
+    const outbox = new PendingOperationsOutbox(db as never, logger(), resolvers);
+    outbox.setMetadataSanitizer(async () => ({}));
+    const { audit, calls } = fakeAuditService();
+    const finalizer = makeIntegrationAuditFinalizer(audit, logger());
+    const recoveryMetadata = { integrationId: 'rabbitmq', action: 'x.y', targetType: 'queue', targetId: 'ns.p.actions' };
+
+    const result = await outbox.execute(
+      {
+        kind: 'rabbitmq.publish',
+        chatId: 'platform',
+        idempotencyKey: 'rabbitmq.publish:env-policy',
+        requestPayload: { envelope: { id: 'env-policy', type: 'x.y', attempt: 0, payload: null } },
+        auditEvent: { eventType: 'integration.action', eventVersion: 'v1' },
+        metadata: recoveryMetadata,
+        recoveryMetadata,
+      },
+      vi.fn(async () => ({ messageId: 'env-policy' })),
+      finalizer,
+    );
+
+    expect(result.auditFinalized).toBe(true);
+    expect(calls).toHaveLength(1);
+    expect(db.rows[0]?.metadata).toEqual({ formatVersion: 1, audit: {}, recovery: recoveryMetadata });
+  });
+
   it('buildOutboxFinalizer routes telegram.* to ModerationService and everything else to the integration finalizer', async () => {
     const moderationAudit = vi.fn(async () => ({ status: 'recorded' as const }));
     const moderation = { auditRecoveredOperation: moderationAudit } as unknown as ModerationService;
     const integration: PendingOperationFinalizer = vi.fn(async () => ({ status: 'recorded' as const }));
     const finalizer = buildOutboxFinalizer(moderation, integration);
 
-    const telegramRow = { id: 'r1', kind: 'telegram.banChatMember', chatId: 'c', requestPayload: {}, metadata: {}, idempotencyKey: 'k1', status: 'succeeded' as const, attemptCount: 1, result: null, auditStatus: 'pending' };
-    const s3Row = { id: 'r2', kind: 's3.putObject', chatId: 'platform', requestPayload: {}, metadata: {}, idempotencyKey: 'k2', status: 'succeeded' as const, attemptCount: 1, result: null, auditStatus: 'pending' };
+    const telegramRow = { id: 'r1', kind: 'telegram.banChatMember', chatId: 'c', requestPayload: {}, metadata: {}, recoveryMetadata: {}, idempotencyKey: 'k1', status: 'succeeded' as const, attemptCount: 1, result: null, auditStatus: 'pending' };
+    const s3Row = { id: 'r2', kind: 's3.putObject', chatId: 'platform', requestPayload: {}, metadata: {}, recoveryMetadata: {}, idempotencyKey: 'k2', status: 'succeeded' as const, attemptCount: 1, result: null, auditStatus: 'pending' };
     const outcome = { status: 'succeeded' as const };
 
     await finalizer(telegramRow, outcome);

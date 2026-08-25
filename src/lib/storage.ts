@@ -73,6 +73,7 @@ export function createStorage(
       // including one resolved by recovery long after this call returned.
       put: async (key, body, contentType) => {
         const bodyDigest = createHash('sha256').update(body).digest('hex');
+        const operationMetadata = integrationOperationMetadata({ integrationId: 's3', action: 'put', targetType: 'object', targetId: key });
         const result = await outbox.execute(
           {
             kind,
@@ -82,7 +83,8 @@ export function createStorage(
             idempotencyKey: `s3.putObject:${key}:${bodyDigest}`,
             requestPayload: { key, contentType, bodyDigest, sizeBytes: body.byteLength },
             auditEvent: { eventType: 'integration.action', eventVersion: 'v1' },
-            metadata: integrationOperationMetadata({ integrationId: 's3', action: 'put', targetType: 'object', targetId: key }),
+            metadata: operationMetadata,
+            recoveryMetadata: operationMetadata,
           },
           async (payload) => {
             try {

@@ -22,8 +22,10 @@ export interface PendingOperationRow {
   readonly kind: string;
   readonly chatId: string;
   readonly requestPayload: Record<string, unknown>;
-  /** Everything needed to reconstruct the audit record once this operation resolves — actor, target, action, reason. Never sent to Telegram. See EnqueueExternalOperationInput.metadata. */
+  /** Policy-projected audit metadata. Never used as the source of required recovery identity. */
   readonly metadata: Record<string, unknown>;
+  /** Minimal operational identity required to finalize the audit after a restart. Never sent to Telegram or filtered by an audit display policy. */
+  readonly recoveryMetadata: Record<string, unknown>;
   readonly idempotencyKey: string;
   readonly status: PendingOperationStatus;
   readonly attemptCount: number;
@@ -158,13 +160,24 @@ export interface EnqueueExternalOperationInput {
   readonly idempotencyKey: string;
   readonly requestPayload: Record<string, unknown>;
   readonly auditEvent?: PendingOperationAuditEventContext;
-  /**
-   * Actor/target/action/reason needed to write the eventual audit record —
-   * kept separate from requestPayload (which is exactly what's forwarded to
-   * Telegram) so it survives a restart: recoverPending() has no live Update
-   * or actor on the call stack to ask, only what was written ahead here.
-   */
+  /** Optional audit data, projected through the effective policy before persistence. */
   readonly metadata?: Record<string, unknown>;
+  /**
+   * Minimal immutable identity needed to reconstruct the eventual audit
+   * record after a restart. Keep optional descriptive data in `metadata`;
+   * this envelope bypasses display-policy projection and is only protected
+   * by the forbidden-data filter.
+   */
+  readonly recoveryMetadata?: PendingOperationRecoveryMetadata;
+}
+
+export interface PendingOperationRecoveryMetadata {
+  readonly action?: string;
+  readonly actorUserId?: string;
+  readonly targetUserId?: string;
+  readonly integrationId?: string;
+  readonly targetType?: string;
+  readonly targetId?: string;
 }
 
 export interface PendingOperationAuditEventContext {
@@ -235,13 +248,43 @@ function withTimeout<T>(promise: Promise<T>, ms: number): Promise<T> {
   return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
 }
 
+const pendingOperationMetadataFormatVersion = 1;
+const pendingOperationRecoveryMetadataFields = ['action', 'actorUserId', 'targetUserId', 'integrationId', 'targetType', 'targetId'] as const;
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === 'object' && !Array.isArray(value);
+}
+
+function decodeStoredMetadata(value: unknown): { readonly metadata: Record<string, unknown>; readonly recoveryMetadata: Record<string, unknown> } {
+  if (
+    isRecord(value) &&
+    value.formatVersion === pendingOperationMetadataFormatVersion &&
+    isRecord(value.audit) &&
+    isRecord(value.recovery)
+  ) {
+    return { metadata: value.audit, recoveryMetadata: value.recovery };
+  }
+
+  // Rows created before the split stored one flat object. Treat it as both
+  // projections so already-valid pending operations remain recoverable.
+  const legacyMetadata = isRecord(value) ? value : {};
+  return { metadata: legacyMetadata, recoveryMetadata: legacyMetadata };
+}
+
+function sanitizeRecoveryMetadata(metadata: PendingOperationRecoveryMetadata): Record<string, unknown> {
+  const sanitized = stripForbidden(metadata) as Record<string, unknown>;
+  return Object.fromEntries(pendingOperationRecoveryMetadataFields.flatMap((field) => (typeof sanitized[field] === 'string' ? [[field, sanitized[field]]] : [])));
+}
+
 function toRow(row: typeof pendingOperations.$inferSelect): PendingOperationRow {
+  const storedMetadata = decodeStoredMetadata(row.metadata);
   return {
     id: row.id,
     kind: row.kind,
     chatId: row.chatId,
     requestPayload: row.requestPayload as Record<string, unknown>,
-    metadata: (row.metadata as Record<string, unknown> | null) ?? {},
+    metadata: storedMetadata.metadata,
+    recoveryMetadata: storedMetadata.recoveryMetadata,
     idempotencyKey: row.idempotencyKey,
     status: row.status,
     attemptCount: row.attemptCount,
@@ -487,7 +530,7 @@ export class PendingOperationsOutbox {
         chatId: input.chatId,
         idempotencyKey: input.idempotencyKey,
         requestPayload: stripForbidden(input.requestPayload),
-        metadata: await this.sanitizeMetadata(input),
+        metadata: await this.prepareStoredMetadata(input),
         status: 'pending',
       })
       .onConflictDoNothing({ target: pendingOperations.idempotencyKey })
@@ -500,18 +543,26 @@ export class PendingOperationsOutbox {
     return toRow(row);
   }
 
-  private async sanitizeMetadata(input: EnqueueExternalOperationInput): Promise<Record<string, unknown>> {
+  private async prepareStoredMetadata(input: EnqueueExternalOperationInput): Promise<Record<string, unknown>> {
     const metadata = input.metadata ? stripForbidden(input.metadata) : {};
-    if (!this.metadataSanitizer || input.auditEvent === undefined) return metadata;
-    return stripForbidden(
-      await this.metadataSanitizer({
-        kind: input.kind,
-        chatId: input.chatId,
-        idempotencyKey: input.idempotencyKey,
-        auditEvent: input.auditEvent,
-        metadata,
-      }),
-    );
+    const auditMetadata =
+      !this.metadataSanitizer || input.auditEvent === undefined
+        ? metadata
+        : stripForbidden(
+            await this.metadataSanitizer({
+              kind: input.kind,
+              chatId: input.chatId,
+              idempotencyKey: input.idempotencyKey,
+              auditEvent: input.auditEvent,
+              metadata,
+            }),
+          );
+    if (input.recoveryMetadata === undefined) return auditMetadata;
+    return {
+      formatVersion: pendingOperationMetadataFormatVersion,
+      audit: auditMetadata,
+      recovery: sanitizeRecoveryMetadata(input.recoveryMetadata),
+    };
   }
 
   /** Eligibility shared by both claim paths: `pending` outright; an `unknown` only once its backoff elapsed AND attempts remain; an `in_progress` only once its lease has expired (or, for pre-lease rows, was never set). An *exhausted* `unknown` (`next_attempt_at` null) is deliberately NOT claimable — see the class doc's LATE COMPLETION note: never blindly re-run a possibly non-idempotent call that already timed out. */

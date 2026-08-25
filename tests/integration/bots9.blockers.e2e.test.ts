@@ -5,6 +5,7 @@ import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from 'vites
 import { validateConfig } from '../../src/config.js';
 import { UpdateInbox } from '../../src/core/updateInbox.js';
 import { createDatabase, type DatabaseClient } from '../../src/db/client.js';
+import { eventPolicies, events } from '../../src/db/schema/audit.js';
 import { processedUpdates } from '../../src/db/schema/core.js';
 import { pendingOperations } from '../../src/db/schema/moderation.js';
 import { AuditService } from '../../src/lib/auditService.js';
@@ -239,6 +240,67 @@ describe.skipIf(!testDatabaseUrl)('BOTS-9 blockers: real-DB verification', () =>
     // …and the redaction itself is visible (not silently dropped text):
     const [reasonRow] = await client.db.select().from(pendingOperations).where(eq(pendingOperations.idempotencyKey, 'moderation.action:telegram-update:42:9001:-100900:2:ban'));
     expect(JSON.stringify(reasonRow?.metadata)).toContain('[redacted]');
+  });
+
+  it('BLOCKER-3: a restrictive audit policy cannot remove the recovery envelope required to finalize a moderation outbox row', async () => {
+    await client.db.insert(eventPolicies).values({
+      policyId: 'bots9-outbox-recovery-policy',
+      chatId: '-100900',
+      eventType: 'moderation.action',
+      eventVersion: 'v1',
+      allowlist: ['chatId'],
+    });
+
+    const resolvers = new PendingOperationResolvers();
+    const outbox = new PendingOperationsOutbox(client.db, silentLogger(), resolvers);
+    outbox.setMetadataSanitizer((input) =>
+      audit.maskOutboxMetadata({
+        tenantId: input.chatId,
+        eventType: input.auditEvent.eventType,
+        eventVersion: input.auditEvent.eventVersion,
+        ...(input.auditEvent.moduleId !== undefined ? { moduleId: input.auditEvent.moduleId } : {}),
+        metadata: input.metadata,
+      }),
+    );
+    const bot = {
+      botInfo: { id: 42 },
+      api: {
+        raw: {
+          banChatMember: vi.fn(async () => true),
+          unbanChatMember: vi.fn(async () => true),
+          restrictChatMember: vi.fn(async () => true),
+          deleteMessage: vi.fn(async () => true),
+        },
+      },
+    };
+    const moderation = new ModerationService(bot as never, audit, outbox, resolvers, silentLogger());
+
+    const result = await runWithUpdateContext({ updateId: '9003', chatId: '-100900', botId: '42' }, () =>
+      moderation.ban({ chatId: '-100900', targetUserId: '2', actorUserId: '9', reason: 'policy-hidden-reason' }),
+    );
+
+    expect(result.status).toBe('succeeded');
+    expect(bot.api.raw.banChatMember).toHaveBeenCalledTimes(1);
+    const [row] = await client.db.select().from(pendingOperations).where(eq(pendingOperations.idempotencyKey, 'moderation.action:telegram-update:42:9003:-100900:2:ban'));
+    expect(row).toMatchObject({
+      status: 'succeeded',
+      auditStatus: 'written',
+      metadata: {
+        formatVersion: 1,
+        audit: {},
+        recovery: { action: 'ban', actorUserId: '9', targetUserId: '2' },
+      },
+    });
+    expect(JSON.stringify(row?.metadata)).not.toContain('policy-hidden-reason');
+
+    const auditRows = await client.db.select().from(events).where(eq(events.idempotencyKey, 'moderation.action:telegram-update:42:9003:-100900:2:ban:audit'));
+    expect(auditRows).toHaveLength(1);
+    expect(auditRows[0]).toMatchObject({
+      eventType: 'moderation.action',
+      actorId: '9',
+      subjectId: '-100900:2',
+      after: { chatId: '-100900' },
+    });
   });
 
   it('BLOCKER-5 DoD: inbox partial failure on a real DB — redelivery resumes, completion dedupes, retention-safe', async () => {

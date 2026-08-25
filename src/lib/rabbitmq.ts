@@ -148,6 +148,7 @@ export async function createRabbitMq(
     const normalizedPayload = validatePayload(type, payload);
     const envelope = actionEnvelopeSchema.parse({ id: randomUUID(), type, attempt: 0, payload: normalizedPayload });
     const kind = 'rabbitmq.publish';
+    const operationMetadata = integrationOperationMetadata({ integrationId: 'rabbitmq', action: type, targetType: 'queue', targetId: topology.actionQueue });
     const result = await outbox!.execute(
       {
         kind,
@@ -155,7 +156,8 @@ export async function createRabbitMq(
         idempotencyKey: `rabbitmq.publish:${envelope.id}`,
         requestPayload: { envelope },
         auditEvent: { eventType: 'integration.action', eventVersion: 'v1' },
-        metadata: integrationOperationMetadata({ integrationId: 'rabbitmq', action: type, targetType: 'queue', targetId: topology.actionQueue }),
+        metadata: operationMetadata,
+        recoveryMetadata: operationMetadata,
       },
       async () => {
         await publishConfirmed(channel, topology.actionsExchange, topology.routingKey, envelope);

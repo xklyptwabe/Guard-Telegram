@@ -309,6 +309,7 @@ export class ModerationService {
         requestPayload,
         auditEvent: { eventType: 'moderation.action', eventVersion: 'v1', moduleId: MODULE_IDS.moderation },
         metadata,
+        recoveryMetadata: { action, actorUserId: input.actorUserId, targetUserId: input.targetUserId },
       },
       this.resolvers.get(kind)!,
       // HIGH-3: audit-finalization is the outbox's durable responsibility —
@@ -335,7 +336,7 @@ export class ModerationService {
     return { status: outcome.status, willRetry: false, ...(outcome.result !== undefined ? { detail: outcome.result } : {}) };
   }
 
-  /** A row resolving during `recoverPending()` has no live command/actor on the call stack — everything needed comes from what was written ahead in `row.metadata` and `row.chatId`. `telegram.deleteMessage` and the moderation-action kinds need different audit events, so this dispatches on `row.kind`. Public so the shared outbox finalizer router (see core wiring / the integration gateway) can delegate `telegram.*` kinds here. */
+  /** A row resolving during `recoverPending()` has no live command/actor on the call stack — everything required comes from the write-ahead recovery envelope and `row.chatId`. `telegram.deleteMessage` and the moderation-action kinds need different audit events, so this dispatches on `row.kind`. Public so the shared outbox finalizer router (see core wiring / the integration gateway) can delegate `telegram.*` kinds here. */
   public async auditRecoveredOperation(row: PendingOperationRow, outcome: AttemptOutcome): Promise<{ readonly status: 'recorded' } | { readonly status: 'policy_skipped' }> {
     if (row.kind === 'telegram.deleteMessage') {
       const messageId = String(row.requestPayload.message_id);
@@ -351,9 +352,9 @@ export class ModerationService {
       });
     }
 
-    const action = typeof row.metadata.action === 'string' ? (row.metadata.action as ModerationAction) : undefined;
-    const targetUserId = typeof row.metadata.targetUserId === 'string' ? row.metadata.targetUserId : undefined;
-    const actorUserId = typeof row.metadata.actorUserId === 'string' ? row.metadata.actorUserId : undefined;
+    const action = typeof row.recoveryMetadata.action === 'string' ? (row.recoveryMetadata.action as ModerationAction) : undefined;
+    const targetUserId = typeof row.recoveryMetadata.targetUserId === 'string' ? row.recoveryMetadata.targetUserId : undefined;
+    const actorUserId = typeof row.recoveryMetadata.actorUserId === 'string' ? row.recoveryMetadata.actorUserId : undefined;
     if (!action || !targetUserId || !actorUserId) {
       // BLOCKER-1: missing audit metadata must NEVER finalize as 'written'.
       // Throw — the outbox keeps `audit_status='pending'` and the backfill

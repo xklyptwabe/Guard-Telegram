@@ -57,12 +57,23 @@ describe('PendingOperationsOutbox', () => {
           reason: 'policy-hidden-reason',
           arbitrary: 'policy-hidden-arbitrary',
         },
+        recoveryMetadata: {
+          action: 'ban',
+          actorUserId: '9',
+          targetUserId: '2',
+          reason: 'policy-hidden-reason',
+          arbitrary: 'policy-hidden-arbitrary',
+        } as never,
         auditEvent: { eventType: 'moderation.action', eventVersion: 'v1', moduleId: 'moderation' },
       },
       async () => undefined,
     );
 
-    expect(db.rows[0]?.metadata).toEqual({ action: 'ban', actorUserId: '[redacted]', targetUserId: '2' });
+    expect(db.rows[0]?.metadata).toEqual({
+      formatVersion: 1,
+      audit: { action: 'ban', actorUserId: '[redacted]', targetUserId: '2' },
+      recovery: { action: 'ban', actorUserId: '9', targetUserId: '2' },
+    });
     expect(JSON.stringify(db.rows[0]?.metadata)).not.toContain('policy-hidden-reason');
     expect(JSON.stringify(db.rows[0]?.metadata)).not.toContain('policy-hidden-arbitrary');
   });

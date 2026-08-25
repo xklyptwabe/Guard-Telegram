@@ -38,23 +38,23 @@ export interface IntegrationOperationMetadata {
   readonly chatId?: string;
 }
 
-export function integrationOperationMetadata(metadata: IntegrationOperationMetadata): Record<string, unknown> {
+export function integrationOperationMetadata(metadata: IntegrationOperationMetadata): IntegrationOperationMetadata & Record<string, unknown> {
   return { ...metadata };
 }
 
 /**
  * Terminal `integration.action` audit for any `s3.*`/`rabbitmq.*` outbox
  * row. Everything needed comes from what was written ahead in
- * `row.metadata` (see {@link IntegrationOperationMetadata}) plus the
+ * `row.recoveryMetadata` (see {@link IntegrationOperationMetadata}) plus the
  * resolved outcome — a row recovered after a restart has no live call site
  * to ask.
  */
 export function makeIntegrationAuditFinalizer(audit: AuditService, logger: Logger): PendingOperationFinalizer {
   return async (row: PendingOperationRow, outcome: AttemptOutcome) => {
-    const integrationId = typeof row.metadata.integrationId === 'string' ? row.metadata.integrationId : undefined;
-    const action = typeof row.metadata.action === 'string' ? row.metadata.action : undefined;
-    const targetType = typeof row.metadata.targetType === 'string' ? row.metadata.targetType : undefined;
-    const targetId = typeof row.metadata.targetId === 'string' ? row.metadata.targetId : undefined;
+    const integrationId = typeof row.recoveryMetadata.integrationId === 'string' ? row.recoveryMetadata.integrationId : undefined;
+    const action = typeof row.recoveryMetadata.action === 'string' ? row.recoveryMetadata.action : undefined;
+    const targetType = typeof row.recoveryMetadata.targetType === 'string' ? row.recoveryMetadata.targetType : undefined;
+    const targetId = typeof row.recoveryMetadata.targetId === 'string' ? row.recoveryMetadata.targetId : undefined;
     if (!integrationId || !action || !targetType || !targetId) {
       // BLOCKER-1: missing metadata must never finalize as 'written'.
       logger.error({ event: 'audit.integration_action.recovered_without_metadata', details: { kind: row.kind, id: row.id } });
