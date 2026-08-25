@@ -4,7 +4,7 @@ External calls — the Telegram Bot API (moderation actions), S3 (`PutObject`), 
 
 This is a distinct concern from `audit.outbox` (BOTS-6/7), which delivers an *already-recorded* audit event onward to a destination. `moderation.pending_operations` exists to make the *external call itself* reliable, before any audit event exists.
 
-Operation kinds are namespaced — `telegram.*` (registered by `ModerationService`), `s3.putObject` (`lib/storage.ts`), `rabbitmq.publish` (`lib/rabbitmq.ts`) — one table, one worker, one terminal-audit pipeline for all of them (BOTS-9 review BLOCKER-3).
+Operation kinds are namespaced — `telegram.*` (registered by `ModerationService`), `s3.putObject` (`lib/storage.ts`), `rabbitmq.publish` and `rabbitmq.reroute.audit` (`lib/rabbitmq.ts`) — one table, one worker, one terminal-audit pipeline for all of them (BOTS-9 review BLOCKER-3).
 
 ## Contract
 
@@ -26,7 +26,7 @@ The one thing this doesn't paper over: a **confirmed** rejection on the unban ha
 
 - **S3 `PutObject`** — the body is never written ahead (files are forbidden in the outbox). A live call executes with the caller's body in scope; recovery can't re-upload, so it *reconciles*: a successful `HEAD` proves the object exists (→ `succeeded`, recorded as reconciled). A `HEAD 404` only proves that the object is not visible at that instant: the timed-out `PUT` may still be completing, and a configured S3-compatible endpoint is not guaranteed to have AWS S3's exact consistency contract. It therefore remains `unknown` and is retried until the attempt limit; exhausted reconciliation remains terminal `unknown`, never a fabricated confirmed failure. `HEAD` is read-only, so retrying it is safe.
 - **RabbitMQ publish** — the envelope, including its id, is created *before* write-ahead and stored in `request_payload`; every retry republishes the same envelope id, making consumer-side dedup possible. Publish failures are unconfirmed from this side and stay `unknown`, retried with the identical envelope.
-- **RabbitMQ DLQ/retry rerouting** gets a post-call `integration.action` record but deliberately no write-ahead row: the source message stays unacked until the reroute is confirmed and is nacked back to the original queue on failure — RabbitMQ's own redelivery is the durable retry, and a DB roundtrip inside that ack window would change consumer ordering for no reliability gain.
+- **RabbitMQ DLQ/retry rerouting** uses the unacked source delivery as its durable write-ahead and RabbitMQ redelivery as its operation retry. After the target publish is confirmed, `rabbitmq.reroute.audit` persists the terminal outcome before the source is acknowledged. An audit failure leaves `audit_status = 'pending'`; the shared outbox worker finalizes that audit after restart without publishing the envelope again.
 
 ## Documented exclusions (BOTS-9 review HIGH-5)
 

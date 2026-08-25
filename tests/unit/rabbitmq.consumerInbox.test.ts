@@ -9,7 +9,7 @@ import type { Logger } from '../../src/lib/logger.js';
 import type { AuditService } from '../../src/lib/auditService.js';
 import type { ActionHandler } from '../../src/lib/rabbitmq.js';
 import { FakeDrizzleTableDb } from './testUtils/fakeDrizzleTable.js';
-import { buildDrizzleOrmMock, fakeLogger } from './testUtils/fakePendingOperationsDb.js';
+import { buildDrizzleOrmMock, FakePendingOperationsDb, fakeLogger } from './testUtils/fakePendingOperationsDb.js';
 
 vi.mock('drizzle-orm', async (importOriginal) => buildDrizzleOrmMock(await importOriginal<typeof import('drizzle-orm')>()));
 
@@ -58,6 +58,9 @@ const amqpMock = vi.hoisted(() => {
 vi.mock('amqplib', () => ({ default: { connect: amqpMock.connect } }));
 
 const { consumedEnvelopes } = await import('../../src/db/schema/core.js');
+const { pendingOperations } = await import('../../src/db/schema/moderation.js');
+const { makeIntegrationAuditFinalizer } = await import('../../src/lib/integrations/externalOperationGateway.js');
+const { PendingOperationResolvers, PendingOperationsOutbox } = await import('../../src/lib/moderation/pendingOperationsOutbox.js');
 const { RabbitEnvelopeInbox } = await import('../../src/lib/rabbitmqConsumerInbox.js');
 const { createRabbitMq } = await import('../../src/lib/rabbitmq.js');
 
@@ -274,5 +277,41 @@ describe('createRabbitMq consumer dedup path', () => {
     amqpMock.deliver(message('00000000-0000-4000-8000-000000000003', 1));
     await vi.waitFor(() => expect(amqpMock.channel.ack).toHaveBeenCalledTimes(3));
     expect(handler).toHaveBeenCalledTimes(2);
+  });
+
+  it('keeps durable audit debt when a confirmed retry reroute cannot be audited immediately', async () => {
+    const envelopeDb = new FakeConsumedEnvelopesDb();
+    const operationDb = new FakePendingOperationsDb(pendingOperations);
+    const resolvers = new PendingOperationResolvers();
+    const outbox = new PendingOperationsOutbox(operationDb as never, logger(), resolvers);
+    const auditService = audit();
+    vi.mocked(auditService.recordEntityChange).mockRejectedValueOnce(new Error('audit database unavailable'));
+    outbox.setDefaultFinalizer(makeIntegrationAuditFinalizer(auditService, logger()));
+    const bridge = await createRabbitMq(config(), logger(), auditService, outbox, resolvers, envelopeDb as never);
+    bridge.registerActionSchema('platform.ping', z.object({ reason: z.string().max(128) }).strict());
+    await bridge.consume('platform.ping', async () => {
+      throw new Error('temporary consumer error');
+    });
+    let auditDebtExistedBeforeAck = false;
+    amqpMock.channel.ack.mockImplementationOnce(() => {
+      auditDebtExistedBeforeAck = operationDb.rows.some((row) => row.status === 'succeeded' && row.auditStatus === 'pending');
+    });
+
+    amqpMock.deliver(message('00000000-0000-4000-8000-000000000004'));
+
+    await vi.waitFor(() => expect(amqpMock.channel.sendToQueue).toHaveBeenCalledTimes(1));
+    await vi.waitFor(() => expect(amqpMock.channel.ack).toHaveBeenCalledTimes(1));
+    expect(operationDb.rows).toHaveLength(1);
+    expect(operationDb.rows[0]).toMatchObject({
+      kind: 'rabbitmq.reroute.audit',
+      status: 'succeeded',
+      auditStatus: 'pending',
+    });
+    expect(auditDebtExistedBeforeAck).toBe(true);
+
+    await outbox.recoverPending();
+
+    expect(operationDb.rows[0]?.auditStatus).toBe('written');
+    expect(amqpMock.channel.sendToQueue).toHaveBeenCalledTimes(1);
   });
 });

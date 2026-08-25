@@ -223,24 +223,41 @@ export async function createRabbitMq(
     await channel.waitForConfirms();
   };
 
+  const rerouteAuditKind = 'rabbitmq.reroute.audit';
+  resolvers?.register(rerouteAuditKind, () => Promise.resolve({}));
+
   /**
-   * DLQ/retry rerouting gets a post-call `integration.action` record but
-   * deliberately NOT a write-ahead row (BOTS-9 review HIGH-5, documented
-   * exclusion): the source message stays unacked until the reroute is
-   * confirmed, and on any reroute failure it is nacked back to the ORIGINAL
-   * queue — RabbitMQ's own redelivery is the durable retry mechanism here,
-   * and interleaving a DB roundtrip into that ack/nack window would change
-   * consumer ordering semantics for no reliability gain. `channel.ack` /
-   * `channel.nack` themselves are protocol-level and stay unaudited for the
-   * same reason.
+   * The unacked source delivery is the durable write-ahead for a reroute.
+   * Once RabbitMQ confirms the target publish, persist a terminal outbox row
+   * before acknowledging the source. If audit finalization fails, that row
+   * keeps the audit debt recoverable without publishing the envelope again.
    */
-  const rerouteWithAudit = async (queue: string, envelope: ActionEnvelope, action: string): Promise<void> => {
+  const rerouteWithAudit = async (queue: string, envelope: ActionEnvelope, action: 'retry' | 'dlq'): Promise<void> => {
     try {
       await sendToQueue(queue, envelope);
-      await auditBestEffort({ integrationId: 'rabbitmq', action, targetType: 'queue', targetId: queue, outcome: 'succeeded' });
     } catch (error: unknown) {
-      await auditBestEffort({ integrationId: 'rabbitmq', action, targetType: 'queue', targetId: queue, outcome: 'unknown' });
+      if (!outbox) await auditBestEffort({ integrationId: 'rabbitmq', action, targetType: 'queue', targetId: queue, outcome: 'unknown' });
       throw error;
+    }
+    if (!outbox) {
+      await auditBestEffort({ integrationId: 'rabbitmq', action, targetType: 'queue', targetId: queue, outcome: 'succeeded' });
+      return;
+    }
+    const operationMetadata = integrationOperationMetadata({ integrationId: 'rabbitmq', action, targetType: 'queue', targetId: queue });
+    const result = await outbox.execute(
+      {
+        kind: rerouteAuditKind,
+        chatId: 'platform',
+        idempotencyKey: `rabbitmq.reroute:${envelope.id}:${envelope.attempt}:${action}`,
+        requestPayload: {},
+        auditEvent: { eventType: 'integration.action', eventVersion: 'v1' },
+        metadata: operationMetadata,
+        recoveryMetadata: operationMetadata,
+      },
+      () => Promise.resolve({ messageId: envelope.id }),
+    );
+    if (!result.isFinal || result.outcome.status !== 'succeeded') {
+      throw new Error(`RabbitMQ ${action} audit debt ${result.outcome.status}`);
     }
   };
 
@@ -256,8 +273,7 @@ export async function createRabbitMq(
       action = { ...action, payload: validatePayload(action.type, action.payload) };
     } catch (error: unknown) {
     try {
-      await sendToQueue(topology.deadLetterQueue, { id: randomUUID(), type: 'invalid', attempt: 0, payload: { reason: 'invalid_message' } });
-      await auditBestEffort({ integrationId: 'rabbitmq', action: 'dlq', targetType: 'queue', targetId: topology.deadLetterQueue, outcome: 'succeeded' });
+      await rerouteWithAudit(topology.deadLetterQueue, { id: randomUUID(), type: 'invalid', attempt: 0, payload: { reason: 'invalid_message' } }, 'dlq');
       void bots9WalExclusion('rabbitmq.ack');
       channel.ack(message);
       logger.warn({ event: 'rabbitmq.invalid_to_dlq', error: { name: error instanceof Error ? error.name : 'UnknownError', message: error instanceof Error ? error.message : String(error) } });
