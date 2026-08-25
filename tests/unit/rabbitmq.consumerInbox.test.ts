@@ -292,26 +292,56 @@ describe('createRabbitMq consumer dedup path', () => {
     await bridge.consume('platform.ping', async () => {
       throw new Error('temporary consumer error');
     });
-    let auditDebtExistedBeforeAck = false;
-    amqpMock.channel.ack.mockImplementationOnce(() => {
-      auditDebtExistedBeforeAck = operationDb.rows.some((row) => row.status === 'succeeded' && row.auditStatus === 'pending');
+    let auditDebtExistedBeforeNack = false;
+    let writeAheadExistedBeforePublish = false;
+    amqpMock.channel.sendToQueue.mockImplementationOnce(() => {
+      writeAheadExistedBeforePublish = operationDb.rows.some((row) => row.kind === 'rabbitmq.reroute' && row.status === 'in_progress');
+      return true;
+    });
+    amqpMock.channel.nack.mockImplementationOnce(() => {
+      auditDebtExistedBeforeNack = operationDb.rows.some((row) => row.status === 'succeeded' && row.auditStatus === 'pending');
     });
 
     amqpMock.deliver(message('00000000-0000-4000-8000-000000000004'));
 
     await vi.waitFor(() => expect(amqpMock.channel.sendToQueue).toHaveBeenCalledTimes(1));
-    await vi.waitFor(() => expect(amqpMock.channel.ack).toHaveBeenCalledTimes(1));
+    await vi.waitFor(() => expect(amqpMock.channel.nack).toHaveBeenCalledTimes(1));
     expect(operationDb.rows).toHaveLength(1);
     expect(operationDb.rows[0]).toMatchObject({
-      kind: 'rabbitmq.reroute.audit',
+      kind: 'rabbitmq.reroute',
       status: 'succeeded',
       auditStatus: 'pending',
     });
-    expect(auditDebtExistedBeforeAck).toBe(true);
+    expect(writeAheadExistedBeforePublish).toBe(true);
+    expect(auditDebtExistedBeforeNack).toBe(true);
+    expect(amqpMock.channel.ack).not.toHaveBeenCalled();
 
     await outbox.recoverPending();
 
     expect(operationDb.rows[0]?.auditStatus).toBe('written');
+    expect(amqpMock.channel.sendToQueue).toHaveBeenCalledTimes(1);
+  });
+
+  it('uses a stable write-ahead key when the same malformed delivery is redelivered', async () => {
+    const envelopeDb = new FakeConsumedEnvelopesDb();
+    const operationDb = new FakePendingOperationsDb(pendingOperations);
+    const resolvers = new PendingOperationResolvers();
+    const outbox = new PendingOperationsOutbox(operationDb as never, logger(), resolvers);
+    outbox.setDefaultFinalizer(makeIntegrationAuditFinalizer(audit(), logger()));
+    const bridge = await createRabbitMq(config(), logger(), audit(), outbox, resolvers, envelopeDb as never);
+    await bridge.consume('platform.ping', async () => undefined);
+    const malformed = {
+      content: Buffer.from('{not-json'),
+      fields: { deliveryTag: 9, redelivered: false, exchange: '', routingKey: 'action.bot' },
+      properties: {},
+    } as ConsumeMessage;
+
+    amqpMock.deliver(malformed);
+    await vi.waitFor(() => expect(amqpMock.channel.ack).toHaveBeenCalledTimes(1));
+    amqpMock.deliver({ ...malformed, fields: { ...malformed.fields, deliveryTag: 10, redelivered: true } });
+    await vi.waitFor(() => expect(amqpMock.channel.ack).toHaveBeenCalledTimes(2));
+
+    expect(operationDb.rows).toHaveLength(1);
     expect(amqpMock.channel.sendToQueue).toHaveBeenCalledTimes(1);
   });
 });

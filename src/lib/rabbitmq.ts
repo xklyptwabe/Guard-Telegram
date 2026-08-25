@@ -1,4 +1,4 @@
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 
 import amqp, { type ChannelModel, type ConfirmChannel, type ConsumeMessage } from 'amqplib';
 import { z } from 'zod';
@@ -33,6 +33,32 @@ export function registerPlatformRabbitActionSchemas(bridge: { registerActionSche
 
 type ActionEnvelope = z.infer<typeof actionEnvelopeSchema>;
 export type ActionHandler = (action: ActionEnvelope) => Promise<void>;
+
+function uuidFromDigest(digest: string): string {
+  const value = digest.slice(0, 32).split('');
+  value[12] = '4';
+  value[16] = ((Number.parseInt(value[16]!, 16) & 0x3) | 0x8).toString(16);
+  return `${value.slice(0, 8).join('')}-${value.slice(8, 12).join('')}-${value.slice(12, 16).join('')}-${value.slice(16, 20).join('')}-${value.slice(20).join('')}`;
+}
+
+function invalidEnvelope(message: ConsumeMessage): ActionEnvelope {
+  const suppliedMessageId = typeof message.properties.messageId === 'string' ? message.properties.messageId : undefined;
+  const parsedMessageId = suppliedMessageId === undefined ? undefined : z.string().uuid().safeParse(suppliedMessageId);
+  const id = parsedMessageId?.success
+    ? parsedMessageId.data
+    : uuidFromDigest(
+        createHash('sha256')
+          .update(message.content)
+          .update('\0')
+          .update(message.fields.exchange)
+          .update('\0')
+          .update(message.fields.routingKey)
+          .update('\0')
+          .update(typeof message.properties.correlationId === 'string' ? message.properties.correlationId : '')
+          .digest('hex'),
+      );
+  return { id, type: 'invalid', attempt: 0, payload: { reason: 'invalid_message' } };
+}
 
 export interface RabbitMqBridge {
   readonly enabled: boolean;
@@ -223,40 +249,45 @@ export async function createRabbitMq(
     await channel.waitForConfirms();
   };
 
-  const rerouteAuditKind = 'rabbitmq.reroute.audit';
-  resolvers?.register(rerouteAuditKind, () => Promise.resolve({}));
+  const rerouteKind = 'rabbitmq.reroute';
+  const reroutePayloadSchema = z.object({ queue: z.string().min(1), envelope: actionEnvelopeSchema }).strict();
+  const executeReroute = async (stored: Record<string, unknown>): Promise<Record<string, unknown>> => {
+    const parsed = reroutePayloadSchema.parse(stored);
+    await sendToQueue(parsed.queue, parsed.envelope);
+    return { messageId: parsed.envelope.id };
+  };
+  resolvers?.register(rerouteKind, executeReroute, { retryAfterUnknown: true });
 
   /**
-   * The unacked source delivery is the durable write-ahead for a reroute.
-   * Once RabbitMQ confirms the target publish, persist a terminal outbox row
-   * before acknowledging the source. If audit finalization fails, that row
-   * keeps the audit debt recoverable without publishing the envelope again.
+   * Persist the target queue and sanitized envelope before publishing. A
+   * redelivered source message resolves to the same row, so it can finish an
+   * owed audit without publishing the envelope again.
    */
   const rerouteWithAudit = async (queue: string, envelope: ActionEnvelope, action: 'retry' | 'dlq'): Promise<void> => {
-    try {
-      await sendToQueue(queue, envelope);
-    } catch (error: unknown) {
-      if (!outbox) await auditBestEffort({ integrationId: 'rabbitmq', action, targetType: 'queue', targetId: queue, outcome: 'unknown' });
-      throw error;
-    }
     if (!outbox) {
+      try {
+        await sendToQueue(queue, envelope);
+      } catch (error: unknown) {
+        await auditBestEffort({ integrationId: 'rabbitmq', action, targetType: 'queue', targetId: queue, outcome: 'unknown' });
+        throw error;
+      }
       await auditBestEffort({ integrationId: 'rabbitmq', action, targetType: 'queue', targetId: queue, outcome: 'succeeded' });
       return;
     }
     const operationMetadata = integrationOperationMetadata({ integrationId: 'rabbitmq', action, targetType: 'queue', targetId: queue });
     const result = await outbox.execute(
       {
-        kind: rerouteAuditKind,
+        kind: rerouteKind,
         chatId: 'platform',
         idempotencyKey: `rabbitmq.reroute:${envelope.id}:${envelope.attempt}:${action}`,
-        requestPayload: {},
+        requestPayload: { queue, envelope },
         auditEvent: { eventType: 'integration.action', eventVersion: 'v1' },
         metadata: operationMetadata,
         recoveryMetadata: operationMetadata,
       },
-      () => Promise.resolve({ messageId: envelope.id }),
+      executeReroute,
     );
-    if (!result.isFinal || result.outcome.status !== 'succeeded') {
+    if (!result.isFinal || result.outcome.status !== 'succeeded' || !result.auditFinalized) {
       throw new Error(`RabbitMQ ${action} audit debt ${result.outcome.status}`);
     }
   };
@@ -272,17 +303,17 @@ export async function createRabbitMq(
       // an envelope whose payload violates it is treated as invalid.
       action = { ...action, payload: validatePayload(action.type, action.payload) };
     } catch (error: unknown) {
-    try {
-      await rerouteWithAudit(topology.deadLetterQueue, { id: randomUUID(), type: 'invalid', attempt: 0, payload: { reason: 'invalid_message' } }, 'dlq');
-      void bots9WalExclusion('rabbitmq.ack');
-      channel.ack(message);
-      logger.warn({ event: 'rabbitmq.invalid_to_dlq', error: { name: error instanceof Error ? error.name : 'UnknownError', message: error instanceof Error ? error.message : String(error) } });
-    } catch {
-      void bots9WalExclusion('rabbitmq.nack');
-      channel.nack(message, false, true);
+      try {
+        await rerouteWithAudit(topology.deadLetterQueue, invalidEnvelope(message), 'dlq');
+        void bots9WalExclusion('rabbitmq.ack');
+        channel.ack(message);
+        logger.warn({ event: 'rabbitmq.invalid_to_dlq', error: { name: error instanceof Error ? error.name : 'UnknownError', message: error instanceof Error ? error.message : String(error) } });
+      } catch {
+        void bots9WalExclusion('rabbitmq.nack');
+        channel.nack(message, false, true);
+      }
+      return;
     }
-    return;
-  }
     try {
       const handler = handlers.get(action.type);
       if (!handler) throw new Error('No consumer registered for action type');

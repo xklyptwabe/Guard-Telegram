@@ -420,6 +420,72 @@ describe('PendingOperationsOutbox', () => {
     expect(db.rows[0]?.attemptCount).toBe(1);
   });
 
+  it('does not re-run a non-retryable operation when direct redelivery finds an expired in-progress lease', async () => {
+    const outbox = new PendingOperationsOutbox(db as never, logger(), resolvers);
+    const executor = vi.fn(async () => ({ answered: true }));
+    const finalizer = vi.fn(async () => ({ status: 'recorded' as const }));
+    resolvers.register('integration.telegram.answerCallbackQuery', executor, { retryAfterUnknown: false });
+    db.rows.push({
+      id: 'expired-answer',
+      kind: 'integration.telegram.answerCallbackQuery',
+      chatId: 'chat-1',
+      requestPayload: {},
+      metadata: {},
+      idempotencyKey: 'key-d1-redelivery',
+      status: 'in_progress',
+      attemptCount: 1,
+      nextAttemptAt: null,
+      workerId: 'crashed-worker',
+      leaseExpiresAt: new Date(Date.now() - 1),
+      auditStatus: 'pending',
+      auditWorkerId: null,
+      auditLeaseExpiresAt: null,
+      result: null,
+      createdAt: new Date(),
+      updatedAt: new Date(),
+    });
+
+    const result = await outbox.execute(
+      { kind: 'integration.telegram.answerCallbackQuery', chatId: 'chat-1', idempotencyKey: 'key-d1-redelivery', requestPayload: {} },
+      executor,
+      finalizer,
+    );
+
+    expect(executor).not.toHaveBeenCalled();
+    expect(result).toMatchObject({ isFinal: true, duplicate: true, outcome: { status: 'unknown' }, auditFinalized: true });
+    expect(finalizer).toHaveBeenCalledTimes(1);
+    expect(db.rows[0]).toMatchObject({ status: 'unknown', auditStatus: 'written', nextAttemptAt: null });
+  });
+
+  it('redelivery finalizes audit debt for a terminal non-retryable unknown without another side effect', async () => {
+    const outbox = new PendingOperationsOutbox(db as never, logger(), resolvers);
+    const executor = vi.fn(async () => {
+      throw new Error('socket hang up');
+    });
+    resolvers.register('integration.telegram.sendMessage', executor, { retryAfterUnknown: false });
+    const failingFinalizer = vi.fn(async (): Promise<{ status: 'recorded' }> => {
+      throw new Error('audit unavailable');
+    });
+
+    const first = await outbox.execute(
+      { kind: 'integration.telegram.sendMessage', chatId: 'chat-1', idempotencyKey: 'key-d1-audit-debt', requestPayload: {} },
+      executor,
+      failingFinalizer,
+    );
+    expect(first).toMatchObject({ isFinal: true, auditFinalized: false, outcome: { status: 'unknown' } });
+
+    const recoveredFinalizer = vi.fn(async () => ({ status: 'recorded' as const }));
+    const second = await outbox.execute(
+      { kind: 'integration.telegram.sendMessage', chatId: 'chat-1', idempotencyKey: 'key-d1-audit-debt', requestPayload: {} },
+      executor,
+      recoveredFinalizer,
+    );
+
+    expect(executor).toHaveBeenCalledTimes(1);
+    expect(second).toMatchObject({ isFinal: true, duplicate: true, auditFinalized: true, outcome: { status: 'unknown' } });
+    expect(recoveredFinalizer).toHaveBeenCalledTimes(1);
+  });
+
   it('BLOCKER-2: a retryable kind still retries after unknown (ban/unban semantics)', async () => {
     const outbox = new PendingOperationsOutbox(db as never, logger(), resolvers);
     resolvers.register('telegram.banChatMember', async () => undefined, { retryAfterUnknown: true });

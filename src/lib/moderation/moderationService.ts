@@ -7,6 +7,7 @@ import type { Logger } from '../logger.js';
 import { normalizeError } from '../logger.js';
 import { AuditPolicyDisabledError, type AuditService } from '../auditService.js';
 import { AuditEventProcessor } from '../audit/eventProcessor.js';
+import { auditEventStatusForOperation } from '../audit/serviceAdapter.js';
 import { safeDownstreamMutationResult } from '../audit/mutationResult.js';
 import { observed, notApplicable } from '../audit/snapshot.js';
 import { recordMessageDeleted } from '../audit/messageAudit.js';
@@ -386,6 +387,7 @@ export class ModerationService {
           category: 'moderation',
           source: 'telegram.moderation_command',
           idempotencyKey,
+          status: auditEventStatusForOperation(operation),
           actorId: input.actorUserId,
           actorType: 'telegram_user',
           // HIGH (round-2): BOTS-9 events must carry the canonical module

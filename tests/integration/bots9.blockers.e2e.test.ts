@@ -69,6 +69,7 @@ async function canSetTelegramBotRole(client: DatabaseClient): Promise<boolean> {
 
 function fakeBot() {
   return {
+    botInfo: { id: 42 },
     api: {
       raw: {
         banChatMember: vi.fn(async () => true),
@@ -238,9 +239,10 @@ describe.skipIf(!testDatabaseUrl)('BOTS-9 blockers: real-DB verification', () =>
       UNION ALL SELECT 'pending.last_error', last_error::text FROM core.processed_updates WHERE last_error::text LIKE '%sup3rs3cret%'
     `);
     expect(scan.rows).toEqual([]);
-    // …and the redaction itself is visible (not silently dropped text):
+    // Migration 0024 deliberately reduces finalized rows to an idempotency
+    // tombstone after the sanitized audit has been written.
     const [reasonRow] = await client.db.select().from(pendingOperations).where(eq(pendingOperations.idempotencyKey, 'moderation.action:telegram-update:42:9001:-100900:2:ban'));
-    expect(JSON.stringify(reasonRow?.metadata)).toContain('[redacted]');
+    expect(reasonRow?.metadata).toEqual({});
   });
 
   it('BLOCKER-3: a restrictive audit policy cannot remove the recovery envelope required to finalize a moderation outbox row', async () => {
@@ -286,11 +288,7 @@ describe.skipIf(!testDatabaseUrl)('BOTS-9 blockers: real-DB verification', () =>
     expect(row).toMatchObject({
       status: 'succeeded',
       auditStatus: 'written',
-      metadata: {
-        formatVersion: 1,
-        audit: {},
-        recovery: { action: 'ban', actorUserId: '9', targetUserId: '2' },
-      },
+      metadata: {},
     });
     expect(JSON.stringify(row?.metadata)).not.toContain('policy-hidden-reason');
 

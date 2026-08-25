@@ -1,4 +1,4 @@
-import { createHash } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 
 import { HeadObjectCommand, PutObjectCommand, S3Client, S3ServiceException } from '@aws-sdk/client-s3';
 
@@ -9,7 +9,7 @@ import { integrationOperationMetadata } from './integrations/externalOperationGa
 
 export interface ObjectStorage {
   readonly enabled: boolean;
-  put(key: string, body: Uint8Array, contentType: string): Promise<void>;
+  put(key: string, body: Uint8Array, contentType: string, options?: { readonly idempotencyKey?: string }): Promise<void>;
   close(): Promise<void>;
 }
 
@@ -71,8 +71,9 @@ export function createStorage(
       // body itself — plus the metadata the audit finalizer needs to write
       // the terminal `integration.action` record after any outcome,
       // including one resolved by recovery long after this call returned.
-      put: async (key, body, contentType) => {
+      put: async (key, body, contentType, options) => {
         const bodyDigest = createHash('sha256').update(body).digest('hex');
+        const operationId = options?.idempotencyKey ?? randomUUID();
         const operationMetadata = integrationOperationMetadata({ integrationId: 's3', action: 'put', targetType: 'object', targetId: key });
         const result = await outbox.execute(
           {
@@ -80,7 +81,7 @@ export function createStorage(
             // chat-less integration: the pending_operations row lives under
             // the platform pseudo-scope, mirroring audit's tenant sentinel.
             chatId: 'platform',
-            idempotencyKey: `s3.putObject:${key}:${bodyDigest}`,
+            idempotencyKey: `s3.putObject:${operationId}`,
             requestPayload: { key, contentType, bodyDigest, sizeBytes: body.byteLength },
             auditEvent: { eventType: 'integration.action', eventVersion: 'v1' },
             metadata: operationMetadata,

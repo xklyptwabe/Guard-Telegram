@@ -82,7 +82,7 @@ export const events = auditSchema.table(
     occurredAt: timestamp('occurred_at', { withTimezone: true }).notNull(),
     recordedAt: timestamp('recorded_at', { withTimezone: true }).defaultNow().notNull(),
     source: text('source').notNull(),
-    status: text('status', { enum: ['recorded', 'failed'] }).notNull().default('recorded'),
+    status: text('status', { enum: ['recorded', 'failed', 'unknown'] }).notNull().default('recorded'),
     tenantId: text('tenant_id').notNull(),
     actorId: text('actor_id'),
     actorType: text('actor_type'),

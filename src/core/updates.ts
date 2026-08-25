@@ -1,4 +1,5 @@
 import { createServer, type IncomingMessage, type Server } from 'node:http';
+import { createHash, randomUUID } from 'node:crypto';
 
 import { BotError, type Bot, type Context } from 'grammy';
 import { z } from 'zod';
@@ -13,8 +14,9 @@ import { constantTimeEquals } from '../lib/cryptoEquals.js';
 import type { Logger } from '../lib/logger.js';
 import type { ModuleRegistry } from './registry.js';
 import type { TelegramBotModule } from './contracts.js';
-import { bots9WalExclusion } from '../lib/bots9WalExclusions.js';
+import { integrationOperationMetadata } from '../lib/integrations/externalOperationGateway.js';
 import { isAuditPendingError } from '../lib/moderation/pendingOperationsOutbox.js';
+import type { PendingOperationResolvers, PendingOperationsOutbox } from '../lib/moderation/pendingOperationsOutbox.js';
 import { UpdateInbox } from './updateInbox.js';
 
 const webhookUpdateSchema = z.object({ update_id: z.number().int() }).passthrough();
@@ -35,13 +37,6 @@ export class UpdateBusyError extends Error {
   }
 }
 
-export class UpdateExhaustedError extends Error {
-  public constructor(updateId: string) {
-    super(`Update ${updateId} exhausted inbox attempts`);
-    this.name = 'UpdateExhaustedError';
-  }
-}
-
 /** grammY wraps every middleware throw in BotError — HTTP layer must unwrap. */
 export function unwrapMiddlewareError(error: unknown): unknown {
   return error instanceof BotError ? error.error : error;
@@ -56,16 +51,11 @@ export function isTransientUpdateError(error: unknown): boolean {
   );
 }
 
-export function isExhaustedUpdateError(error: unknown): boolean {
-  const cause = unwrapMiddlewareError(error);
-  return cause instanceof UpdateExhaustedError || (cause instanceof Error && cause.name === 'UpdateExhaustedError');
-}
-
 /** HTTP status for a failed webhook handleUpdate. Never 200 for owed work. */
 export function webhookStatusForError(error: unknown): 409 | 503 | 400 {
   const cause = unwrapMiddlewareError(error);
   if (cause instanceof UpdateBusyError || (cause instanceof Error && cause.name === 'UpdateBusyError')) return 409;
-  if (isAuditPendingError(cause) || isExhaustedUpdateError(cause)) return 503;
+  if (isAuditPendingError(cause)) return 503;
   if (cause instanceof SyntaxError) return 400;
   if (cause instanceof z.ZodError) return 400;
   return 503;
@@ -85,7 +75,7 @@ function messageThreadId(ctx: Context): string | undefined {
   return undefined;
 }
 
-export function registerPlatformMiddleware(bot: Bot<Context>, database: DrizzleDatabase, registry: ModuleRegistry, logger: Logger, transportMode: 'long_polling' | 'webhook' = 'long_polling'): void {
+export function registerPlatformMiddleware(bot: Bot<Context>, database: DrizzleDatabase, registry: ModuleRegistry, logger: Logger): void {
   const inbox = new UpdateInbox(database, logger);
   bot.use(async (ctx, next) => {
     const updateId = String(ctx.update.update_id);
@@ -102,10 +92,6 @@ export function registerPlatformMiddleware(bot: Bot<Context>, database: DrizzleD
           return;
         }
         if (claim === 'busy') {
-          if (busyReason === 'exhausted') {
-            logger.error({ event: 'update.inbox.exhausted', details: { updateId, attemptCount, transportMode } });
-            throw new UpdateExhaustedError(updateId);
-          }
           throw new UpdateBusyError(updateId, busyReason ?? 'unknown');
         }
         if (ctx.chat) await registry.ensureChat(chatId!, ctx.chat.type, chatTitle(ctx));
@@ -183,15 +169,6 @@ export function startLongPolling(bot: Bot<Context>, config: Pick<AppConfig, 'tel
             await bot.handleUpdate(update);
             offset = update.update_id + 1;
           } catch (error: unknown) {
-            if (isExhaustedUpdateError(error)) {
-              logger.error({
-                event: 'transport.long_polling.exhausted_skip',
-                details: { updateId: update.update_id, offset },
-                error: { name: error instanceof Error ? error.name : 'UnknownError', message: error instanceof Error ? error.message : String(error) },
-              });
-              offset = update.update_id + 1;
-              continue;
-            }
             logger.warn({
               event: 'transport.long_polling.will_retry',
               details: { updateId: update.update_id, offset },
@@ -262,16 +239,44 @@ function webhookSecretMatches(provided: string | readonly string[] | undefined, 
   return constantTimeEquals(provided, expected);
 }
 
-export async function startWebhook(bot: Bot<Context>, config: AppConfig, logger: Logger): Promise<TransportController> {
+export async function startWebhook(
+  bot: Bot<Context>,
+  config: AppConfig,
+  logger: Logger,
+  outbox?: PendingOperationsOutbox,
+  resolvers?: PendingOperationResolvers,
+): Promise<TransportController> {
   if (!config.telegramWebhookUrl || !config.telegramWebhookSecret) throw new Error('Webhook configuration is incomplete');
   const webhookUrl = new URL(config.telegramWebhookUrl);
   const secret = config.telegramWebhookSecret;
-  // BOTS-9 HIGH-5: bootstrap-only, idempotent; retry-by-restart, not WAL.
-  void bots9WalExclusion('telegram.setWebhook');
-  await bot.api.setWebhook(webhookUrl.toString(), {
-    secret_token: secret,
-    allowed_updates: config.telegramAllowedUpdates,
-  });
+  const setWebhook = async (): Promise<Record<string, unknown>> => {
+    await bot.api.setWebhook(webhookUrl.toString(), { secret_token: secret, allowed_updates: config.telegramAllowedUpdates });
+    return { configured: true };
+  };
+  if (outbox && resolvers) {
+    const kind = 'integration.telegram.setWebhook';
+    resolvers.register(kind, setWebhook, { retryAfterUnknown: true });
+    const metadata = integrationOperationMetadata({ integrationId: 'telegram', action: 'setWebhook', targetType: 'bot_configuration', targetId: 'webhook' });
+    const result = await outbox.execute(
+      {
+        kind,
+        chatId: 'platform',
+        idempotencyKey: `telegram.setWebhook:${randomUUID()}`,
+        requestPayload: {
+          webhookUrlDigest: createHash('sha256').update(webhookUrl.toString()).digest('hex'),
+          allowedUpdates: config.telegramAllowedUpdates,
+        },
+        auditEvent: { eventType: 'integration.action', eventVersion: 'v1' },
+        metadata,
+        recoveryMetadata: metadata,
+      },
+      setWebhook,
+    );
+    if (result.isFinal && !result.auditFinalized) throw new Error('Telegram setWebhook audit is still owed');
+    if (result.outcome.status !== 'succeeded') throw new Error(`Telegram setWebhook ${result.outcome.status}`);
+  } else {
+    await setWebhook();
+  }
   const server = createServer((request, response) => {
     void (async () => {
       try {

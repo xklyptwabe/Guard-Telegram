@@ -23,7 +23,7 @@ const eventCategorySchema = z.enum([
   'command',
   'integration',
 ]);
-const eventStatusSchema = z.enum(['recorded', 'failed']);
+const eventStatusSchema = z.enum(['recorded', 'failed', 'unknown']);
 const exportFormatSchema = z.enum(['json', 'csv']);
 const exportFiltersSchema = z
   .object({

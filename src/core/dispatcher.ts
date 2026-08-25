@@ -1,3 +1,5 @@
+import { createHash, randomUUID } from 'node:crypto';
+
 import type { Context } from 'grammy';
 import type { i18n } from 'i18next';
 
@@ -15,8 +17,8 @@ import type { Cooldowns } from '../lib/cooldowns.js';
 import { getUpdateContext } from '../lib/context.js';
 import type { EventBus } from '../lib/eventBus.js';
 import type { Logger } from '../lib/logger.js';
-import { bots9WalExclusion } from '../lib/bots9WalExclusions.js';
-import { AuditFinalizationPendingError, type PendingOperationFinalizer, type PendingOperationsOutbox } from '../lib/moderation/pendingOperationsOutbox.js';
+import { integrationOperationMetadata } from '../lib/integrations/externalOperationGateway.js';
+import { AuditFinalizationPendingError, type PendingOperationFinalizer, type PendingOperationResolvers, type PendingOperationsOutbox } from '../lib/moderation/pendingOperationsOutbox.js';
 import { hasPermission } from '../lib/permissions.js';
 import type { ReplyService } from '../lib/reply.js';
 import type { TelegramCommandDefinition } from './contracts.js';
@@ -86,9 +88,15 @@ export class CommandDispatcher {
     private readonly logger: Logger,
     private readonly audit: AuditService,
     private readonly outbox?: PendingOperationsOutbox,
+    resolvers?: PendingOperationResolvers,
   ) {
     this.commandsByName = new Map(commands.map((command) => [command.name, command]));
     this.commandAuditFinalizer = makeCommandAuditFinalizer(audit, logger);
+    resolvers?.register(
+      'integration.telegram.answerCallbackQuery',
+      () => Promise.reject(new Error('callback query identity is intentionally not persisted; interrupted answer remains unknown')),
+      { retryAfterUnknown: false },
+    );
   }
 
   public async dispatchCommand(ctx: Context, commandName: string, rawArguments: string): Promise<void> {
@@ -256,15 +264,40 @@ export class CommandDispatcher {
       }
       await this.dispatchCommand(ctx, envelope.commandName, envelope.rawArguments);
     } finally {
-      // BOTS-9 review finding (HIGH-5) — documented exclusion:
-      // answerCallbackQuery only dismisses the client-side loading spinner
-      // on the button the user just pressed; it expires within seconds and
-      // has no lasting state. A write-ahead/retry would be pure overhead
-      // with a stale-ack as its only possible outcome.
-      void bots9WalExclusion('telegram.answerCallbackQuery');
-      await ctx.answerCallbackQuery({ text: t('common.callbackDone') }).catch((error: unknown) => {
+      await this.answerCallback(ctx, t('common.callbackDone'));
+    }
+  }
+
+  private async answerCallback(ctx: Context, text: string): Promise<void> {
+    if (!this.outbox) {
+      await ctx.answerCallbackQuery({ text }).catch((error: unknown) => {
         this.logger.error({ event: 'callback.answer_failed', ...(ctx.chat ? { chatId: String(ctx.chat.id) } : {}), ...(ctx.from ? { userId: String(ctx.from.id) } : {}), error: { name: error instanceof Error ? error.name : 'UnknownError', message: error instanceof Error ? error.message : String(error) } });
       });
+      return;
+    }
+    const context = getUpdateContext();
+    const chatId = ctx.chat ? String(ctx.chat.id) : 'platform';
+    const callbackIdDigest = createHash('sha256').update(ctx.callbackQuery?.id ?? 'missing').digest('hex');
+    const occurrence = context ? `${context.botId ?? 'unscoped-bot'}:${context.updateId}` : randomUUID();
+    const metadata = integrationOperationMetadata({ integrationId: 'telegram', action: 'answerCallbackQuery', targetType: 'callback_query', targetId: callbackIdDigest, ...(ctx.chat ? { chatId } : {}) });
+    const result = await this.outbox.execute(
+      {
+        kind: 'integration.telegram.answerCallbackQuery',
+        chatId,
+        idempotencyKey: `telegram.answerCallbackQuery:${occurrence}`,
+        requestPayload: { callbackIdDigest, textDigest: createHash('sha256').update(text).digest('hex'), sizeBytes: Buffer.byteLength(text) },
+        auditEvent: { eventType: 'integration.action', eventVersion: 'v1' },
+        metadata,
+        recoveryMetadata: metadata,
+      },
+      async () => {
+        await ctx.answerCallbackQuery({ text });
+        return { answered: true };
+      },
+    );
+    if (result.isFinal && !result.auditFinalized) throw new AuditFinalizationPendingError('Telegram answerCallbackQuery audit is still owed');
+    if (result.outcome.status !== 'succeeded') {
+      this.logger.error({ event: 'callback.answer_failed', ...(ctx.chat ? { chatId } : {}), ...(ctx.from ? { userId: String(ctx.from.id) } : {}), details: { outcome: result.outcome.status } });
     }
   }
 

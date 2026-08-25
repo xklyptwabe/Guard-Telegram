@@ -111,7 +111,7 @@ describe('UpdateInbox (BOTS-9 review BLOCKER-5)', () => {
     expect(db.rows[0]?.workerId).not.toBeNull();
   });
 
-  it('attempts are bounded: an exhausted update is never reprocessed, even on redelivery', async () => {
+  it('continues retrying after the backoff cap instead of permanently losing the update', async () => {
     const inbox = makeInbox(2);
     const first = await inbox.begin('bot-1', '105');
     await inbox.fail('bot-1', '105', first.attemptCount, new Error('boom'));
@@ -123,8 +123,8 @@ describe('UpdateInbox (BOTS-9 review BLOCKER-5)', () => {
     db.rows[0]!.nextAttemptAt = new Date(Date.now() - 1);
 
     const third = await inbox.begin('bot-1', '105');
-    expect(third.claim).toBe('busy'); // exhausted — redelivery is a no-op now
-    expect(db.rows[0]?.attemptCount).toBe(2);
+    expect(third.claim).toBe('claimed');
+    expect(third.attemptCount).toBe(3);
   });
 
   it('fail() strips secret-shaped error text before it reaches the database (BLOCKER-4)', async () => {
@@ -164,7 +164,7 @@ describe('UpdateInbox (BOTS-9 review BLOCKER-5)', () => {
     expect(again.busyReason).toBe('lease_held');
   });
 
-  it('round-2: an attempts-exhausted row reports exhausted (webhook answers 503 — do not confirm)', async () => {
+  it('round-2: an update remains claimable after the configured backoff exponent cap', async () => {
     const inbox = makeInbox(2);
     const first = await inbox.begin('bot-1', '201');
     expect(first.claim).toBe('claimed');
@@ -174,10 +174,11 @@ describe('UpdateInbox (BOTS-9 review BLOCKER-5)', () => {
     expect(second.claim).toBe('claimed');
     await inbox.fail('bot-1', '201', second.attemptCount, new Error('boom'));
     db.rows[0]!.nextAttemptAt = new Date(0);
-    // maxAttempts reached — no further claims.
+    // The cap limits backoff growth; it must not turn a mandatory update into
+    // a permanently skipped tombstone.
     const third = await inbox.begin('bot-1', '201');
-    expect(third.claim).toBe('busy');
-    expect(third.busyReason).toBe('exhausted');
+    expect(third.claim).toBe('claimed');
+    expect(third.attemptCount).toBe(3);
   });
 
   it('round-2: a row still inside its backoff window reports backoff (webhook answers 409, Telegram redelivers later)', async () => {

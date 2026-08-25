@@ -108,12 +108,12 @@ async function bootstrap(): Promise<void> {
     validateModules(modules);
     const events = new EventBus(logger);
     const registry = new ModuleRegistry(modules, database.db, audit, events, logger);
-    const reply = new ReplyService(config, logger);
-    const dispatcher = new CommandDispatcher(collectCommands(modules), registry, new Cooldowns(), reply, events, i18n, logger, audit, pendingOperationsOutbox);
-    registerPlatformMiddleware(bot, database.db, registry, logger, config.telegramTransport);
+    const reply = new ReplyService(config, logger, pendingOperationsOutbox, pendingOperationResolvers);
+    const dispatcher = new CommandDispatcher(collectCommands(modules), registry, new Cooldowns(), reply, events, i18n, logger, audit, pendingOperationsOutbox, pendingOperationResolvers);
+    registerPlatformMiddleware(bot, database.db, registry, logger);
     registerBotMembershipAudit(bot, audit, logger);
     registerModuleUpdateHandlers(bot, modules, registry, logger);
-    await registerCommands(bot, modules, dispatcher, i18n, logger);
+    await registerCommands(bot, modules, dispatcher, i18n, logger, pendingOperationsOutbox, pendingOperationResolvers);
 
     // BOTS-9: resume anything the write-ahead outbox left unresolved before
     // this process last stopped — before accepting new traffic, so recovery
@@ -125,7 +125,7 @@ async function bootstrap(): Promise<void> {
     // the process stays up, not only once at bootstrap.
     pendingOperationsOutbox.startWorker(outboxFinalizer);
 
-    transport = config.telegramTransport === 'webhook' ? await startWebhook(bot, config, logger) : startLongPolling(bot, config, logger);
+    transport = config.telegramTransport === 'webhook' ? await startWebhook(bot, config, logger, pendingOperationsOutbox, pendingOperationResolvers) : startLongPolling(bot, config, logger);
     if (config.backendApiEnabled) {
       backendApi = await startBackendApiServer(config, database.db, audit, logger);
     }

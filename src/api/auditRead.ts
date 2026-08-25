@@ -33,7 +33,7 @@ const eventCategorySchema = z.enum([
   'command',
   'integration',
 ]);
-const eventStatusSchema = z.enum(['recorded', 'failed']);
+const eventStatusSchema = z.enum(['recorded', 'failed', 'unknown']);
 const uuidPathSegmentSchema = z.string().uuid();
 const policyResolutionTargetSchema = z.object({
   chatId: z.string().trim().min(1).max(128).optional(),

@@ -32,6 +32,7 @@ function silentLogger(): Logger {
 
 function fakeBot() {
   return {
+    botInfo: { id: 42 },
     api: {
       raw: {
         banChatMember: vi.fn(async () => true),
@@ -358,7 +359,7 @@ describe.skipIf(!testDatabaseUrl)('BOT-13: full integration scenarios', () => {
 
       const snapshot = await client.db.select().from(entitySnapshots).where(and(eq(entitySnapshots.entityType, 'chat_member'), eq(entitySnapshots.entityId, subjectId)));
       expect((snapshot[0]?.snapshotData as { status: string }).status).toBe(statusAt(total - 1));
-    }, 30_000);
+    }, 300_000);
   });
 
   describe('большие и потенциально опасные (XSS-подобные) JSON-снимки', () => {

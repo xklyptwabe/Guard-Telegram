@@ -115,6 +115,13 @@ describe('audit migrations', () => {
     expect(sql).not.toMatch(/GRANT\s+UPDATE\s+ON\s+core\.consumed_envelopes/i);
   });
 
+  it('allows unknown as a first-class terminal audit event status', () => {
+    const sql = readFileSync('src/db/migrations/0025_audit_event_unknown_status.sql', 'utf8');
+
+    expect(sql).toContain('DROP CONSTRAINT "events_status_check"');
+    expect(sql).toContain("CHECK (\"status\" IN ('recorded', 'failed', 'unknown'))");
+  });
+
   it('minimizes finalized external-operation payloads without broadening runtime UPDATE grants', () => {
     const sql = readFileSync('src/db/migrations/0024_minimize_finalized_pending_operations.sql', 'utf8');
 

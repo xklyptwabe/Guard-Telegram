@@ -64,14 +64,14 @@ describe('recordMessageObserved', () => {
   });
 
   it('stores an ordinary channel post without fabricating a user through the production module handler', async () => {
-    const fixture = loadFixture('bots9/edited_channel_post.json');
+    const fixture = loadFixture('bots9/channel_post.json');
     const { audit, calls, observations } = fakeAuditService();
     const module = createMessageAuditModule(audit, logger());
     const handler = module.updateHandlers?.find((candidate) => candidate.id === 'message-audit-observed-message');
-    const { edit_date: _editDate, ...channelPost } = fixture.edited_channel_post;
+    const channelPost = fixture.channel_post;
 
     await runWithUpdateContext(
-      { updateId: String(fixture.update_id - 1), chatId: String(channelPost.chat.id), botId: '42' },
+      { updateId: String(fixture.update_id), chatId: String(channelPost.chat.id), botId: '42' },
       async () => handler?.handle({ channelPost } as never),
     );
 
@@ -211,6 +211,7 @@ describe('recordMessageDeleted', () => {
 
       expect(calls).toHaveLength(1);
       const call = calls[0] as {
+        input: { status?: string };
         result: {
           before?: Record<string, unknown>;
           beforeSnapshotStatus?: string;
@@ -219,6 +220,7 @@ describe('recordMessageDeleted', () => {
           snapshotData?: Record<string, unknown>;
         };
       };
+      expect(call.input.status).toBe(outcome);
       expect(call.result.before).toBeUndefined();
       expect(call.result.beforeSnapshotStatus).toBe('not_observed');
       expect(call.result.afterSnapshotStatus).toBe('not_applicable');

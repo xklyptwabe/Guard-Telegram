@@ -1,7 +1,7 @@
 import { and, eq } from 'drizzle-orm';
 
 import { getUpdateContext } from './context.js';
-import type { SnapshotStatus } from './audit/enums.js';
+import type { AuditEventStatus, SnapshotStatus } from './audit/enums.js';
 import {
   AUDIT_OPERATIONAL_METADATA_ALLOWLIST,
   applyAllowlist,
@@ -34,6 +34,7 @@ export interface AuditEventInput extends AuditIdentity {
   readonly category: string;
   readonly source: string;
   readonly idempotencyKey: string;
+  readonly status?: AuditEventStatus;
   readonly actorId?: string;
   readonly actorType?: string;
   readonly correlationId?: string;
@@ -209,6 +210,7 @@ export class AuditService {
           eventVersion: events.eventVersion,
           category: events.category,
           source: events.source,
+          status: events.status,
           actorId: events.actorId,
           actorType: events.actorType,
           subjectType: events.subjectType,
@@ -290,6 +292,7 @@ export class AuditService {
           category: input.category,
           occurredAt: new Date(),
           source: input.source,
+          status: input.status ?? 'recorded',
           tenantId: input.tenantId,
           actorId: input.actorId,
           actorType: input.actorType,
@@ -318,6 +321,7 @@ export class AuditService {
           eventType: input.eventType,
           eventVersion: input.eventVersion,
           category: input.category,
+          status: input.status ?? 'recorded',
           tenantId: input.tenantId,
           subjectType: input.subjectType,
           subjectId: input.subjectId,
@@ -354,6 +358,7 @@ function sameIdempotentOperation(
     readonly eventVersion: string;
     readonly category: string;
     readonly source: string;
+    readonly status: AuditEventStatus;
     readonly actorId: string | null;
     readonly actorType: string | null;
     readonly subjectType: string;
@@ -367,6 +372,7 @@ function sameIdempotentOperation(
     existing.eventVersion === input.eventVersion &&
     existing.category === input.category &&
     existing.source === input.source &&
+    existing.status === (input.status ?? 'recorded') &&
     existing.actorId === (input.actorId ?? null) &&
     existing.actorType === (input.actorType ?? null) &&
     existing.subjectType === input.subjectType &&
@@ -401,7 +407,6 @@ function applySnapshotMode(
     after: undefined,
     beforeSnapshotStatus: redactObservedStatus(mutation.beforeSnapshotStatus),
     afterSnapshotStatus: redactObservedStatus(mutation.afterSnapshotStatus),
-    ...(mutation.changes === undefined ? {} : { changes: mutation.changes }),
     snapshotData: {},
   };
 }

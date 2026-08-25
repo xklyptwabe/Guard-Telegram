@@ -10,7 +10,7 @@ import { AuditEventProcessor } from './eventProcessor.js';
 import type { RaiseAuditEventInput } from './eventProcessor.js';
 import { readCurrentSnapshotData } from './entitySnapshotLookup.js';
 import { observed, notObserved, notApplicable } from './snapshot.js';
-import { toDownstreamMutationResult } from './serviceAdapter.js';
+import { auditEventStatusForOperation, toDownstreamMutationResult } from './serviceAdapter.js';
 import { safeDownstreamMutationResult } from './mutationResult.js';
 
 const auditProcessor = new AuditEventProcessor();
@@ -268,6 +268,7 @@ export async function recordMessageDeleted(
         category: 'message',
         source: 'telegram.moderation_delete',
         idempotencyKey: input.idempotencyKey,
+        status: auditEventStatusForOperation(operation),
         ...(input.deletedBy !== undefined ? { actorId: input.deletedBy, actorType: 'telegram_user' } : {}),
         // Round-2 (HIGH): the bot's own deleteMessage is a moderation
         // action — canonical module id for BOTS-8 module policy.

@@ -80,6 +80,12 @@ export function expiredAuditEventsDeleteQuery(now: Date, batchSize: number) {
       WHERE event."metadata" #>> '{auditPolicy,values,retentionDays}' ~ '^[0-9]+$'
         AND event."occurred_at" < ${now}::timestamptz
           - (((event."metadata" #>> '{auditPolicy,values,retentionDays}')::int) * INTERVAL '1 day')
+        AND NOT EXISTS (
+          SELECT 1
+          FROM "audit"."outbox" AS box
+          WHERE box."event_id" = event."id"
+            AND box."status" <> 'delivered'
+        )
       ORDER BY event."occurred_at" ASC, event."id" ASC
       LIMIT ${batchSize}
     )

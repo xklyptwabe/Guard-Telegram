@@ -176,6 +176,13 @@
       "when": 1787653600000,
       "tag": "0024_minimize_finalized_pending_operations",
       "breakpoints": true
+    },
+    {
+      "idx": 25,
+      "version": "7",
+      "when": 1787660190439,
+      "tag": "0025_audit_event_unknown_status",
+      "breakpoints": true
     }
   ]
 }

@@ -64,8 +64,7 @@ describe('createStorage().put (round-5)', () => {
     await expect(storage.put('obj/a.bin', new Uint8Array([1, 2, 3]), 'application/octet-stream')).rejects.toThrow(/S3 put unknown/);
     expect(db.rows).toHaveLength(1);
     expect(db.rows[0]?.status).toBe('unknown');
-    expect(String(db.rows[0]?.idempotencyKey)).toMatch(/^s3\.putObject:obj\/a\.bin:[0-9a-f]{64}$/);
-    expect(String(db.rows[0]?.idempotencyKey)).not.toMatch(/[0-9a-f]{8}-[0-9a-f]{4}-/);
+    expect(String(db.rows[0]?.idempotencyKey)).toMatch(/^s3\.putObject:[0-9a-f-]{36}$/);
   });
 
   it('keeps a timed-out put unknown after HEAD 404 reconciliation through createStorage', async () => {
@@ -101,5 +100,58 @@ describe('createStorage().put (round-5)', () => {
     expect(db.rows[0]?.attemptCount).toBe(2);
     expect(db.rows[0]?.nextAttemptAt).toBeNull();
     expect(s3Mock.send.mock.calls.some(([command]) => command instanceof HeadObjectCommand)).toBe(true);
+  });
+
+  it('does not collapse two intentional puts with the same key and body', async () => {
+    s3Mock.send.mockResolvedValue({ $metadata: { httpStatusCode: 200 } });
+    const resolvers = new PendingOperationResolvers();
+    const outbox = new PendingOperationsOutbox(db as never, logger(), resolvers);
+    outbox.setDefaultFinalizer(async () => ({ status: 'recorded' }));
+    const storage = createStorage(
+      {
+        s3Enabled: true,
+        s3Region: 'us-east-1',
+        s3AccessKeyId: 'ak',
+        s3SecretAccessKey: 'sk',
+        s3Bucket: 'bucket',
+      },
+      logger(),
+      outbox,
+      resolvers,
+    );
+    const body = new Uint8Array([1, 2, 3]);
+
+    await storage.put('obj/repeated.bin', body, 'application/octet-stream');
+    await storage.put('obj/repeated.bin', body, 'application/octet-stream');
+
+    expect(db.rows).toHaveLength(2);
+    expect(db.rows[0]?.idempotencyKey).not.toBe(db.rows[1]?.idempotencyKey);
+    expect(s3Mock.send).toHaveBeenCalledTimes(2);
+  });
+
+  it('deduplicates a caller-redelivered put when the same operation key is supplied', async () => {
+    s3Mock.send.mockResolvedValue({ $metadata: { httpStatusCode: 200 } });
+    const resolvers = new PendingOperationResolvers();
+    const outbox = new PendingOperationsOutbox(db as never, logger(), resolvers);
+    outbox.setDefaultFinalizer(async () => ({ status: 'recorded' }));
+    const storage = createStorage(
+      {
+        s3Enabled: true,
+        s3Region: 'us-east-1',
+        s3AccessKeyId: 'ak',
+        s3SecretAccessKey: 'sk',
+        s3Bucket: 'bucket',
+      },
+      logger(),
+      outbox,
+      resolvers,
+    );
+    const options = { idempotencyKey: 'business-operation-42' };
+
+    await storage.put('obj/repeated.bin', new Uint8Array([1]), 'application/octet-stream', options);
+    await storage.put('obj/repeated.bin', new Uint8Array([1]), 'application/octet-stream', options);
+
+    expect(db.rows).toHaveLength(1);
+    expect(s3Mock.send).toHaveBeenCalledTimes(1);
   });
 });

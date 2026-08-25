@@ -125,6 +125,34 @@ describe('AuditService persistence safety', () => {
     expect(JSON.stringify(database.captured.event)).not.toContain('policy-sensitive-reason');
   });
 
+  it('does not persist snapshot values through changes in metadata-only mode', async () => {
+    const database = fakeAuditDatabase({ snapshotMode: 'metadata' });
+    const audit = new AuditService(database.db as never);
+
+    await audit.recordEntityChange(
+      {
+        tenantId: 'chat-1',
+        subjectType: 'chat_module_state',
+        subjectId: 'chat-1:moderation',
+        eventType: 'module.state.changed',
+        eventVersion: 'v1',
+        category: 'module',
+        source: 'unit-test',
+        idempotencyKey: 'unit:audit-service:metadata-mode',
+      },
+      async () => ({
+        before: { enabled: false, source: 'override' },
+        after: { enabled: true, source: 'override' },
+        changes: { status: 'computed', fields: { enabled: { before: false, after: true } } },
+        snapshotData: { chatId: 'chat-1', moduleId: 'moderation', enabled: true, source: 'override' },
+      }),
+    );
+
+    expect(database.captured.event).toMatchObject({ before: undefined, after: undefined, beforeSnapshotStatus: 'redacted', afterSnapshotStatus: 'redacted' });
+    expect(database.captured.event?.changes).toBeUndefined();
+    expect(database.captured.outbox?.changes).toBeUndefined();
+  });
+
   it('applies effective policy allowlist and masking before outbox metadata is persisted', async () => {
     const database = fakePolicyReader({
       allowlist: ['action', 'actorUserId', 'targetUserId'],

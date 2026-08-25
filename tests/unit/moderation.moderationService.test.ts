@@ -83,7 +83,8 @@ describe('ModerationService', () => {
     const outcome = await runWithUpdateContext({ updateId: '1', chatId: '-100111' }, () => service.ban({ chatId: '-100111', targetUserId: '2', actorUserId: '9' }));
 
     expect(outcome.status).toBe('failed');
-    const call = calls[0] as { result: { metadata?: Record<string, unknown> } };
+    const call = calls[0] as { input: { status?: string }; result: { metadata?: Record<string, unknown> } };
+    expect(call.input.status).toBe('failed');
     expect(call.result.metadata).toMatchObject({ operation: 'failed' });
   });
 

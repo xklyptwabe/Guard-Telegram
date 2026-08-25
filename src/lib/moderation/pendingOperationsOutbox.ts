@@ -29,6 +29,8 @@ export interface PendingOperationRow {
   readonly idempotencyKey: string;
   readonly status: PendingOperationStatus;
   readonly attemptCount: number;
+  readonly nextAttemptAt: Date | null;
+  readonly leaseExpiresAt: Date | null;
   readonly result: Record<string, unknown> | null;
   /** 'pending' | 'written' | 'policy_skipped' — see the schema column doc. */
   readonly auditStatus: string;
@@ -295,6 +297,8 @@ function toRow(row: typeof pendingOperations.$inferSelect): PendingOperationRow 
     idempotencyKey: row.idempotencyKey,
     status: row.status,
     attemptCount: row.attemptCount,
+    nextAttemptAt: row.nextAttemptAt,
+    leaseExpiresAt: row.leaseExpiresAt,
     result: (row.result as Record<string, unknown> | null) ?? null,
     auditStatus: row.auditStatus,
   };
@@ -410,7 +414,7 @@ export class PendingOperationsOutbox {
   }
 
   private async executeRow(row: PendingOperationRow, executor: PendingOperationExecutor, onFinal?: PendingOperationFinalizer): Promise<PendingOperationResult> {
-    if (row.status === 'succeeded' || row.status === 'failed' || (row.status === 'unknown' && row.attemptCount >= this.maxAttempts)) {
+    if (row.status === 'succeeded' || row.status === 'failed' || (row.status === 'unknown' && row.nextAttemptAt === null)) {
       const outcome: AttemptOutcome = row.result ? { status: row.status, result: row.result } : { status: row.status };
       // The original attempt resolved earlier — possibly with an audit that
       // never got written. A redelivery reaching this branch is exactly the
@@ -680,6 +684,18 @@ export class PendingOperationsOutbox {
   }
 
   private async attemptById(row: PendingOperationRow, executor: PendingOperationExecutor): Promise<PendingOperationResult> {
+    if (this.resolvers.get(row.kind) && !this.resolvers.retryAfterUnknown(row.kind)) {
+      const now = new Date();
+      const interrupted = await this.db
+        .update(pendingOperations)
+        .set({ status: 'unknown', nextAttemptAt: null, result: interruptedOperationResult, workerId: null, leaseExpiresAt: null, updatedAt: now })
+        .where(and(eq(pendingOperations.id, row.id), eq(pendingOperations.status, 'in_progress'), or(isNull(pendingOperations.leaseExpiresAt), lte(pendingOperations.leaseExpiresAt, now))))
+        .returning();
+      if (interrupted[0]) {
+        const terminal = toRow(interrupted[0]);
+        return { row: terminal, outcome: { status: 'unknown', result: interruptedOperationResult }, isFinal: true, duplicate: true, auditFinalized: true };
+      }
+    }
     const claimed = await this.claimById(row.id);
     if (!claimed) {
       // Lost the claim — someone else (a concurrent call, or the polling

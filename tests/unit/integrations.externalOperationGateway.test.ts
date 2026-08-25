@@ -141,8 +141,8 @@ describe('integration write-ahead gateway (BOTS-9 review BLOCKER-3)', () => {
     const command: PendingOperationFinalizer = vi.fn(async () => ({ status: 'recorded' as const }));
     const finalizer = buildOutboxFinalizer(moderation, integration, command);
 
-    const telegramRow = { id: 'r1', kind: 'telegram.banChatMember', chatId: 'c', requestPayload: {}, metadata: {}, recoveryMetadata: {}, idempotencyKey: 'k1', status: 'succeeded' as const, attemptCount: 1, result: null, auditStatus: 'pending' };
-    const s3Row = { id: 'r2', kind: 's3.putObject', chatId: 'platform', requestPayload: {}, metadata: {}, recoveryMetadata: {}, idempotencyKey: 'k2', status: 'succeeded' as const, attemptCount: 1, result: null, auditStatus: 'pending' };
+    const telegramRow = { id: 'r1', kind: 'telegram.banChatMember', chatId: 'c', requestPayload: {}, metadata: {}, recoveryMetadata: {}, idempotencyKey: 'k1', status: 'succeeded' as const, attemptCount: 1, nextAttemptAt: null, leaseExpiresAt: null, result: null, auditStatus: 'pending' };
+    const s3Row = { id: 'r2', kind: 's3.putObject', chatId: 'platform', requestPayload: {}, metadata: {}, recoveryMetadata: {}, idempotencyKey: 'k2', status: 'succeeded' as const, attemptCount: 1, nextAttemptAt: null, leaseExpiresAt: null, result: null, auditStatus: 'pending' };
     const commandRow = { ...s3Row, id: 'r3', kind: 'command.audit', chatId: 'c', idempotencyKey: 'k3' };
     const outcome = { status: 'succeeded' as const };
 

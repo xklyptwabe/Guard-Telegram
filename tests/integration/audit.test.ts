@@ -246,7 +246,7 @@ describe.skipIf(!testDatabaseUrl)('Audit transaction integration', () => {
     });
   });
 
-  it('expires an event even when its audit delivery outbox is still pending', async () => {
+  it('does not expire an event while its audit delivery outbox is still pending', async () => {
     await database!.db.insert(eventPolicies).values({
       policyId: 'audit-retention-pending-outbox',
       chatId: '1010',
@@ -285,9 +285,9 @@ describe.skipIf(!testDatabaseUrl)('Audit transaction integration', () => {
     `);
 
     const result = await purgeExpiredAuditEventsBatch(database!.db, { batchSize: 10, now: new Date() });
-    expect(result.deletedEventIds).toContain(recorded.eventId);
-    expect(await database!.db.select().from(events).where(eq(events.id, recorded.eventId))).toHaveLength(0);
-    expect(await database!.db.select().from(outbox).where(eq(outbox.eventId, recorded.eventId))).toHaveLength(0);
+    expect(result.deletedEventIds).not.toContain(recorded.eventId);
+    expect(await database!.db.select().from(events).where(eq(events.id, recorded.eventId))).toHaveLength(1);
+    expect(await database!.db.select().from(outbox).where(eq(outbox.eventId, recorded.eventId))).toHaveLength(1);
   });
 
   it('keeps input.moduleId canonical in event and outbox metadata', async () => {

@@ -33,6 +33,7 @@ function silentLogger(): Logger {
 
 function fakeBot() {
   return {
+    botInfo: { id: 42 },
     api: {
       raw: {
         banChatMember: vi.fn(async () => true),
@@ -223,6 +224,37 @@ describe.skipIf(!testDatabaseUrl)('BOTS-9 round-2 fixes: real-DB verification', 
     expect(row[0]?.nextAttemptAt).toBeNull();
     expect(finalizer).toHaveBeenCalledTimes(1);
     expect(finalizer.mock.calls[0]?.[1]).toMatchObject({ status: 'unknown' });
+  });
+
+  it('BLOCKER-2: direct Update redelivery also terminalizes an expired non-retryable lease without replay', async () => {
+    const executor = vi.fn(async () => ({ ok: true }));
+    const resolvers = new PendingOperationResolvers();
+    resolvers.register('integration.telegram.sendMessage', executor, { retryAfterUnknown: false });
+    const outbox = new PendingOperationsOutbox(client.db, silentLogger(), resolvers);
+    await client.db.insert(pendingOperations).values({
+      kind: 'integration.telegram.sendMessage',
+      chatId,
+      idempotencyKey: 'send-crashed-in-progress-redelivery-1',
+      requestPayload: { textDigest: 'safe-digest' },
+      status: 'in_progress',
+      attemptCount: 1,
+      lastAttemptAt: new Date(Date.now() - 60_000),
+      workerId: 'stopped-worker',
+      leaseExpiresAt: new Date(Date.now() - 1),
+    });
+    const finalizer = vi.fn(async () => ({ status: 'recorded' as const }));
+
+    const result = await outbox.execute(
+      { kind: 'integration.telegram.sendMessage', chatId, idempotencyKey: 'send-crashed-in-progress-redelivery-1', requestPayload: {} },
+      executor,
+      finalizer,
+    );
+
+    expect(executor).not.toHaveBeenCalled();
+    expect(result).toMatchObject({ isFinal: true, duplicate: true, auditFinalized: true, outcome: { status: 'unknown' } });
+    expect(finalizer).toHaveBeenCalledTimes(1);
+    const row = await client.db.select().from(pendingOperations).where(eq(pendingOperations.idempotencyKey, 'send-crashed-in-progress-redelivery-1')).limit(1);
+    expect(row[0]).toMatchObject({ status: 'unknown', auditStatus: 'written', nextAttemptAt: null });
   });
 
   it('BLOCKER-1/4: a terminal moderation op with a failing audit leaves audit_status=pending AND throws — the backfill later completes it WITHOUT re-running Telegram', async () => {
