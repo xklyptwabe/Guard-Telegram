@@ -306,8 +306,10 @@ export async function recordMessageDeleted(
         // Round-2 (HIGH-3): a failed/unknown delete must NOT archive the
         // snapshot — Telegram never confirmed the deletion, so the message
         // likely still exists and the DB must keep saying so. The audit
-        // event still records the attempt (before=observed, after=not
-        // applicable), but the entity snapshot stays exactly as it was.
+        // event still records the attempt, but the entity snapshot stays
+        // exactly as it was. If there was no snapshot, retain only the known
+        // subject identity; before remains not_observed and no message state
+        // or author is fabricated.
         // `before` is the RAW snapshot data (the `observed(...)` wrapper is
         // only used inside AuditRecord; `normalizeAuditMutationForPersistence`
         // expects the plain data alongside `beforeSnapshotStatus`).
@@ -318,7 +320,7 @@ export async function recordMessageDeleted(
           afterSnapshotStatus: record.after.status,
           changes: record.changes,
           snapshotStatus: 'current',
-          snapshotData: previous ?? {},
+          snapshotData: previous ?? { chatId: input.chatId, messageId: input.messageId },
           metadata: { operation: record.operation, ...(userId !== undefined ? { userId } : {}) },
         };
       },

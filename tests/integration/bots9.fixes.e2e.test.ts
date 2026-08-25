@@ -271,6 +271,36 @@ describe.skipIf(!testDatabaseUrl)('BOTS-9 round-2 fixes: real-DB verification', 
     expect(snap[0]?.snapshotStatus).toBe('archived');
   });
 
+  it.each(['failed', 'unknown'] as const)(
+    'BLOCKER: a %s delete without a previous snapshot still writes one final audit event',
+    async (outcome) => {
+      const messageId = outcome === 'failed' ? '504' : '505';
+      const subjectId = `${chatId}:${messageId}`;
+
+      await expect(
+        recordMessageDeleted(audit, silentLogger(), {
+          chatId,
+          messageId,
+          idempotencyKey: `r2-del:${messageId}:${outcome}`,
+          deletedBy: '456',
+          outcome,
+        }),
+      ).resolves.toEqual({ status: 'recorded' });
+
+      const eventRows = await client.db.select().from(events).where(eq(events.subjectId, subjectId));
+      expect(eventRows).toHaveLength(1);
+      expect(eventRows[0]).toMatchObject({
+        eventType: 'message.deleted',
+        beforeSnapshotStatus: 'not_observed',
+        afterSnapshotStatus: 'not_applicable',
+      });
+      const snapshotRows = await client.db.select().from(entitySnapshots).where(eq(entitySnapshots.entityId, subjectId));
+      expect(snapshotRows).toHaveLength(1);
+      expect(snapshotRows[0]?.snapshotStatus).toBe('current');
+      expect(snapshotRows[0]?.snapshotData).toEqual({ chatId, messageId });
+    },
+  );
+
   it('HIGH: equal-timestamp updates use update_id as the order marker — an older update_id never overwrites', async () => {
     // The producer derives tenantId from the FIXTURE's chat, not from the
     // update-context — query snapshots under the fixture chat id.

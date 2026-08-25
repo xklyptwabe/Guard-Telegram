@@ -196,6 +196,37 @@ describe('recordMessageEdited', () => {
 });
 
 describe('recordMessageDeleted', () => {
+  it.each(['failed', 'unknown'] as const)(
+    'records a %s deletion with before_status not_observed and a non-fabricated identity snapshot',
+    async (outcome) => {
+      const { audit, calls } = fakeAuditService([]);
+
+      await recordMessageDeleted(audit, logger(), {
+        chatId: '-100',
+        messageId: '502',
+        idempotencyKey: `k-unobserved-${outcome}`,
+        deletedBy: '999',
+        outcome,
+      });
+
+      expect(calls).toHaveLength(1);
+      const call = calls[0] as {
+        result: {
+          before?: Record<string, unknown>;
+          beforeSnapshotStatus?: string;
+          afterSnapshotStatus?: string;
+          snapshotStatus?: string;
+          snapshotData?: Record<string, unknown>;
+        };
+      };
+      expect(call.result.before).toBeUndefined();
+      expect(call.result.beforeSnapshotStatus).toBe('not_observed');
+      expect(call.result.afterSnapshotStatus).toBe('not_applicable');
+      expect(call.result.snapshotStatus).toBe('current');
+      expect(call.result.snapshotData).toEqual({ chatId: '-100', messageId: '502' });
+    },
+  );
+
   it('audits a bot-performed deletion with before_status not_observed when the message was never seen before — never fabricates an author', async () => {
     const { audit, calls } = fakeAuditService([]); // never observed
     await recordMessageDeleted(audit, logger(), { chatId: '-100', messageId: '503', idempotencyKey: 'k1', deletedBy: '999' });
