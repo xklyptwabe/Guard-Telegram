@@ -183,6 +183,48 @@
       "when": 1787660190439,
       "tag": "0025_audit_event_unknown_status",
       "breakpoints": true
+    },
+    {
+      "idx": 26,
+      "version": "7",
+      "when": 1787750000000,
+      "tag": "0026_scope_pending_operations_by_owner",
+      "breakpoints": true
+    },
+    {
+      "idx": 27,
+      "version": "7",
+      "when": 1787751000000,
+      "tag": "0027_preserve_pending_audit_outbox_on_retention",
+      "breakpoints": true
+    },
+    {
+      "idx": 28,
+      "version": "7",
+      "when": 1787752000000,
+      "tag": "0028_index_audit_outbox_event",
+      "breakpoints": true
+    },
+    {
+      "idx": 29,
+      "version": "7",
+      "when": 1787753000000,
+      "tag": "0029_allow_unobserved_entity_snapshots",
+      "breakpoints": true
+    },
+    {
+      "idx": 30,
+      "version": "7",
+      "when": 1787754000000,
+      "tag": "0030_secure_public_telegram_entities",
+      "breakpoints": true
+    },
+    {
+      "idx": 31,
+      "version": "7",
+      "when": 1787755000000,
+      "tag": "0031_order_pending_operations_by_supersession",
+      "breakpoints": true
     }
   ]
 }

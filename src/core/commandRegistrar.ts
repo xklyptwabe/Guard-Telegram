@@ -44,6 +44,7 @@ export async function registerCommands(
         kind,
         chatId: 'platform',
         idempotencyKey: `telegram.setMyCommands:${randomUUID()}`,
+        supersessionKey: `telegram.setMyCommands:${targetId}`,
         requestPayload: { commands: menu, ...(languageCode !== undefined ? { language_code: languageCode } : {}) },
         auditEvent: { eventType: 'integration.action', eventVersion: 'v1' },
         metadata,

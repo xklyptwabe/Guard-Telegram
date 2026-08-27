@@ -7,7 +7,7 @@ import { CommandDispatcher } from '../../src/core/dispatcher.js';
 import { startWebhook } from '../../src/core/updates.js';
 import type { AuditService } from '../../src/lib/auditService.js';
 import type { Cooldowns } from '../../src/lib/cooldowns.js';
-import { runWithUpdateContext } from '../../src/lib/context.js';
+import { runWithModuleContext, runWithUpdateContext } from '../../src/lib/context.js';
 import type { EventBus } from '../../src/lib/eventBus.js';
 import type { Logger } from '../../src/lib/logger.js';
 import { AuditFinalizationPendingError, type PendingOperationsOutbox, type PendingOperationResolvers } from '../../src/lib/moderation/pendingOperationsOutbox.js';
@@ -18,8 +18,11 @@ type OutboxInput = {
   kind: string;
   chatId: string;
   idempotencyKey: string;
+  supersessionKey?: string;
   requestPayload: Record<string, unknown>;
   metadata: Record<string, unknown>;
+  recoveryMetadata?: Record<string, unknown>;
+  auditEvent?: { eventType: string; eventVersion: string; moduleId?: string };
 };
 
 function logger(): Logger {
@@ -68,6 +71,24 @@ describe('Telegram mutation write-ahead coverage', () => {
     expect(JSON.stringify(writes[0])).not.toContain(marker);
   });
 
+  it('carries the command module through sendMessage intent and restart recovery metadata', async () => {
+    const { outbox, resolvers, writes } = outboxDouble();
+    const reply = new ReplyService({ telegramTopicFallbackToChat: true }, logger(), outbox, resolvers);
+    const ctx = {
+      chat: { id: -1001, type: 'supergroup' },
+      update: { update_id: 504, message: { message_id: 4, date: 1, chat: { id: -1001, type: 'supergroup' } } },
+      api: { sendMessage: vi.fn(async () => ({ message_id: 79 })) },
+    } as unknown as Context;
+
+    await runWithUpdateContext({ updateId: '504', botId: '42', chatId: '-1001' }, () =>
+      runWithModuleContext('moderation', () => reply.send(ctx, 'safe')),
+    );
+
+    expect(writes[0]?.metadata).toMatchObject({ moduleId: 'moderation' });
+    expect(writes[0]?.recoveryMetadata).toMatchObject({ moduleId: 'moderation' });
+    expect(writes[0]?.auditEvent).toMatchObject({ eventType: 'integration.action', moduleId: 'moderation' });
+  });
+
   it('propagates sendMessage audit debt through the update retry contract', async () => {
     const { outbox, resolvers } = outboxDouble(false);
     const reply = new ReplyService({ telegramTopicFallbackToChat: true }, logger(), outbox, resolvers);
@@ -99,6 +120,11 @@ describe('Telegram mutation write-ahead coverage', () => {
       'integration.telegram.setMyCommands',
     ]);
     expect(writes.every((write) => write.requestPayload.commands instanceof Array)).toBe(true);
+    expect(writes.map((write) => write.supersessionKey)).toEqual([
+      'telegram.setMyCommands:default',
+      'telegram.setMyCommands:ru',
+      'telegram.setMyCommands:en',
+    ]);
   });
 
   it('persists a redacted setWebhook intent before sending the URL and secret', async () => {

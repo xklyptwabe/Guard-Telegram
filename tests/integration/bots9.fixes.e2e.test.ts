@@ -8,11 +8,12 @@ import type { TelegramCommandDefinition } from '../../src/core/contracts.js';
 import { CommandDispatcher } from '../../src/core/dispatcher.js';
 import type { ModuleRegistry } from '../../src/core/registry.js';
 import { createDatabase, type DatabaseClient } from '../../src/db/client.js';
-import { eventPolicies, events, entitySnapshots } from '../../src/db/schema/audit.js';
+import { eventPolicies, events, entitySnapshots, outbox as auditOutbox } from '../../src/db/schema/audit.js';
 import { pendingOperations } from '../../src/db/schema/moderation.js';
 import { purgeExpiredAuditEventsBatch } from '../../src/db/retention.js';
 import { AuditService } from '../../src/lib/auditService.js';
 import { makeCommandAuditFinalizer, registerCommandAuditResolver } from '../../src/lib/audit/commandAudit.js';
+import { recordBotMembershipChanged } from '../../src/lib/audit/botMembershipAudit.js';
 import { recordMessageDeleted } from '../../src/lib/audit/messageAudit.js';
 import { recordMemberStatusChanged } from '../../src/lib/audit/memberAudit.js';
 import { recordIntegrationAction } from '../../src/lib/audit/integrationAudit.js';
@@ -378,7 +379,7 @@ describe.skipIf(!testDatabaseUrl)('BOTS-9 round-2 fixes: real-DB verification', 
   });
 
   it.each(['failed', 'unknown'] as const)(
-    'BLOCKER: a %s delete without a previous snapshot still writes one final audit event',
+    'BLOCKER: a %s delete without a previous snapshot writes one event without fabricating observed state',
     async (outcome) => {
       const messageId = outcome === 'failed' ? '504' : '505';
       const subjectId = `${chatId}:${messageId}`;
@@ -403,7 +404,7 @@ describe.skipIf(!testDatabaseUrl)('BOTS-9 round-2 fixes: real-DB verification', 
       const snapshotRows = await client.db.select().from(entitySnapshots).where(eq(entitySnapshots.entityId, subjectId));
       expect(snapshotRows).toHaveLength(1);
       expect(snapshotRows[0]?.snapshotStatus).toBe('current');
-      expect(snapshotRows[0]?.snapshotData).toEqual({ chatId, messageId });
+      expect(snapshotRows[0]?.snapshotData).toBeNull();
     },
   );
 
@@ -464,6 +465,32 @@ describe.skipIf(!testDatabaseUrl)('BOTS-9 round-2 fixes: real-DB verification', 
     ]);
   });
 
+  it('keeps independent bot membership snapshots for two bots in the same chat', async () => {
+    const membershipContext = (botId: number) => ({
+      myChatMember: {
+        chat: { id: Number(chatId), type: 'supergroup', title: 'Fixture Chat' },
+        from: { id: 999999, is_bot: false, first_name: 'Owner' },
+        date: 1_770_001_100,
+        old_chat_member: { status: 'member', user: { id: botId, is_bot: true, first_name: `Bot ${botId}` } },
+        new_chat_member: { status: 'left', user: { id: botId, is_bot: true, first_name: `Bot ${botId}` } },
+      },
+    });
+
+    await runWithUpdateContext({ updateId: '960010', botId: '41', chatId }, () =>
+      recordBotMembershipChanged(audit, silentLogger(), membershipContext(41) as never),
+    );
+    await runWithUpdateContext({ updateId: '960010', botId: '42', chatId }, () =>
+      recordBotMembershipChanged(audit, silentLogger(), membershipContext(42) as never),
+    );
+
+    const snapshots = await client.db
+      .select({ entityId: entitySnapshots.entityId, snapshotData: entitySnapshots.snapshotData })
+      .from(entitySnapshots)
+      .where(eq(entitySnapshots.entityType, 'bot_membership'));
+    expect(snapshots.map((row) => row.entityId).sort()).toEqual([`${chatId}:41`, `${chatId}:42`]);
+    expect(snapshots.map((row) => (row.snapshotData as Record<string, unknown>).botId).sort()).toEqual(['41', '42']);
+  });
+
   it('HIGH-2: integration.action carries the first-class outcome — failed and unknown are distinguishable', async () => {
     await recordIntegrationAction(audit, silentLogger(), { integrationId: 's3', action: 'put', targetType: 'object', targetId: 'k1', outcome: 'failed', statusCode: 403 });
     await recordIntegrationAction(audit, silentLogger(), { integrationId: 's3', action: 'put', targetType: 'object', targetId: 'k2', outcome: 'unknown' });
@@ -471,6 +498,65 @@ describe.skipIf(!testDatabaseUrl)('BOTS-9 round-2 fixes: real-DB verification', 
     const rows = await client.db.select().from(events).where(eq(events.eventType, 'integration.action'));
     const outcomes = rows.map((r) => ((r.after ?? {}) as Record<string, unknown>).outcome).sort();
     expect(outcomes).toEqual(['failed', 'unknown']);
+    expect(rows.map((row) => row.status).sort()).toEqual(['failed', 'unknown']);
+  });
+
+  it('applies chat+module policy to integration.action without affecting another module', async () => {
+    await client.db.insert(eventPolicies).values({
+      policyId: 'pol-r2-integration-module',
+      chatId,
+      moduleId: 'moderation',
+      enabled: false,
+    });
+
+    await expect(recordIntegrationAction(audit, silentLogger(), {
+      integrationId: 'telegram',
+      action: 'sendMessage',
+      targetType: 'chat',
+      targetId: chatId,
+      chatId,
+      moduleId: 'moderation',
+      outcome: 'succeeded',
+      idempotencyKey: 'r2-integration-module:moderation',
+    })).resolves.toEqual({ status: 'policy_skipped' });
+
+    await expect(recordIntegrationAction(audit, silentLogger(), {
+      integrationId: 'telegram',
+      action: 'sendMessage',
+      targetType: 'chat',
+      targetId: chatId,
+      chatId,
+      moduleId: 'help',
+      outcome: 'succeeded',
+      idempotencyKey: 'r2-integration-module:help',
+    })).resolves.toEqual({ status: 'recorded' });
+
+    const rows = await client.db.select().from(events).where(eq(events.eventType, 'integration.action'));
+    expect(rows).toHaveLength(1);
+    expect(rows[0]?.metadata).toMatchObject({ moduleId: 'help' });
+  });
+
+  it('does not turn a failed or unknown delete without a prior snapshot into an observed before', async () => {
+    await recordMessageDeleted(audit, silentLogger(), {
+      chatId,
+      messageId: 'never-observed',
+      idempotencyKey: 'message-delete-failed',
+      outcome: 'failed',
+    });
+    await recordMessageDeleted(audit, silentLogger(), {
+      chatId,
+      messageId: 'never-observed',
+      idempotencyKey: 'message-delete-unknown',
+      outcome: 'unknown',
+    });
+
+    const subjectId = `${chatId}:never-observed`;
+    const eventRows = await client.db.select().from(events).where(eq(events.subjectId, subjectId));
+    expect(eventRows).toHaveLength(2);
+    expect(eventRows.map((row) => row.beforeSnapshotStatus)).toEqual(['not_observed', 'not_observed']);
+    expect(eventRows.every((row) => row.before === null)).toBe(true);
+    const [snapshot] = await client.db.select().from(entitySnapshots).where(eq(entitySnapshots.entityId, subjectId));
+    expect(snapshot?.snapshotData).toBeNull();
   });
 
   it('HIGH-7/retention: a written audit that retention purged is NOT resurrected on redelivery (durable tombstone)', async () => {
@@ -491,14 +577,15 @@ describe.skipIf(!testDatabaseUrl)('BOTS-9 round-2 fixes: real-DB verification', 
     let eventsForChat = await client.db.select().from(events).where(eq(events.tenantId, chatId));
     expect(eventsForChat).toHaveLength(1);
 
-    // Downstream already consumed the audit outbox — only then may retention
-    // delete the event (pending outbox must survive CASCADE).
-    await client.db.execute(sql`UPDATE audit.outbox SET status = 'delivered' WHERE event_id = ${eventsForChat[0]!.id}`);
-
-    // Retention purges the audit event (backdate it past the policy window).
+    // The delivery row is intentionally still pending. Retention must purge
+    // the expired event without deleting this unfinished, self-contained
+    // delivery envelope.
     await client.db.execute(sql`UPDATE audit.events SET occurred_at = now() - interval '2 days'`);
     const purged = await purgeExpiredAuditEventsBatch(client.db);
     expect(purged.deletedCount).toBe(1);
+    const pendingDelivery = await client.db.select().from(auditOutbox);
+    expect(pendingDelivery).toHaveLength(1);
+    expect(pendingDelivery[0]).toMatchObject({ eventId: null, status: 'pending' });
 
     // Redelivery of the SAME update (same idempotency key): the operation is
     // terminal and its audit_status='written' acts as the tombstone — the
@@ -513,6 +600,202 @@ describe.skipIf(!testDatabaseUrl)('BOTS-9 round-2 fixes: real-DB verification', 
 
     eventsForChat = await client.db.select().from(events).where(eq(events.tenantId, chatId));
     expect(eventsForChat).toHaveLength(0); // no resurrection
+  });
+
+  it('keeps a pre-owner terminal tombstone authoritative after the owner-scoping upgrade', async () => {
+    const idempotencyKey = `moderation.action:telegram-update:42:legacy-redelivery:${chatId}:123:ban`;
+    await client.db.insert(pendingOperations).values({
+      ownerId: 'legacy',
+      kind: 'telegram.banChatMember',
+      chatId,
+      idempotencyKey,
+      operationFingerprint: null,
+      requestPayload: {},
+      metadata: {},
+      status: 'succeeded',
+      auditStatus: 'written',
+    });
+    const executor = vi.fn(async () => ({ ok: true }));
+    const outbox = new PendingOperationsOutbox(client.db, silentLogger(), new PendingOperationResolvers(), undefined, undefined, undefined, '42');
+
+    const result = await outbox.execute(
+      { kind: 'telegram.banChatMember', chatId, idempotencyKey, requestPayload: { chat_id: Number(chatId), user_id: 123 } },
+      executor,
+      vi.fn(async () => ({ status: 'recorded' as const })),
+    );
+
+    expect(result.duplicate).toBe(true);
+    expect(executor).not.toHaveBeenCalled();
+    const rows = await client.db.select().from(pendingOperations).where(eq(pendingOperations.idempotencyKey, idempotencyKey));
+    expect(rows).toHaveLength(1);
+    expect(rows[0]?.ownerId).toBe('legacy');
+  });
+
+  it('allows finalized unknown tombstones through the 0026 unfinished-work guard', async () => {
+    await client.db.insert(pendingOperations).values({
+      ownerId: 'guard-check',
+      kind: 'telegram.deleteMessage',
+      chatId,
+      idempotencyKey: 'terminal-unknown-migration-guard',
+      requestPayload: {},
+      metadata: {},
+      status: 'unknown',
+      nextAttemptAt: null,
+      auditStatus: 'written',
+    });
+
+    const terminal = await client.db.execute(sql`
+      SELECT EXISTS (
+        SELECT 1
+        FROM moderation.pending_operations
+        WHERE owner_id = 'guard-check'
+          AND (
+            status IN ('pending', 'in_progress')
+            OR (status = 'unknown' AND next_attempt_at IS NOT NULL)
+            OR audit_status = 'pending'
+          )
+      ) AS blocked
+    `);
+    expect(terminal.rows[0]?.blocked).toBe(false);
+
+    await client.db
+      .update(pendingOperations)
+      .set({ nextAttemptAt: new Date(Date.now() + 60_000), auditStatus: 'pending' })
+      .where(eq(pendingOperations.idempotencyKey, 'terminal-unknown-migration-guard'));
+    const retryable = await client.db.execute(sql`
+      SELECT EXISTS (
+        SELECT 1
+        FROM moderation.pending_operations
+        WHERE owner_id = 'guard-check'
+          AND (
+            status IN ('pending', 'in_progress')
+            OR (status = 'unknown' AND next_attempt_at IS NOT NULL)
+            OR audit_status = 'pending'
+          )
+      ) AS blocked
+    `);
+    expect(retryable.rows[0]?.blocked).toBe(true);
+  });
+
+  it('does not let an older moderation retry overwrite a newer opposite decision', async () => {
+    const bot = fakeBot();
+    bot.api.raw.banChatMember.mockRejectedValueOnce(new Error('timeout after possible delivery'));
+    const resolvers = new PendingOperationResolvers();
+    const outbox = new PendingOperationsOutbox(client.db, silentLogger(), resolvers, 3, 50, undefined, '42');
+    const service = new ModerationService(bot as never, audit, outbox, resolvers, silentLogger());
+
+    const oldOutcome = await runWithUpdateContext({ updateId: 'old-ban', botId: '42' }, () =>
+      service.ban({ chatId, targetUserId: '123', actorUserId: '456' }),
+    );
+    expect(oldOutcome).toEqual({ status: 'unknown', willRetry: true });
+    const newOutcome = await runWithUpdateContext({ updateId: 'new-unban', botId: '42' }, () =>
+      service.unban({ chatId, targetUserId: '123', actorUserId: '456' }),
+    );
+    expect(newOutcome.status).toBe('succeeded');
+
+    await client.db
+      .update(pendingOperations)
+      .set({ nextAttemptAt: new Date(Date.now() - 1) })
+      .where(eq(pendingOperations.idempotencyKey, `moderation.action:telegram-update:42:old-ban:${chatId}:123:ban`));
+    await service.recoverPending();
+
+    expect(bot.api.raw.banChatMember).toHaveBeenCalledTimes(1);
+    expect(bot.api.raw.unbanChatMember).toHaveBeenCalledTimes(1);
+    const [oldRow] = await client.db
+      .select()
+      .from(pendingOperations)
+      .where(eq(pendingOperations.idempotencyKey, `moderation.action:telegram-update:42:old-ban:${chatId}:123:ban`));
+    expect(oldRow).toMatchObject({ status: 'unknown', nextAttemptAt: null, auditStatus: 'written' });
+    expect(await client.db.select().from(events).where(eq(events.eventType, 'moderation.action'))).toHaveLength(2);
+  });
+
+  it('compares supersession order at PostgreSQL timestamp precision', async () => {
+    const supersessionKey = `moderation.member-state:${chatId}:123`;
+    const inserted = await client.db
+      .insert(pendingOperations)
+      .values([
+        {
+          ownerId: '42',
+          kind: 'telegram.banChatMember',
+          chatId,
+          idempotencyKey: 'same-ms-older',
+          supersessionKey,
+          requestPayload: { chat_id: Number(chatId), user_id: 123 },
+          metadata: {},
+          status: 'succeeded',
+          auditStatus: 'written',
+        },
+        {
+          ownerId: '42',
+          kind: 'telegram.unbanChatMember',
+          chatId,
+          idempotencyKey: 'same-ms-current',
+          supersessionKey,
+          requestPayload: { chat_id: Number(chatId), user_id: 123 },
+          metadata: {},
+          status: 'pending',
+        },
+      ])
+      .returning({ id: pendingOperations.id, idempotencyKey: pendingOperations.idempotencyKey });
+    const olderId = inserted.find((row) => row.idempotencyKey === 'same-ms-older')!.id;
+    const currentId = inserted.find((row) => row.idempotencyKey === 'same-ms-current')!.id;
+    await client.db.execute(sql`
+      UPDATE moderation.pending_operations
+      SET created_at = CASE id
+        WHEN ${olderId}::uuid THEN '2026-01-01 00:00:00.000100+00'::timestamptz
+        WHEN ${currentId}::uuid THEN '2026-01-01 00:00:00.000900+00'::timestamptz
+      END
+      WHERE id IN (${olderId}::uuid, ${currentId}::uuid)
+    `);
+
+    const executor = vi.fn(async () => ({ ok: true }));
+    const resolvers = new PendingOperationResolvers();
+    resolvers.register('telegram.unbanChatMember', executor, { retryAfterUnknown: true });
+    const outbox = new PendingOperationsOutbox(client.db, silentLogger(), resolvers, 3, 50, undefined, '42');
+    await outbox.recoverPending();
+
+    expect(executor).toHaveBeenCalledTimes(1);
+    const [current] = await client.db.select().from(pendingOperations).where(eq(pendingOperations.id, currentId));
+    expect(current).toMatchObject({ status: 'succeeded' });
+  });
+
+  it('keeps the new setMyCommands menu after recovery of an older unknown attempt', async () => {
+    const kind = 'integration.telegram.setMyCommands';
+    const supersessionKey = 'telegram.setMyCommands:default';
+    const appliedMenus: string[] = [];
+    const recoveryExecutor = vi.fn(async (payload: Record<string, unknown>) => {
+      appliedMenus.push(payload.version as string);
+      return { ok: true };
+    });
+    const resolvers = new PendingOperationResolvers();
+    resolvers.register(kind, recoveryExecutor, { retryAfterUnknown: true });
+    const outbox = new PendingOperationsOutbox(client.db, silentLogger(), resolvers, 3, 50, undefined, '42');
+    outbox.setDefaultFinalizer(makeIntegrationAuditFinalizer(audit, silentLogger()));
+    const metadata = { integrationId: 'telegram', action: 'setMyCommands', targetType: 'bot_command_scope', targetId: 'default' };
+
+    await outbox.execute(
+      { kind, chatId: 'platform', idempotencyKey: 'old-command-menu', supersessionKey, requestPayload: { version: 'old' }, auditEvent: { eventType: 'integration.action', eventVersion: 'v1' }, metadata, recoveryMetadata: metadata },
+      vi.fn(async (payload: Record<string, unknown>) => {
+        appliedMenus.push(payload.version as string);
+        throw new Error('timeout after possible delivery');
+      }),
+    );
+    await outbox.execute(
+      { kind, chatId: 'platform', idempotencyKey: 'new-command-menu', supersessionKey, requestPayload: { version: 'new' }, auditEvent: { eventType: 'integration.action', eventVersion: 'v1' }, metadata, recoveryMetadata: metadata },
+      vi.fn(async (payload: Record<string, unknown>) => {
+        appliedMenus.push(payload.version as string);
+        return { ok: true };
+      }),
+    );
+
+    await client.db.update(pendingOperations).set({ nextAttemptAt: new Date(Date.now() - 1) }).where(eq(pendingOperations.idempotencyKey, 'old-command-menu'));
+    await outbox.recoverPending();
+
+    expect(recoveryExecutor).not.toHaveBeenCalled();
+    expect(appliedMenus.at(-1)).toBe('new');
+    const [oldRow] = await client.db.select().from(pendingOperations).where(eq(pendingOperations.idempotencyKey, 'old-command-menu'));
+    expect(oldRow).toMatchObject({ status: 'unknown', nextAttemptAt: null, auditStatus: 'written' });
+    expect(await client.db.select().from(events).where(eq(events.eventType, 'integration.action'))).toHaveLength(2);
   });
 
   it('S3: exhausted HEAD 404 reconciliation remains unknown and writes one terminal audit', async () => {

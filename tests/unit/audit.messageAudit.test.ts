@@ -197,7 +197,7 @@ describe('recordMessageEdited', () => {
 
 describe('recordMessageDeleted', () => {
   it.each(['failed', 'unknown'] as const)(
-    'records a %s deletion with before_status not_observed and a non-fabricated identity snapshot',
+    'records a %s deletion with before_status not_observed and keeps the snapshot unobserved',
     async (outcome) => {
       const { audit, calls } = fakeAuditService([]);
 
@@ -217,7 +217,7 @@ describe('recordMessageDeleted', () => {
           beforeSnapshotStatus?: string;
           afterSnapshotStatus?: string;
           snapshotStatus?: string;
-          snapshotData?: Record<string, unknown>;
+          snapshotData?: Record<string, unknown> | null;
         };
       };
       expect(call.input.status).toBe(outcome);
@@ -225,7 +225,7 @@ describe('recordMessageDeleted', () => {
       expect(call.result.beforeSnapshotStatus).toBe('not_observed');
       expect(call.result.afterSnapshotStatus).toBe('not_applicable');
       expect(call.result.snapshotStatus).toBe('current');
-      expect(call.result.snapshotData).toEqual({ chatId: '-100', messageId: '502' });
+      expect(call.result.snapshotData).toBeNull();
     },
   );
 

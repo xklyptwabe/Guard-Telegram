@@ -16,7 +16,7 @@ vi.mock('drizzle-orm', async (importOriginal) => buildDrizzleOrmMock(await impor
 
 const { CommandDispatcher } = await import('../../src/core/dispatcher.js');
 const { AuditPolicyDisabledError } = await import('../../src/lib/auditService.js');
-const { runWithUpdateContext } = await import('../../src/lib/context.js');
+const { getUpdateContext, runWithUpdateContext } = await import('../../src/lib/context.js');
 const { pendingOperations } = await import('../../src/db/schema/moderation.js');
 const { makeCommandAuditFinalizer, registerCommandAuditResolver } = await import('../../src/lib/audit/commandAudit.js');
 const { PendingOperationResolvers, PendingOperationsOutbox: Outbox } = await import('../../src/lib/moderation/pendingOperationsOutbox.js');
@@ -71,7 +71,11 @@ function fakeDispatcher(command: TelegramCommandDefinition, audit: AuditService,
 
 describe('CommandDispatcher — command.executed audit wiring', () => {
   it('records success:true after a command completes without throwing', async () => {
-    const command = fakeCommand();
+    const command = fakeCommand({
+      execute: vi.fn(async () => {
+        expect(getUpdateContext()?.moduleId).toBe('test-module');
+      }),
+    });
     const { audit, calls } = fakeAuditService();
     const { dispatcher } = fakeDispatcher(command, audit);
     const ctx = fakeCtx(1, 2);

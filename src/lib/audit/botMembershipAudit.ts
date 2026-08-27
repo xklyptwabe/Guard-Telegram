@@ -104,13 +104,19 @@ export async function recordBotMembershipChanged(audit: AuditService, logger: Lo
   }
 
   const oldStatusParsed = botMembershipChangedSchema.shape.status.safeParse(update.old_chat_member?.status);
+  const rawBotId = update.new_chat_member?.user?.id;
+  if (rawBotId === undefined) {
+    logger.warn({ event: 'audit.bot_membership_changed.incomplete_update', chatId, details: { missing: 'new_chat_member.user.id' } });
+    return;
+  }
+  const botId = String(rawBotId);
   const newRights = extractRights(update.new_chat_member);
   const oldRights = extractRights(update.old_chat_member);
   const actorId = update.from ? String(update.from.id) : undefined;
   const observedAt = new Date(update.date * 1000).toISOString();
-  const idempotencyKey = `bot.membership.changed:telegram-update:${updateContext.botId ?? 'unscoped-bot'}:${updateContext.updateId}:${chatId}`;
+  const idempotencyKey = `bot.membership.changed:telegram-update:${botId}:${updateContext.updateId}:${chatId}`;
   const subjectType = 'bot_membership';
-  const subjectId = chatId;
+  const subjectId = `${chatId}:${botId}`;
 
   try {
     await audit.recordEntityChange(
@@ -126,7 +132,7 @@ export async function recordBotMembershipChanged(audit: AuditService, logger: Lo
         ...(actorId !== undefined ? { actorId, actorType: 'telegram_user' } : {}),
       },
       async (tx) => {
-        const current = (await readCurrentSnapshotData(tx, chatId, subjectType, subjectId)) as { status?: string; rights?: BotAdministratorRights; observedAt?: string; observedUpdateId?: number } | undefined;
+        const current = (await readCurrentSnapshotData(tx, chatId, subjectType, subjectId)) as { botId?: string; status?: string; rights?: BotAdministratorRights; observedAt?: string; observedUpdateId?: number } | undefined;
         // Round-2 (HIGH): update.date has second precision — two updates in
         // the same second are common (ban+unban), and a plain `>` lets the
         // second one overwrite the first as if newer. Telegram's update_id
@@ -152,8 +158,8 @@ export async function recordBotMembershipChanged(audit: AuditService, logger: Lo
           operation,
           chatId,
           ...(actorId !== undefined ? { actorId } : {}),
-          before: oldStatusParsed.success ? observed({ chatId, status: oldStatusParsed.data, ...(oldRights ? { rights: oldRights } : {}) }) : notObserved(),
-          after: observed({ chatId, status: newStatusParsed.data, ...(newRights ? { rights: newRights } : {}) }),
+          before: oldStatusParsed.success ? observed({ chatId, botId, status: oldStatusParsed.data, ...(oldRights ? { rights: oldRights } : {}) }) : notObserved(),
+          after: observed({ chatId, botId, status: newStatusParsed.data, ...(newRights ? { rights: newRights } : {}) }),
         });
         const mutationResult = toDownstreamMutationResult(record);
 
@@ -163,6 +169,7 @@ export async function recordBotMembershipChanged(audit: AuditService, logger: Lo
           snapshotStatus: mutationResult.snapshotStatus,
           snapshotData: {
             chatId,
+            botId,
             status: snapshotStatus,
             ...(snapshotRights ? { rights: snapshotRights } : {}),
             observedAt: effectiveObservedAt,

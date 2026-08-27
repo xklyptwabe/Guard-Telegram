@@ -149,4 +149,77 @@ describe('audit migrations', () => {
     expect(sql).toContain('last_error');
     expect(sql).not.toMatch(/GRANT\s+UPDATE\s+ON\s+(?:moderation\.pending_operations|core\.processed_updates)/i);
   });
+
+  it('scopes pending operations by owner with owner-local idempotency and claim indexes', () => {
+    const sql = readFileSync('src/db/migrations/0026_scope_pending_operations_by_owner.sql', 'utf8');
+
+    const safetyGuard = sql.indexOf('Cannot scope pending operations by owner while unfinished execution or audit debt exists');
+    const ownerColumn = sql.indexOf('ADD COLUMN "owner_id" text DEFAULT \'legacy\' NOT NULL');
+    expect(safetyGuard).toBeGreaterThanOrEqual(0);
+    expect(ownerColumn).toBeGreaterThan(safetyGuard);
+    expect(sql).toContain("WHERE \"status\" IN ('pending', 'in_progress')");
+    expect(sql).toContain("OR (\"status\" = 'unknown' AND \"next_attempt_at\" IS NOT NULL)");
+    expect(sql).not.toContain("IN ('pending', 'in_progress', 'unknown')");
+    expect(sql).toContain('OR "audit_status" = \'pending\'');
+    expect(sql).toContain("USING ERRCODE = '55000'");
+    expect(sql).toContain('ADD COLUMN "owner_id" text DEFAULT \'legacy\' NOT NULL');
+    expect(sql).toContain('ADD COLUMN "operation_fingerprint" text');
+    expect(sql).toContain('CREATE UNIQUE INDEX "pending_operations_owner_idempotency_key_idx"');
+    expect(sql).toContain('("owner_id", "idempotency_key")');
+    expect(sql).toContain('CREATE INDEX "pending_operations_owner_status_next_attempt_idx"');
+    expect(sql).not.toMatch(/GRANT\s+UPDATE/i);
+  });
+
+  it('persists state supersession domains and backfills recoverable operations', () => {
+    const sql = readFileSync('src/db/migrations/0031_order_pending_operations_by_supersession.sql', 'utf8');
+
+    expect(sql).toContain('ADD COLUMN "supersession_key" text');
+    expect(sql).toContain("'moderation.member-state:' || \"chat_id\"");
+    expect(sql).toContain("'telegram.setMyCommands:' || COALESCE");
+    expect(sql).toContain('CREATE INDEX "pending_operations_owner_supersession_created_idx"');
+    expect(sql).toContain('("owner_id", "supersession_key", "created_at")');
+    expect(sql).not.toMatch(/GRANT\s+UPDATE/i);
+  });
+
+  it('preserves unfinished audit delivery debt when retention removes its source event', () => {
+    const sql = readFileSync('src/db/migrations/0027_preserve_pending_audit_outbox_on_retention.sql', 'utf8');
+
+    expect(sql).toContain('ALTER COLUMN "event_id" DROP NOT NULL');
+    expect(sql).toContain('ON DELETE SET NULL');
+    expect(sql).not.toMatch(/ON DELETE CASCADE/i);
+  });
+
+  it('indexes audit outbox event references used by retention SET NULL', () => {
+    const sql = readFileSync('src/db/migrations/0028_index_audit_outbox_event.sql', 'utf8');
+
+    expect(sql).toContain('CREATE INDEX IF NOT EXISTS "outbox_event_idx"');
+    expect(sql).toContain('ON "audit"."outbox" USING btree ("event_id")');
+  });
+
+  it('represents an unobserved entity snapshot as SQL NULL instead of fabricated JSON', () => {
+    const sql = readFileSync('src/db/migrations/0029_allow_unobserved_entity_snapshots.sql', 'utf8');
+
+    expect(sql).toContain('ALTER COLUMN "snapshot_data" DROP NOT NULL');
+    expect(sql).toContain("SET \"snapshot_data\" = NULL");
+    expect(sql).toContain("\"snapshot_data\" = '{}'::jsonb");
+    expect(sql).not.toContain('audit.events');
+  });
+
+  it('keeps internal Telegram entities inaccessible through public Supabase roles', () => {
+    const sql = readFileSync('src/db/migrations/0030_secure_public_telegram_entities.sql', 'utf8');
+
+    expect(sql).toContain('ALTER TABLE "public"."telegram_chats" ENABLE ROW LEVEL SECURITY');
+    expect(sql).toContain('ALTER TABLE "public"."telegram_users" ENABLE ROW LEVEL SECURITY');
+    expect(sql).toContain('FROM PUBLIC');
+    expect(sql).toContain("rolname = 'anon'");
+    expect(sql).toContain('FROM anon');
+    expect(sql).toContain("rolname = 'authenticated'");
+    expect(sql).toContain('FROM authenticated');
+    expect(sql).toContain('GRANT SELECT, INSERT, UPDATE ON TABLE "public"."telegram_chats" TO telegram_bot');
+    expect(sql).toContain('GRANT SELECT, INSERT, UPDATE ON TABLE "public"."telegram_users" TO telegram_bot');
+    expect(sql).not.toMatch(/GRANT\s+(?:SELECT,\s*)?(?:INSERT,\s*)?(?:UPDATE,\s*)?DELETE\s+ON\s+TABLE\s+"public"\."telegram_(?:chats|users)"/i);
+    expect(sql).toContain('TO telegram_bot');
+    expect(sql).toContain('USING (true)');
+    expect(sql).toContain('WITH CHECK (true)');
+  });
 });

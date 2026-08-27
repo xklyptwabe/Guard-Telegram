@@ -82,7 +82,15 @@ async function bootstrap(): Promise<void> {
     // created before the integration clients so they can register their
     // kinds/executors on it.
     const pendingOperationResolvers = new PendingOperationResolvers();
-    const pendingOperationsOutbox = new PendingOperationsOutbox(database.db, logger, pendingOperationResolvers);
+    const pendingOperationsOutbox = new PendingOperationsOutbox(
+      database.db,
+      logger,
+      pendingOperationResolvers,
+      undefined,
+      undefined,
+      undefined,
+      String(bot.botInfo.id),
+    );
     pendingOperationsOutbox.setMetadataSanitizer((input) =>
       audit.maskOutboxMetadata({
         tenantId: input.chatId,

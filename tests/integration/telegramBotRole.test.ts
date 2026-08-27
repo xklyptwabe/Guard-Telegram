@@ -74,4 +74,34 @@ describe.skipIf(!testDatabaseUrl)('telegram_bot role privileges (0019/0020/0023)
       envelopeIdUpdate: false,
     });
   });
+
+  it('hides internal public Telegram entities from Data API roles while preserving narrow bot access', async () => {
+    const result = await client.db.execute(sql`
+      SELECT
+        (SELECT relrowsecurity FROM pg_class WHERE oid = 'public.telegram_chats'::regclass) AS "chatsRls",
+        (SELECT relrowsecurity FROM pg_class WHERE oid = 'public.telegram_users'::regclass) AS "usersRls",
+        has_table_privilege('anon', 'public.telegram_chats', 'SELECT') AS "anonChatsSelect",
+        has_table_privilege('authenticated', 'public.telegram_chats', 'DELETE') AS "authenticatedChatsDelete",
+        has_table_privilege('anon', 'public.telegram_users', 'INSERT') AS "anonUsersInsert",
+        has_table_privilege('authenticated', 'public.telegram_users', 'UPDATE') AS "authenticatedUsersUpdate",
+        has_table_privilege('telegram_bot', 'public.telegram_chats', 'SELECT,INSERT,UPDATE') AS "botChatsWrite",
+        has_table_privilege('telegram_bot', 'public.telegram_chats', 'DELETE') AS "botChatsDelete",
+        has_table_privilege('telegram_bot', 'public.telegram_users', 'SELECT,INSERT,UPDATE') AS "botUsersWrite",
+        has_table_privilege('telegram_bot', 'public.telegram_users', 'DELETE') AS "botUsersDelete"
+    `);
+    const row = (result as { rows?: Array<Record<string, boolean>> }).rows?.[0];
+
+    expect(row).toMatchObject({
+      chatsRls: true,
+      usersRls: true,
+      anonChatsSelect: false,
+      authenticatedChatsDelete: false,
+      anonUsersInsert: false,
+      authenticatedUsersUpdate: false,
+      botChatsWrite: true,
+      botChatsDelete: false,
+      botUsersWrite: true,
+      botUsersDelete: false,
+    });
+  });
 });

@@ -52,7 +52,7 @@ export interface AuditChange<TSnapshot extends Record<string, unknown>> {
   readonly changes?: Record<string, unknown>;
   readonly metadata?: Record<string, unknown>;
   readonly snapshotStatus?: AuditEntitySnapshotStatus;
-  readonly snapshotData: TSnapshot;
+  readonly snapshotData: TSnapshot | null;
 }
 
 export type AuditMutationResult<TSnapshot extends Record<string, unknown>> = AuditChange<TSnapshot>;
@@ -170,7 +170,7 @@ export class AuditService {
           entityType: input.subjectType,
           entityId: input.subjectId,
           snapshotStatus: 'current',
-          snapshotData: {},
+          snapshotData: null,
           lastSubjectSequence: 0,
         })
         .onConflictDoNothing({ target: [entitySnapshots.tenantId, entitySnapshots.entityType, entitySnapshots.entityId] });
@@ -180,7 +180,7 @@ export class AuditService {
         .where(snapshotWhere)
         .limit(1)
         .for('update');
-      const existing = rows[0]?.snapshotData as Record<string, unknown> | undefined;
+      const existing = rows[0]?.snapshotData as Record<string, unknown> | null | undefined;
       const existingId = typeof existing?.observedUpdateId === 'number' ? existing.observedUpdateId : undefined;
       if (existing && Object.keys(existing).length > 0 && existingId !== undefined && existingId >= input.observedUpdateId) {
         return;
@@ -249,7 +249,7 @@ export class AuditService {
           entityType: input.subjectType,
           entityId: input.subjectId,
           snapshotStatus: 'current',
-          snapshotData: {},
+          snapshotData: null,
           lastSubjectSequence: 0,
         })
         .onConflictDoNothing({ target: [entitySnapshots.tenantId, entitySnapshots.entityType, entitySnapshots.entityId] });
@@ -407,7 +407,7 @@ function applySnapshotMode(
     after: undefined,
     beforeSnapshotStatus: redactObservedStatus(mutation.beforeSnapshotStatus),
     afterSnapshotStatus: redactObservedStatus(mutation.afterSnapshotStatus),
-    snapshotData: {},
+    snapshotData: null,
   };
 }
 

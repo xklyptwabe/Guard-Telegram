@@ -36,6 +36,7 @@ export interface IntegrationOperationMetadata {
   readonly targetType: string;
   readonly targetId: string;
   readonly chatId?: string;
+  readonly moduleId?: string;
 }
 
 export function integrationOperationMetadata(metadata: IntegrationOperationMetadata): IntegrationOperationMetadata & Record<string, unknown> {
@@ -55,6 +56,7 @@ export function makeIntegrationAuditFinalizer(audit: AuditService, logger: Logge
     const action = typeof row.recoveryMetadata.action === 'string' ? row.recoveryMetadata.action : undefined;
     const targetType = typeof row.recoveryMetadata.targetType === 'string' ? row.recoveryMetadata.targetType : undefined;
     const targetId = typeof row.recoveryMetadata.targetId === 'string' ? row.recoveryMetadata.targetId : undefined;
+    const moduleId = typeof row.recoveryMetadata.moduleId === 'string' ? row.recoveryMetadata.moduleId : undefined;
     if (!integrationId || !action || !targetType || !targetId) {
       // BLOCKER-1: missing metadata must never finalize as 'written'.
       logger.error({ event: 'audit.integration_action.recovered_without_metadata', details: { kind: row.kind, id: row.id } });
@@ -72,6 +74,7 @@ export function makeIntegrationAuditFinalizer(audit: AuditService, logger: Logge
       outcome: outcome.status,
       ...(statusCode !== undefined ? { statusCode } : {}),
       ...(chatId !== undefined ? { chatId } : {}),
+      ...(moduleId !== undefined ? { moduleId } : {}),
       idempotencyKey: `${row.idempotencyKey}:audit`,
     });
   };

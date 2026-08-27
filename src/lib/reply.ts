@@ -66,14 +66,21 @@ export class ReplyService {
     const operationId = context
       ? `${context.botId ?? 'unscoped-bot'}:${context.updateId}:${ctx.chat.id}:${messageThreadId ?? 'chat'}:${occurrence}:${textDigest}`
       : randomUUID();
-    const metadata = integrationOperationMetadata({ integrationId: 'telegram', action: 'sendMessage', targetType: 'chat', targetId: String(ctx.chat.id), chatId: String(ctx.chat.id) });
+    const metadata = integrationOperationMetadata({
+      integrationId: 'telegram',
+      action: 'sendMessage',
+      targetType: 'chat',
+      targetId: String(ctx.chat.id),
+      chatId: String(ctx.chat.id),
+      ...(context?.moduleId !== undefined ? { moduleId: context.moduleId } : {}),
+    });
     const result = await this.outbox.execute(
       {
         kind: this.kind,
         chatId: String(ctx.chat.id),
         idempotencyKey: `telegram.sendMessage:${operationId}`,
         requestPayload: { chat_id: ctx.chat.id, ...(messageThreadId !== undefined ? { message_thread_id: messageThreadId } : {}), textDigest, sizeBytes: Buffer.byteLength(text) },
-        auditEvent: { eventType: 'integration.action', eventVersion: 'v1' },
+        auditEvent: { eventType: 'integration.action', eventVersion: 'v1', ...(context?.moduleId !== undefined ? { moduleId: context.moduleId } : {}) },
         metadata,
         recoveryMetadata: metadata,
       },

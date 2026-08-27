@@ -14,7 +14,7 @@ import {
 } from '../lib/audit/commandAudit.js';
 import type { AuditService } from '../lib/auditService.js';
 import type { Cooldowns } from '../lib/cooldowns.js';
-import { getUpdateContext } from '../lib/context.js';
+import { getUpdateContext, runWithModuleContext } from '../lib/context.js';
 import type { EventBus } from '../lib/eventBus.js';
 import type { Logger } from '../lib/logger.js';
 import { integrationOperationMetadata } from '../lib/integrations/externalOperationGateway.js';
@@ -140,18 +140,20 @@ export class CommandDispatcher {
         await this.reply.send(ctx, t('common.invalidArguments'));
         return;
       }
-      await command.execute(
-        {
-          ctx,
-          ...identity,
-          moduleId: command.moduleId,
-          registry: this.registry,
-          logger: this.logger,
-          reply: this.reply,
-          events: this.events,
-          t,
-        },
-        parsed.data,
+      await runWithModuleContext(command.moduleId, () =>
+        command.execute(
+          {
+            ctx,
+            ...identity,
+            moduleId: command.moduleId,
+            registry: this.registry,
+            logger: this.logger,
+            reply: this.reply,
+            events: this.events,
+            t,
+          },
+          parsed.data,
+        ),
       );
       const durationMs = Date.now() - startedAt;
       this.logger.info({ event: 'command.completed', module: command.moduleId, chatId: identity.chatId, userId: identity.userId, commandName, durationMs });

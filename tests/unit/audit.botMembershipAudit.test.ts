@@ -43,10 +43,31 @@ describe('recordBotMembershipChanged', () => {
     expect(calls).toHaveLength(1);
     const call = calls[0] as { input: { eventType: string; subjectId: string; idempotencyKey: string }; result: { before?: Record<string, unknown>; after?: Record<string, unknown> } };
     expect(call.input.eventType).toBe('bot.membership.changed');
-    expect(call.input.subjectId).toBe('-1001111111111');
-    expect(call.input.idempotencyKey).toBe('bot.membership.changed:telegram-update:bot-42:100005:-1001111111111');
-    expect(call.result.before).toMatchObject({ status: 'member' });
-    expect(call.result.after).toMatchObject({ status: 'administrator' });
+    expect(call.input.subjectId).toBe('-1001111111111:777777');
+    expect(call.input.idempotencyKey).toBe('bot.membership.changed:telegram-update:777777:100005:-1001111111111');
+    expect(call.result.before).toMatchObject({ botId: '777777', status: 'member' });
+    expect(call.result.after).toMatchObject({ botId: '777777', status: 'administrator' });
+  });
+
+  it('uses a bot-scoped snapshot identity when two bots receive membership updates for the same chat', async () => {
+    const fixture = loadFixture('my_chat_member.promoted.json');
+    const { audit, calls } = fakeAuditService();
+    const first = { myChatMember: fixture.my_chat_member } as never;
+    const second = {
+      myChatMember: {
+        ...fixture.my_chat_member,
+        old_chat_member: { ...fixture.my_chat_member.old_chat_member, user: { ...fixture.my_chat_member.old_chat_member.user, id: 888888 } },
+        new_chat_member: { ...fixture.my_chat_member.new_chat_member, user: { ...fixture.my_chat_member.new_chat_member.user, id: 888888 } },
+      },
+    } as never;
+
+    await runWithUpdateContext({ updateId: '1', botId: '777777', chatId: '-1001111111111' }, () => recordBotMembershipChanged(audit, logger(), first));
+    await runWithUpdateContext({ updateId: '1', botId: '888888', chatId: '-1001111111111' }, () => recordBotMembershipChanged(audit, logger(), second));
+
+    expect(calls.map((call) => (call.input as { subjectId: string }).subjectId)).toEqual([
+      '-1001111111111:777777',
+      '-1001111111111:888888',
+    ]);
   });
 
   it('audits the bot being removed from a chat', async () => {

@@ -322,6 +322,17 @@ describe('createRabbitMq consumer dedup path', () => {
     expect(amqpMock.channel.sendToQueue).toHaveBeenCalledTimes(1);
   });
 
+  it('retries an unknown rabbitmq.publish with the same durable envelope id', async () => {
+    const envelopeDb = new FakeConsumedEnvelopesDb();
+    const operationDb = new FakePendingOperationsDb(pendingOperations);
+    const resolvers = new PendingOperationResolvers();
+    const outbox = new PendingOperationsOutbox(operationDb as never, logger(), resolvers);
+
+    await createRabbitMq(config(), logger(), audit(), outbox, resolvers, envelopeDb as never);
+
+    expect(resolvers.retryAfterUnknown('rabbitmq.publish')).toBe(true);
+  });
+
   it('uses a stable write-ahead key when the same malformed delivery is redelivered', async () => {
     const envelopeDb = new FakeConsumedEnvelopesDb();
     const operationDb = new FakePendingOperationsDb(pendingOperations);

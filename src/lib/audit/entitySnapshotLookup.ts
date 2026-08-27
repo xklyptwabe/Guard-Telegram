@@ -11,9 +11,8 @@ import type { AuditTransaction } from '../auditService.js';
  * transaction — no separate locking needed here.
  *
  * Returns `undefined` for "never observed before" (either no row exists
- * yet, or it's still the empty placeholder `{}` `recordEntityChange`
- * inserts on first sight) — callers use that to decide `before:
- * notObserved()` vs `before: observed(...)`.
+ * yet, or its snapshot data is SQL NULL) — callers use that to decide
+ * `before: notObserved()` vs `before: observed(...)`.
  */
 export async function readCurrentSnapshotData(
   tx: AuditTransaction,
@@ -26,6 +25,6 @@ export async function readCurrentSnapshotData(
     .from(entitySnapshots)
     .where(and(eq(entitySnapshots.tenantId, tenantId), eq(entitySnapshots.entityType, subjectType), eq(entitySnapshots.entityId, subjectId)))
     .limit(1);
-  const data = rows[0]?.snapshotData as Record<string, unknown> | undefined;
-  return data && Object.keys(data).length > 0 ? data : undefined;
+  const data = rows[0]?.snapshotData as Record<string, unknown> | null | undefined;
+  return data ?? undefined;
 }

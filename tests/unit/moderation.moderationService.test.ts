@@ -67,6 +67,7 @@ describe('ModerationService', () => {
     expect(bot.api.raw.banChatMember).toHaveBeenCalledTimes(1);
     expect(bot.api.raw.banChatMember).toHaveBeenCalledWith({ chat_id: -100111, user_id: 2 });
     expect(db.rows[0]?.idempotencyKey).toBe('moderation.action:telegram-update:bot-42:1:-100111:2:ban');
+    expect(db.rows[0]?.supersessionKey).toBe('moderation.member-state:-100111:2');
     expect(calls).toHaveLength(1);
     const call = calls[0] as { input: { eventType: string }; result: { after?: Record<string, unknown>; metadata?: Record<string, unknown> } };
     expect(call.input.eventType).toBe('moderation.action');

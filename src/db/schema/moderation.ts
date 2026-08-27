@@ -39,6 +39,8 @@ export const pendingOperations = moderationSchema.table(
   'pending_operations',
   {
     id: uuid('id').defaultRandom().primaryKey(),
+    /** Stable bot/deployment owner. Background recovery only claims rows owned by the current bot instance. */
+    ownerId: text('owner_id').notNull().default('legacy'),
     /** Dot-separated operation kind, e.g. `telegram.banChatMember` or `command.audit` — used to look up the recovery handler after restart. */
     kind: text('kind').notNull(),
     chatId: text('chat_id').notNull(),
@@ -47,6 +49,10 @@ export const pendingOperations = moderationSchema.table(
     /** Everything needed to reconstruct the eventual audit record — deliberately kept separate from requestPayload and cleared by the DB once terminal audit finalization succeeds or is deliberately policy-skipped. */
     metadata: jsonb('metadata'),
     idempotencyKey: text('idempotency_key').notNull(),
+    /** Immutable digest of the logical operation. It survives payload minimization so one key cannot alias different work. */
+    operationFingerprint: text('operation_fingerprint'),
+    /** Stable state domain used to prevent an older retry from overwriting a newer intent for the same remote entity. */
+    supersessionKey: text('supersession_key'),
     status: text('status', { enum: ['pending', 'in_progress', 'succeeded', 'failed', 'unknown'] }).notNull().default('pending'),
     attemptCount: integer('attempt_count').notNull().default(0),
     /** Set only once the row leaves `pending`/`in_progress` for a terminal-ish state. */
@@ -81,9 +87,10 @@ export const pendingOperations = moderationSchema.table(
     updatedAt: updatedAt(),
   },
   (table) => [
-    uniqueIndex('pending_operations_idempotency_key_idx').on(table.idempotencyKey),
-    index('pending_operations_status_next_attempt_idx').on(table.status, table.nextAttemptAt),
-    index('pending_operations_lease_idx').on(table.status, table.leaseExpiresAt),
-    index('pending_operations_chat_idx').on(table.chatId),
+    uniqueIndex('pending_operations_owner_idempotency_key_idx').on(table.ownerId, table.idempotencyKey),
+    index('pending_operations_owner_status_next_attempt_idx').on(table.ownerId, table.status, table.nextAttemptAt),
+    index('pending_operations_owner_lease_idx').on(table.ownerId, table.status, table.leaseExpiresAt),
+    index('pending_operations_owner_chat_idx').on(table.ownerId, table.chatId),
+    index('pending_operations_owner_supersession_created_idx').on(table.ownerId, table.supersessionKey, table.createdAt),
   ],
 );

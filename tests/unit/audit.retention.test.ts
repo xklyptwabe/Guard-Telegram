@@ -24,14 +24,15 @@ describe('audit retention batch job', () => {
     );
   });
 
-  it('uses bounded cleanup SQL and preserves events whose delivery outbox is not terminal', () => {
+  it('uses bounded cleanup SQL, purges delivered rows, and lets pending outbox debt survive via ON DELETE SET NULL', () => {
     const dialect = new PgDialect();
     const query = dialect.sqlToQuery(expiredAuditEventsDeleteQuery(new Date('2026-08-06T10:00:00.000Z'), 100)).sql;
 
     expect(query).toContain('LIMIT $2');
     expect(query).toContain('DELETE FROM "audit"."events" AS event');
     expect(query).toContain('"audit"."outbox"');
-    expect(query).toContain('box."status" <> \'delivered\'');
+    expect(query).toContain('box."status" = \'delivered\'');
+    expect(query).not.toContain('NOT EXISTS');
     expect(query).not.toMatch(/\bFOR\s+UPDATE\b/i);
     expect(query).not.toMatch(/\bLOCK\s+TABLE\b/i);
     expect(query).not.toMatch(/\bTRUNCATE\b/i);

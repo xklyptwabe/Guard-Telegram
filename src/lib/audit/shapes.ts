@@ -86,6 +86,7 @@ export const memberStatusSnapshotSchema = memberStatusChangedSchema.extend({
 
 export const botMembershipChangedSchema = z.object({
   chatId: z.string().min(1),
+  botId: z.string().min(1),
   status: z.enum(['member', 'administrator', 'left', 'kicked']),
 });
 

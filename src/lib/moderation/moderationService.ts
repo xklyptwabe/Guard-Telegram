@@ -307,6 +307,7 @@ export class ModerationService {
         kind,
         chatId: input.chatId,
         idempotencyKey,
+        supersessionKey: `moderation.member-state:${input.chatId}:${input.targetUserId}`,
         requestPayload,
         auditEvent: { eventType: 'moderation.action', eventVersion: 'v1', moduleId: MODULE_IDS.moderation },
         metadata,

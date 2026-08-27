@@ -13,7 +13,11 @@ import { runWithUpdateContext } from '../../src/lib/context.js';
 import { makeIntegrationAuditFinalizer } from '../../src/lib/integrations/externalOperationGateway.js';
 import type { Logger } from '../../src/lib/logger.js';
 import { ModerationService } from '../../src/lib/moderation/moderationService.js';
-import { PendingOperationResolvers, PendingOperationsOutbox } from '../../src/lib/moderation/pendingOperationsOutbox.js';
+import {
+  PendingOperationIdempotencyConflictError,
+  PendingOperationResolvers,
+  PendingOperationsOutbox,
+} from '../../src/lib/moderation/pendingOperationsOutbox.js';
 
 const testDatabaseUrl = process.env.TEST_DATABASE_URL;
 
@@ -243,6 +247,60 @@ describe.skipIf(!testDatabaseUrl)('BOTS-9 blockers: real-DB verification', () =>
     // tombstone after the sanitized audit has been written.
     const [reasonRow] = await client.db.select().from(pendingOperations).where(eq(pendingOperations.idempotencyKey, 'moderation.action:telegram-update:42:9001:-100900:2:ban'));
     expect(reasonRow?.metadata).toEqual({});
+  });
+
+  it('scopes recovery claims by owner and allows the same logical key for different bots', async () => {
+    const resolvers = new PendingOperationResolvers();
+    const ownerAExecutor = vi.fn(async () => ({ owner: 'a' }));
+    const ownerBExecutor = vi.fn(async () => ({ owner: 'b' }));
+    const ownerA = new PendingOperationsOutbox(client.db, silentLogger(), resolvers, undefined, undefined, undefined, 'bot-a');
+    const ownerB = new PendingOperationsOutbox(client.db, silentLogger(), resolvers, undefined, undefined, undefined, 'bot-b');
+
+    await client.db.insert(pendingOperations).values({
+      ownerId: 'bot-a',
+      kind: 'telegram.banChatMember',
+      chatId: '-100900',
+      idempotencyKey: 'shared-update-key',
+      operationFingerprint: 'legacy-test-row',
+      requestPayload: { chat_id: -100900, user_id: 1 },
+      status: 'pending',
+    });
+    resolvers.register('telegram.banChatMember', ownerBExecutor);
+
+    await ownerB.recoverPending();
+    expect(ownerBExecutor).not.toHaveBeenCalled();
+    expect((await client.db.select().from(pendingOperations).where(eq(pendingOperations.ownerId, 'bot-a')))[0]?.status).toBe('pending');
+
+    resolvers.register('telegram.banChatMember', ownerAExecutor);
+    await ownerA.recoverPending();
+    expect(ownerAExecutor).toHaveBeenCalledTimes(1);
+
+    await expect(
+      ownerB.execute(
+        { kind: 'telegram.banChatMember', chatId: '-100900', idempotencyKey: 'shared-update-key', requestPayload: { chat_id: -100900, user_id: 2 } },
+        ownerBExecutor,
+      ),
+    ).resolves.toMatchObject({ outcome: { status: 'succeeded' }, duplicate: false });
+    const rows = await client.db.select({ ownerId: pendingOperations.ownerId }).from(pendingOperations).where(eq(pendingOperations.idempotencyKey, 'shared-update-key'));
+    expect(rows.map((row) => row.ownerId).sort()).toEqual(['bot-a', 'bot-b']);
+  });
+
+  it('rejects a conflicting operation behind an existing owner-scoped idempotency key', async () => {
+    const resolvers = new PendingOperationResolvers();
+    const outbox = new PendingOperationsOutbox(client.db, silentLogger(), resolvers, undefined, undefined, undefined, 'bot-a');
+    const executor = vi.fn(async () => ({ ok: true }));
+
+    await outbox.execute(
+      { kind: 'telegram.banChatMember', chatId: '-100900', idempotencyKey: 'conflicting-key', requestPayload: { chat_id: -100900, user_id: 1 } },
+      executor,
+    );
+    await expect(
+      outbox.execute(
+        { kind: 'telegram.unbanChatMember', chatId: '-100901', idempotencyKey: 'conflicting-key', requestPayload: { chat_id: -100901, user_id: 2 } },
+        executor,
+      ),
+    ).rejects.toBeInstanceOf(PendingOperationIdempotencyConflictError);
+    expect(executor).toHaveBeenCalledTimes(1);
   });
 
   it('BLOCKER-3: a restrictive audit policy cannot remove the recovery envelope required to finalize a moderation outbox row', async () => {

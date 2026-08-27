@@ -85,9 +85,16 @@ describe('integration write-ahead gateway (BOTS-9 review BLOCKER-3)', () => {
     const outbox = new PendingOperationsOutbox(db as never, logger(), resolvers);
     const { audit, calls } = fakeAuditService();
     const finalizer = makeIntegrationAuditFinalizer(audit, logger());
+    const input = {
+      kind: 'rabbitmq.publish',
+      chatId: 'platform',
+      idempotencyKey: 'rabbitmq.publish:env-1',
+      requestPayload: { envelope: { id: 'env-1', type: 'x.y', attempt: 0, payload: null } },
+      metadata: { integrationId: 'rabbitmq', action: 'x.y', targetType: 'queue', targetId: 'ns.p.actions' },
+    } as const;
 
     const first = await outbox.execute(
-      { kind: 'rabbitmq.publish', chatId: 'platform', idempotencyKey: 'rabbitmq.publish:env-1', requestPayload: { envelope: { id: 'env-1', type: 'x.y', attempt: 0, payload: null } }, metadata: { integrationId: 'rabbitmq', action: 'x.y', targetType: 'queue', targetId: 'ns.p.actions' } },
+      input,
       vi.fn(async () => ({ messageId: 'env-1' })),
       finalizer,
     );
@@ -101,7 +108,7 @@ describe('integration write-ahead gateway (BOTS-9 review BLOCKER-3)', () => {
     // tombstone) the finalizer is NOT re-invoked at all — an audit event
     // that once existed must never be resurrected after retention purges it.
     await outbox.execute(
-      { kind: 'rabbitmq.publish', chatId: 'platform', idempotencyKey: 'rabbitmq.publish:env-1', requestPayload: {}, metadata: {} },
+      input,
       vi.fn(),
       finalizer,
     );
@@ -113,7 +120,7 @@ describe('integration write-ahead gateway (BOTS-9 review BLOCKER-3)', () => {
     outbox.setMetadataSanitizer(async () => ({}));
     const { audit, calls } = fakeAuditService();
     const finalizer = makeIntegrationAuditFinalizer(audit, logger());
-    const recoveryMetadata = { integrationId: 'rabbitmq', action: 'x.y', targetType: 'queue', targetId: 'ns.p.actions' };
+    const recoveryMetadata = { integrationId: 'rabbitmq', action: 'x.y', targetType: 'queue', targetId: 'ns.p.actions', moduleId: 'moderation' };
 
     const result = await outbox.execute(
       {
@@ -131,6 +138,7 @@ describe('integration write-ahead gateway (BOTS-9 review BLOCKER-3)', () => {
 
     expect(result.auditFinalized).toBe(true);
     expect(calls).toHaveLength(1);
+    expect(calls[0]?.input.moduleId).toBe('moderation');
     expect(db.rows[0]?.metadata).toEqual({ formatVersion: 1, audit: {}, recovery: recoveryMetadata });
   });
 
@@ -141,8 +149,8 @@ describe('integration write-ahead gateway (BOTS-9 review BLOCKER-3)', () => {
     const command: PendingOperationFinalizer = vi.fn(async () => ({ status: 'recorded' as const }));
     const finalizer = buildOutboxFinalizer(moderation, integration, command);
 
-    const telegramRow = { id: 'r1', kind: 'telegram.banChatMember', chatId: 'c', requestPayload: {}, metadata: {}, recoveryMetadata: {}, idempotencyKey: 'k1', status: 'succeeded' as const, attemptCount: 1, nextAttemptAt: null, leaseExpiresAt: null, result: null, auditStatus: 'pending' };
-    const s3Row = { id: 'r2', kind: 's3.putObject', chatId: 'platform', requestPayload: {}, metadata: {}, recoveryMetadata: {}, idempotencyKey: 'k2', status: 'succeeded' as const, attemptCount: 1, nextAttemptAt: null, leaseExpiresAt: null, result: null, auditStatus: 'pending' };
+    const telegramRow = { id: 'r1', kind: 'telegram.banChatMember', chatId: 'c', requestPayload: {}, metadata: {}, recoveryMetadata: {}, idempotencyKey: 'k1', status: 'succeeded' as const, attemptCount: 1, nextAttemptAt: null, leaseExpiresAt: null, result: null, createdAt: new Date(1), auditStatus: 'pending' };
+    const s3Row = { id: 'r2', kind: 's3.putObject', chatId: 'platform', requestPayload: {}, metadata: {}, recoveryMetadata: {}, idempotencyKey: 'k2', status: 'succeeded' as const, attemptCount: 1, nextAttemptAt: null, leaseExpiresAt: null, result: null, createdAt: new Date(2), auditStatus: 'pending' };
     const commandRow = { ...s3Row, id: 'r3', kind: 'command.audit', chatId: 'c', idempotencyKey: 'k3' };
     const outcome = { status: 'succeeded' as const };
 

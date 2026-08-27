@@ -6,7 +6,7 @@ import { buildDrizzleOrmMock, FakePendingOperationsDb, fakeLogger } from './test
 vi.mock('drizzle-orm', async (importOriginal) => buildDrizzleOrmMock(await importOriginal<typeof import('drizzle-orm')>()));
 
 const { pendingOperations } = await import('../../src/db/schema/moderation.js');
-const { PendingOperationResolvers, PendingOperationsOutbox } = await import('../../src/lib/moderation/pendingOperationsOutbox.js');
+const { PendingOperationIdempotencyConflictError, PendingOperationResolvers, PendingOperationsOutbox } = await import('../../src/lib/moderation/pendingOperationsOutbox.js');
 
 function logger(): Logger {
   return fakeLogger() as unknown as Logger;
@@ -34,6 +34,111 @@ describe('PendingOperationsOutbox', () => {
     expect(db.rows[0]?.status).toBe('succeeded');
     // write-ahead really happened before the call resolved: exactly one row for this operation.
     expect(db.rows).toHaveLength(1);
+  });
+
+  it('rejects reuse of one idempotency key for a different logical operation', async () => {
+    const outbox = new PendingOperationsOutbox(db as never, logger(), resolvers);
+    const firstExecutor = vi.fn(async () => ({ ok: true }));
+    const conflictingExecutor = vi.fn(async () => ({ ok: true }));
+
+    await outbox.execute(
+      { kind: 'telegram.banChatMember', chatId: 'chat-1', idempotencyKey: 'shared-key', requestPayload: { chat_id: 1, user_id: 2 } },
+      firstExecutor,
+    );
+
+    await expect(
+      outbox.execute(
+        { kind: 'telegram.unbanChatMember', chatId: 'chat-2', idempotencyKey: 'shared-key', requestPayload: { chat_id: 2, user_id: 3 } },
+        conflictingExecutor,
+      ),
+    ).rejects.toBeInstanceOf(PendingOperationIdempotencyConflictError);
+    expect(firstExecutor).toHaveBeenCalledTimes(1);
+    expect(conflictingExecutor).not.toHaveBeenCalled();
+    expect(db.rows).toHaveLength(1);
+  });
+
+  it('canonicalizes operation payload keys before comparing an idempotent redelivery', async () => {
+    const outbox = new PendingOperationsOutbox(db as never, logger(), resolvers);
+    const firstExecutor = vi.fn(async () => ({ ok: true }));
+    const duplicateExecutor = vi.fn(async () => ({ ok: true }));
+
+    await outbox.execute(
+      { kind: 'telegram.banChatMember', chatId: 'chat-1', idempotencyKey: 'canonical-key', requestPayload: { chat_id: 1, user_id: 2 } },
+      firstExecutor,
+    );
+    const duplicate = await outbox.execute(
+      { kind: 'telegram.banChatMember', chatId: 'chat-1', idempotencyKey: 'canonical-key', requestPayload: { user_id: 2, chat_id: 1 } },
+      duplicateExecutor,
+    );
+
+    expect(duplicate.duplicate).toBe(true);
+    expect(duplicateExecutor).not.toHaveBeenCalled();
+  });
+
+  it('only recovers pending operations owned by the current bot', async () => {
+    const recoveryExecutor = vi.fn(async () => ({ ok: true }));
+    resolvers.register('telegram.banChatMember', recoveryExecutor);
+    const ownerA = new PendingOperationsOutbox(db as never, logger(), resolvers, undefined, undefined, undefined, 'bot-a');
+    const ownerB = new PendingOperationsOutbox(db as never, logger(), resolvers, undefined, undefined, undefined, 'bot-b');
+    const initialExecutor = vi.fn(async () => {
+      throw new Error('temporary network failure');
+    });
+
+    await ownerA.execute(
+      { kind: 'telegram.banChatMember', chatId: 'chat-1', idempotencyKey: 'owned-key', requestPayload: { chat_id: 1, user_id: 2 } },
+      initialExecutor,
+    );
+    db.rows[0]!.status = 'pending';
+    db.rows[0]!.nextAttemptAt = null;
+
+    await ownerB.recoverPending();
+    expect(recoveryExecutor).not.toHaveBeenCalled();
+    expect(db.rows[0]?.status).toBe('pending');
+
+    await ownerA.recoverPending();
+    expect(recoveryExecutor).toHaveBeenCalledTimes(1);
+    expect(db.rows[0]?.status).toBe('succeeded');
+  });
+
+  it('uses a matching finalized legacy tombstone on post-upgrade redelivery', async () => {
+    const input = {
+      kind: 'telegram.banChatMember',
+      chatId: 'chat-1',
+      idempotencyKey: 'moderation.action:telegram-update:bot-a:77:chat-1:2:ban',
+      requestPayload: { chat_id: 1, user_id: 2 },
+    };
+    const legacy = new PendingOperationsOutbox(db as never, logger(), resolvers);
+    await legacy.execute(input, vi.fn(async () => ({ ok: true })), vi.fn(async () => ({ status: 'recorded' as const })));
+    db.rows[0]!.operationFingerprint = null;
+
+    const executor = vi.fn(async () => ({ ok: true }));
+    const current = new PendingOperationsOutbox(db as never, logger(), resolvers, undefined, undefined, undefined, 'bot-a');
+    const result = await current.execute(input, executor, vi.fn(async () => ({ status: 'recorded' as const })));
+
+    expect(result.duplicate).toBe(true);
+    expect(executor).not.toHaveBeenCalled();
+    expect(db.rows).toHaveLength(1);
+    expect(db.rows[0]?.ownerId).toBe('legacy');
+  });
+
+  it('does not let another bot consume a legacy key that names a different owner', async () => {
+    const input = {
+      kind: 'telegram.banChatMember',
+      chatId: 'chat-1',
+      idempotencyKey: 'moderation.action:telegram-update:bot-a:77:chat-1:2:ban',
+      requestPayload: { chat_id: 1, user_id: 2 },
+    };
+    const legacy = new PendingOperationsOutbox(db as never, logger(), resolvers);
+    await legacy.execute(input, vi.fn(async () => ({ ok: true })), vi.fn(async () => ({ status: 'recorded' as const })));
+    db.rows[0]!.operationFingerprint = null;
+
+    const executor = vi.fn(async () => ({ ok: true }));
+    const otherBot = new PendingOperationsOutbox(db as never, logger(), resolvers, undefined, undefined, undefined, 'bot-b');
+    const result = await otherBot.execute(input, executor, vi.fn(async () => ({ status: 'recorded' as const })));
+
+    expect(result.duplicate).toBe(false);
+    expect(executor).toHaveBeenCalledTimes(1);
+    expect(db.rows.map((row) => row.ownerId)).toEqual(['legacy', 'bot-b']);
   });
 
   it('sanitizes WAL metadata through the configured policy-aware sanitizer before insert', async () => {
@@ -531,5 +636,66 @@ describe('PendingOperationsOutbox', () => {
 
     expect(result.isFinal).toBe(false);
     expect(result.auditFinalized).toBe(true);
+  });
+
+  it('does not replay an older moderation intent after a newer opposite intent', async () => {
+    const recoveryBan = vi.fn(async () => ({ ok: true }));
+    resolvers.register('telegram.banChatMember', recoveryBan, { retryAfterUnknown: true });
+    resolvers.register('telegram.unbanChatMember', vi.fn(async () => ({ ok: true })), { retryAfterUnknown: true });
+    const outbox = new PendingOperationsOutbox(db as never, logger(), resolvers, 3, 10, undefined, 'bot-a');
+    outbox.setDefaultFinalizer(vi.fn(async () => ({ status: 'recorded' as const })));
+    const supersessionKey = 'moderation.member-state:chat-1:2';
+
+    await outbox.execute(
+      { kind: 'telegram.banChatMember', chatId: 'chat-1', idempotencyKey: 'old-ban', supersessionKey, requestPayload: { chat_id: 1, user_id: 2 } },
+      vi.fn(async () => {
+        throw new Error('timeout after possible delivery');
+      }),
+    );
+    await outbox.execute(
+      { kind: 'telegram.unbanChatMember', chatId: 'chat-1', idempotencyKey: 'new-unban', supersessionKey, requestPayload: { chat_id: 1, user_id: 2 } },
+      vi.fn(async () => ({ ok: true })),
+    );
+
+    db.rows[0]!.nextAttemptAt = new Date(Date.now() - 1);
+    await outbox.recoverPending();
+
+    expect(recoveryBan).not.toHaveBeenCalled();
+    expect(db.rows[0]).toMatchObject({ status: 'unknown', nextAttemptAt: null, result: { reason: 'superseded_by_newer_intent' }, auditStatus: 'written' });
+    expect(db.rows[1]?.status).toBe('succeeded');
+  });
+
+  it('keeps the current command menu last when an older setMyCommands attempt recovers', async () => {
+    const appliedMenus: string[] = [];
+    const recovery = vi.fn(async (payload: Record<string, unknown>) => {
+      appliedMenus.push(payload.version as string);
+      return { ok: true };
+    });
+    resolvers.register('integration.telegram.setMyCommands', recovery, { retryAfterUnknown: true });
+    const outbox = new PendingOperationsOutbox(db as never, logger(), resolvers, 3, 10, undefined, 'bot-a');
+    outbox.setDefaultFinalizer(vi.fn(async () => ({ status: 'recorded' as const })));
+    const supersessionKey = 'telegram.setMyCommands:default';
+
+    await outbox.execute(
+      { kind: 'integration.telegram.setMyCommands', chatId: 'platform', idempotencyKey: 'old-menu', supersessionKey, requestPayload: { version: 'old' } },
+      vi.fn(async (payload: Record<string, unknown>) => {
+        appliedMenus.push(payload.version as string);
+        throw new Error('timeout after possible delivery');
+      }),
+    );
+    await outbox.execute(
+      { kind: 'integration.telegram.setMyCommands', chatId: 'platform', idempotencyKey: 'new-menu', supersessionKey, requestPayload: { version: 'new' } },
+      vi.fn(async (payload: Record<string, unknown>) => {
+        appliedMenus.push(payload.version as string);
+        return { ok: true };
+      }),
+    );
+
+    db.rows[0]!.nextAttemptAt = new Date(Date.now() - 1);
+    await outbox.recoverPending();
+
+    expect(recovery).not.toHaveBeenCalled();
+    expect(appliedMenus.at(-1)).toBe('new');
+    expect(db.rows[0]).toMatchObject({ status: 'unknown', nextAttemptAt: null, result: { reason: 'superseded_by_newer_intent' } });
   });
 });
