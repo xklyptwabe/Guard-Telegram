@@ -6,7 +6,7 @@ import { createDatabase, type DatabaseClient } from '../../src/db/client.js';
 
 const testDatabaseUrl = process.env.TEST_DATABASE_URL;
 
-describe.skipIf(!testDatabaseUrl)('telegram_bot role privileges (0019/0020/0023)', () => {
+describe.skipIf(!testDatabaseUrl)('telegram_bot role privileges (0019/0020/0023/0030)', () => {
   let client: DatabaseClient;
 
   beforeAll(() => {
@@ -80,10 +80,38 @@ describe.skipIf(!testDatabaseUrl)('telegram_bot role privileges (0019/0020/0023)
       SELECT
         (SELECT relrowsecurity FROM pg_class WHERE oid = 'public.telegram_chats'::regclass) AS "chatsRls",
         (SELECT relrowsecurity FROM pg_class WHERE oid = 'public.telegram_users'::regclass) AS "usersRls",
-        has_table_privilege('anon', 'public.telegram_chats', 'SELECT') AS "anonChatsSelect",
-        has_table_privilege('authenticated', 'public.telegram_chats', 'DELETE') AS "authenticatedChatsDelete",
-        has_table_privilege('anon', 'public.telegram_users', 'INSERT') AS "anonUsersInsert",
-        has_table_privilege('authenticated', 'public.telegram_users', 'UPDATE') AS "authenticatedUsersUpdate",
+        COALESCE(
+          has_table_privilege(
+            (SELECT oid FROM pg_roles WHERE rolname = 'anon'),
+            'public.telegram_chats',
+            'SELECT'
+          ),
+          false
+        ) AS "anonChatsSelect",
+        COALESCE(
+          has_table_privilege(
+            (SELECT oid FROM pg_roles WHERE rolname = 'authenticated'),
+            'public.telegram_chats',
+            'DELETE'
+          ),
+          false
+        ) AS "authenticatedChatsDelete",
+        COALESCE(
+          has_table_privilege(
+            (SELECT oid FROM pg_roles WHERE rolname = 'anon'),
+            'public.telegram_users',
+            'INSERT'
+          ),
+          false
+        ) AS "anonUsersInsert",
+        COALESCE(
+          has_table_privilege(
+            (SELECT oid FROM pg_roles WHERE rolname = 'authenticated'),
+            'public.telegram_users',
+            'UPDATE'
+          ),
+          false
+        ) AS "authenticatedUsersUpdate",
         has_table_privilege('telegram_bot', 'public.telegram_chats', 'SELECT,INSERT,UPDATE') AS "botChatsWrite",
         has_table_privilege('telegram_bot', 'public.telegram_chats', 'DELETE') AS "botChatsDelete",
         has_table_privilege('telegram_bot', 'public.telegram_users', 'SELECT,INSERT,UPDATE') AS "botUsersWrite",
