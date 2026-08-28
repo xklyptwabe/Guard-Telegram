@@ -1,0 +1,22 @@
+{
+  "update_id": 131001,
+  "chat_member": {
+    "chat": { "id": -1003131313, "type": "supergroup", "title": "BOTS-13 E2E Chat A" },
+    "from": { "id": 999001, "is_bot": false, "first_name": "OwnerA", "username": "owner_a" },
+    "date": 1780000001,
+    "old_chat_member": {
+      "status": "member",
+      "user": { "id": 222001, "is_bot": false, "first_name": "Alice", "username": "alice13" }
+    },
+    "new_chat_member": {
+      "status": "administrator",
+      "user": { "id": 222001, "is_bot": false, "first_name": "Alice", "username": "alice13" },
+      "can_be_edited": false,
+      "can_manage_chat": true,
+      "can_delete_messages": true,
+      "can_restrict_members": true,
+      "can_promote_members": false,
+      "is_anonymous": false
+    }
+  }
+}

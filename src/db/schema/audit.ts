@@ -82,7 +82,7 @@ export const events = auditSchema.table(
     occurredAt: timestamp('occurred_at', { withTimezone: true }).notNull(),
     recordedAt: timestamp('recorded_at', { withTimezone: true }).defaultNow().notNull(),
     source: text('source').notNull(),
-    status: text('status', { enum: ['recorded', 'failed'] }).notNull().default('recorded'),
+    status: text('status', { enum: ['recorded', 'failed', 'unknown'] }).notNull().default('recorded'),
     tenantId: text('tenant_id').notNull(),
     actorId: text('actor_id'),
     actorType: text('actor_type'),
@@ -112,6 +112,13 @@ export const events = auditSchema.table(
     index('events_subject_sequence_idx').on(table.tenantId, table.subjectType, table.subjectId, table.subjectSequence),
     index('events_correlation_idx').on(table.correlationId),
     index('events_type_occurred_idx').on(table.eventType, table.occurredAt.desc()),
+    foreignKey({
+      name: 'events_event_type_version_event_types_fk',
+      columns: [table.eventType, table.eventVersion],
+      foreignColumns: [eventTypes.eventType, eventTypes.eventVersion],
+    })
+      .onUpdate('cascade')
+      .onDelete('restrict'),
   ],
 );
 
@@ -122,7 +129,8 @@ export const entitySnapshots = auditSchema.table(
     entityType: text('entity_type').notNull(),
     entityId: text('entity_id').notNull(),
     snapshotStatus: text('snapshot_status', { enum: ['current', 'archived'] }).notNull().default('current'),
-    snapshotData: jsonb('snapshot_data').notNull(),
+    /** NULL means the entity has never been observed; never substitute an empty/fabricated JSON snapshot. */
+    snapshotData: jsonb('snapshot_data'),
     lastSubjectSequence: bigint('last_subject_sequence', { mode: 'number' }).notNull(),
     lastEventId: uuid('last_event_id'),
     createdAt: createdAt(),
@@ -135,9 +143,7 @@ export const outbox = auditSchema.table(
   'outbox',
   {
     id: uuid('id').defaultRandom().primaryKey(),
-    eventId: uuid('event_id')
-      .notNull()
-      .references(() => events.id, { onDelete: 'cascade' }),
+    eventId: uuid('event_id').references(() => events.id, { onDelete: 'set null' }),
     destination: text('destination').notNull(),
     payload: jsonb('payload').notNull(),
     status: text('status', { enum: ['pending', 'delivered', 'failed'] }).notNull().default('pending'),
@@ -146,5 +152,5 @@ export const outbox = auditSchema.table(
     createdAt: createdAt(),
     updatedAt: updatedAt(),
   },
-  (table) => [index('outbox_status_next_attempt_idx').on(table.status, table.nextAttemptAt)],
+  (table) => [index('outbox_status_next_attempt_idx').on(table.status, table.nextAttemptAt), index('outbox_event_idx').on(table.eventId)],
 );

@@ -243,19 +243,31 @@ describe('toDownstreamInput', () => {
       version: 1,
       operation: 'noop',
       before: notApplicable(),
-      after: observed({ integrationId: 'i1', action: 'call', targetType: 'webhook', targetId: 'wh-1', statusCode: 200, success: true }),
+      after: observed({ integrationId: 'i1', action: 'call', targetType: 'webhook', targetId: 'wh-1', statusCode: 200, outcome: 'succeeded', success: true }),
     });
     const recordB = processor.process({
       name: 'integration.action',
       version: 1,
       operation: 'noop',
       before: notApplicable(),
-      after: observed({ integrationId: 'i1', action: 'call', targetType: 'webhook', targetId: 'wh-1', statusCode: 500, success: false }),
+      after: observed({ integrationId: 'i1', action: 'call', targetType: 'webhook', targetId: 'wh-1', statusCode: 500, outcome: 'failed', success: false }),
     });
 
     // Same identity (integrationId/targetId), genuinely different payload
     // (statusCode/success differ) — must produce different keys.
     expect(toDownstreamInput(recordA).idempotencyKey).not.toBe(toDownstreamInput(recordB).idempotencyKey);
+  });
+
+  it.each(['failed', 'unknown'] as const)('maps operation %s to the canonical event status', (operation) => {
+    const record = processor.process({
+      name: 'integration.action',
+      version: 1,
+      operation,
+      before: notApplicable(),
+      after: observed({ integrationId: 'i1', action: 'call', targetType: 'webhook', targetId: 'wh-1', outcome: operation, success: false }),
+    });
+
+    expect(toDownstreamInput(record).status).toBe(operation);
   });
 });
 

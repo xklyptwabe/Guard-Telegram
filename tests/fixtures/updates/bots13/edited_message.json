@@ -1,0 +1,11 @@
+{
+  "update_id": 131003,
+  "edited_message": {
+    "message_id": 9001,
+    "date": 1780000003,
+    "edit_date": 1780000060,
+    "chat": { "id": -1003131313, "type": "supergroup", "title": "BOTS-13 E2E Chat A" },
+    "from": { "id": 222001, "is_bot": false, "first_name": "Alice", "username": "alice13" },
+    "text": "<script>alert('bots13')</script> edited text"
+  }
+}

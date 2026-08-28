@@ -125,6 +125,128 @@ describe('AuditService persistence safety', () => {
     expect(JSON.stringify(database.captured.event)).not.toContain('policy-sensitive-reason');
   });
 
+  it('does not persist snapshot values through changes in metadata-only mode', async () => {
+    const database = fakeAuditDatabase({ snapshotMode: 'metadata' });
+    const audit = new AuditService(database.db as never);
+
+    await audit.recordEntityChange(
+      {
+        tenantId: 'chat-1',
+        subjectType: 'chat_module_state',
+        subjectId: 'chat-1:moderation',
+        eventType: 'module.state.changed',
+        eventVersion: 'v1',
+        category: 'module',
+        source: 'unit-test',
+        idempotencyKey: 'unit:audit-service:metadata-mode',
+      },
+      async () => ({
+        before: { enabled: false, source: 'override' },
+        after: { enabled: true, source: 'override' },
+        changes: { status: 'computed', fields: { enabled: { before: false, after: true } } },
+        snapshotData: { chatId: 'chat-1', moduleId: 'moderation', enabled: true, source: 'override' },
+      }),
+    );
+
+    expect(database.captured.event).toMatchObject({ before: undefined, after: undefined, beforeSnapshotStatus: 'redacted', afterSnapshotStatus: 'redacted' });
+    expect(database.captured.event?.changes).toBeUndefined();
+    expect(database.captured.outbox?.changes).toBeUndefined();
+  });
+
+  it('applies effective policy allowlist and masking before outbox metadata is persisted', async () => {
+    const database = fakePolicyReader({
+      allowlist: ['action', 'actorUserId', 'targetUserId'],
+      masking: ['actorUserId'],
+    });
+    const audit = new AuditService(database as never);
+
+    const metadata = await audit.maskOutboxMetadata({
+      tenantId: 'chat-1',
+      eventType: 'moderation.action',
+      eventVersion: 'v1',
+      moduleId: 'moderation',
+      metadata: {
+        action: 'ban',
+        actorUserId: '9',
+        targetUserId: '2',
+        reason: 'policy-hidden-reason',
+        arbitrary: 'policy-hidden-arbitrary',
+      },
+    });
+
+    expect(metadata).toEqual({ action: 'ban', actorUserId: '[redacted]', targetUserId: '2' });
+    expect(JSON.stringify(metadata)).not.toContain('policy-hidden-reason');
+    expect(JSON.stringify(metadata)).not.toContain('policy-hidden-arbitrary');
+  });
+
+  it('applies effective policy allowlist and masking before an observed message snapshot is persisted', async () => {
+    const database = fakeSnapshotDatabase({
+      allowlist: ['chatId', 'messageId', 'userId', 'editedAt', 'observedUpdateId', 'text'],
+      masking: ['text'],
+    });
+    const audit = new AuditService(database.db as never);
+
+    await audit.observeCurrentSnapshot({
+      tenantId: 'chat-1',
+      subjectType: 'message',
+      subjectId: 'chat-1:message-1',
+      eventType: 'message.edited',
+      eventVersion: 'v1',
+      moduleId: 'message-audit',
+      snapshotData: {
+        chatId: 'chat-1',
+        messageId: 'message-1',
+        userId: 'user-1',
+        editedAt: '2026-08-24T10:00:00.000Z',
+        observedUpdateId: 101,
+        textLength: 23,
+        text: 'policy-sensitive-message',
+      },
+      observedUpdateId: 101,
+    });
+
+    expect(database.captured.snapshot).toEqual({
+      chatId: 'chat-1',
+      messageId: 'message-1',
+      userId: 'user-1',
+      editedAt: '2026-08-24T10:00:00.000Z',
+      observedUpdateId: 101,
+      text: '[redacted]',
+    });
+    expect(JSON.stringify(database.captured.snapshot)).not.toContain('policy-sensitive-message');
+    expect(database.captured.snapshot).not.toHaveProperty('textLength');
+  });
+
+  it.each([
+    ['disabled event', { enabled: false }],
+    ['metadata-only mode', { snapshotMode: 'metadata' as const }],
+  ])('does not persist an observed message snapshot under %s policy', async (_case, policyOverrides) => {
+    const database = fakeSnapshotDatabase(policyOverrides);
+    const audit = new AuditService(database.db as never);
+
+    await audit.observeCurrentSnapshot({
+      tenantId: 'chat-1',
+      subjectType: 'message',
+      subjectId: 'chat-1:message-1',
+      eventType: 'message.edited',
+      eventVersion: 'v1',
+      moduleId: 'message-audit',
+      snapshotData: {
+        chatId: 'chat-1',
+        messageId: 'message-1',
+        userId: 'user-1',
+        editedAt: '2026-08-24T10:00:00.000Z',
+        observedUpdateId: 101,
+        textLength: 23,
+        text: 'must-not-be-persisted',
+      },
+      observedUpdateId: 101,
+    });
+
+    expect(database.captured.insertCount).toBe(0);
+    expect(database.captured.snapshot).toBeUndefined();
+  });
+
   it('redacts forbidden values nested below allowed metadata and drops unsafe Telegram identifiers', async () => {
     const database = fakeAuditDatabase();
     const audit = new AuditService(database.db as never);
@@ -286,6 +408,89 @@ function fakeAuditDatabase(policyOverrides: Partial<AuditPolicyResolutionRow> = 
     },
   };
 
+  return {
+    captured,
+    db: { transaction: async (operation: (tx: typeof transaction) => Promise<unknown>) => operation(transaction) },
+  };
+}
+
+function fakePolicyReader(policyOverrides: Partial<AuditPolicyResolutionRow> = {}) {
+  const policy: AuditPolicyResolutionRow = {
+    policyId: 'unit:outbox-policy',
+    chatId: 'chat-1',
+    eventType: 'moderation.action',
+    eventVersion: 'v1',
+    moduleId: null,
+    enabled: true,
+    siteVisible: null,
+    snapshotMode: null,
+    allowlist: null,
+    masking: null,
+    retentionDays: null,
+    severity: null,
+    exportAllowed: null,
+    ...policyOverrides,
+  };
+  return {
+    select: () => ({
+      from: async () => [policy],
+    }),
+  };
+}
+
+function fakeSnapshotDatabase(policyOverrides: Partial<AuditPolicyResolutionRow> = {}) {
+  const policy: AuditPolicyResolutionRow = {
+    policyId: 'unit:message-snapshot-policy',
+    chatId: 'chat-1',
+    eventType: null,
+    eventVersion: null,
+    moduleId: 'message-audit',
+    enabled: true,
+    siteVisible: null,
+    snapshotMode: 'snapshot',
+    allowlist: null,
+    masking: null,
+    retentionDays: null,
+    severity: null,
+    exportAllowed: null,
+    ...policyOverrides,
+  };
+  const captured: { insertCount: number; snapshot: Record<string, unknown> | undefined } = {
+    insertCount: 0,
+    snapshot: undefined,
+  };
+  const transaction = {
+    select(selection: Record<string, unknown>) {
+      if ('policyId' in selection) return { from: async () => [policy] };
+      const query = {
+        from: () => query,
+        where: () => query,
+        limit: () => query,
+        for: async () => [{ snapshotData: {} }],
+      };
+      return query;
+    },
+    insert(table: unknown) {
+      if (table !== entitySnapshots) throw new Error('Unexpected table in observed snapshot test');
+      return {
+        values: () => ({
+          onConflictDoNothing: async () => {
+            captured.insertCount += 1;
+          },
+        }),
+      };
+    },
+    update(table: unknown) {
+      if (table !== entitySnapshots) throw new Error('Unexpected table in observed snapshot test');
+      return {
+        set: (value: { readonly snapshotData?: Record<string, unknown> }) => ({
+          where: async () => {
+            captured.snapshot = value.snapshotData;
+          },
+        }),
+      };
+    },
+  };
   return {
     captured,
     db: { transaction: async (operation: (tx: typeof transaction) => Promise<unknown>) => operation(transaction) },

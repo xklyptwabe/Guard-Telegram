@@ -449,7 +449,7 @@
       },
       "AuditEventStatus": {
         "type": "string",
-        "enum": ["recorded", "failed"]
+        "enum": ["recorded", "failed", "unknown"]
       },
       "AuditSeverity": {
         "type": "string",

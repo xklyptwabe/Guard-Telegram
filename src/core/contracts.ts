@@ -42,6 +42,14 @@ export interface TelegramBotModule {
   readonly description: string;
   readonly global: boolean;
   readonly defaultEnabled: boolean;
+  /**
+   * Modules whose removal would break the chat's own administration
+   * surface. Disabling such a module through `/module_disable` would lock
+   * the chat's admins out of module management entirely (found by the
+   * BOTS-13 post-acceptance bug hunt); `ModuleRegistry.setEnabled` refuses
+   * the operation for these.
+   */
+  readonly protectFromDisable?: boolean;
   readonly commands?: readonly TelegramCommandDefinition[];
   readonly updateHandlers?: readonly TelegramUpdateHandler[];
   onEnable?(chatId: string): Promise<void>;

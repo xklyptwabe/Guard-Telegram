@@ -4,6 +4,12 @@ import { Logger, redact } from '../../src/lib/logger.js';
 import { runWithUpdateContext } from '../../src/lib/context.js';
 
 describe('logging redaction', () => {
+  it('redacts bearer, password=, bot token and JWT inside free-text messages', () => {
+    expect(redact('Authorization Bearer REVIEW_BEARER_MARKER extra')).toContain('[REDACTED]');
+    expect(String(redact('password=REVIEW_PASSWORD_MARKER'))).not.toContain('REVIEW_PASSWORD_MARKER');
+    expect(String(redact('bot 123456:REVIEW_BOT_TOKEN_VALUE_HERE'))).not.toContain('REVIEW_BOT_TOKEN_VALUE_HERE');
+  });
+
   it('removes secret-bearing fields and URL credentials', () => {
     expect(redact({ botToken: 'secret', databaseUrl: 'postgres://user:password@host/db', nested: { authorization: 'Bearer value' } })).toEqual({
       botToken: '[REDACTED]',

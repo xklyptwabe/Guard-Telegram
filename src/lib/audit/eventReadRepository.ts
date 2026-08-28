@@ -3,7 +3,7 @@ import { z } from 'zod';
 
 import type { DrizzleDatabase } from '../../db/client.js';
 import { eventPolicies, events, eventTypes } from '../../db/schema/audit.js';
-import type { EventCategory } from './enums.js';
+import type { AuditEventStatus, EventCategory } from './enums.js';
 import {
   readAuditPolicyResolutionRows,
   resolveEffectiveAuditPolicyFromRows,
@@ -14,7 +14,7 @@ import { PLATFORM_TENANT_SENTINEL } from './serviceAdapter.js';
 export const AUDIT_EVENTS_DEFAULT_LIMIT = 50;
 export const AUDIT_EVENTS_MAX_LIMIT = 100;
 
-export type AuditEventStatus = 'recorded' | 'failed';
+export type { AuditEventStatus } from './enums.js';
 
 export interface AuditEventsReadScope {
   readonly systemAdmin: boolean;

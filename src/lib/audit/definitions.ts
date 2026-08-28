@@ -5,10 +5,12 @@ import {
   auditPolicyChangedSchema,
   auditRetentionCompletedSchema,
   botMembershipChangedSchema,
+  botMembershipSnapshotSchema,
   chatSettingsChangedSchema,
   commandExecutedSchema,
   integrationActionSchema,
   memberStatusChangedSchema,
+  memberStatusSnapshotSchema,
   messageDeletedSchema,
   messageEditedSchema,
   moderationActionSchema,
@@ -99,7 +101,13 @@ export const AUDIT_EVENT_DEFINITIONS: AuditEventDefinitions = {
     siteVisible: true,
     canBeDisabled: true,
     snapshotSchema: memberStatusChangedSchema,
-    allowlist: ['chatId', 'userId', 'status'],
+    sparseSnapshotSchema: memberStatusSnapshotSchema,
+    // 'observedAt' (Telegram's own `date` for the update) is what makes
+    // the out-of-order/staleness guard in memberAudit.ts actually work —
+    // see memberStatusSnapshotSchema's doc comment. 'observedUpdateId' is
+    // the round-2 equal-timestamp tie-breaker — it must reach the DB or
+    // the guard silently degrades (BOTS-13-style schema-stripping bug).
+    allowlist: ['chatId', 'userId', 'status', 'observedAt', 'observedUpdateId'],
   }),
 
   'bot.membership.changed': defineAuditEvent('bot.membership.changed', {
@@ -111,7 +119,8 @@ export const AUDIT_EVENT_DEFINITIONS: AuditEventDefinitions = {
     // Whether the bot itself is still in a chat is safety-critical operational data.
     canBeDisabled: false,
     snapshotSchema: botMembershipChangedSchema,
-    allowlist: ['chatId', 'status'],
+    sparseSnapshotSchema: botMembershipSnapshotSchema,
+    allowlist: ['chatId', 'botId', 'status', 'observedAt', 'observedUpdateId', 'rights'],
   }),
 
   'moderation.action': defineAuditEvent('moderation.action', {
@@ -123,7 +132,7 @@ export const AUDIT_EVENT_DEFINITIONS: AuditEventDefinitions = {
     // Accountability for moderation actions must not be switchable off.
     canBeDisabled: false,
     snapshotSchema: moderationActionSchema,
-    allowlist: ['chatId', 'targetUserId', 'actorUserId', 'action', 'reason', 'durationSeconds'],
+    allowlist: ['chatId', 'targetUserId', 'actorUserId', 'action', 'reason', 'durationSeconds', 'partialOutcome'],
   }),
 
   'message.edited': defineAuditEvent('message.edited', {
@@ -140,6 +149,7 @@ export const AUDIT_EVENT_DEFINITIONS: AuditEventDefinitions = {
       'messageId',
       'userId',
       'editedAt',
+      'observedUpdateId',
       'textLength',
       { field: 'text', when: (policy) => policy.allowMessageTextLogging },
     ],
@@ -184,7 +194,7 @@ export const AUDIT_EVENT_DEFINITIONS: AuditEventDefinitions = {
     siteVisible: false,
     canBeDisabled: true,
     snapshotSchema: integrationActionSchema,
-    allowlist: ['integrationId', 'action', 'targetType', 'targetId', 'statusCode', 'success'],
+    allowlist: ['integrationId', 'action', 'targetType', 'targetId', 'statusCode', 'outcome', 'success'],
   }),
 
   'audit.exported': defineAuditEvent('audit.exported', {

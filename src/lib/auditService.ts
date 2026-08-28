@@ -1,7 +1,7 @@
 import { and, eq } from 'drizzle-orm';
 
 import { getUpdateContext } from './context.js';
-import type { SnapshotStatus } from './audit/enums.js';
+import type { AuditEventStatus, SnapshotStatus } from './audit/enums.js';
 import {
   AUDIT_OPERATIONAL_METADATA_ALLOWLIST,
   applyAllowlist,
@@ -9,11 +9,13 @@ import {
   type AuditPolicyContext,
 } from './audit/masking.js';
 import { resolveEffectiveAuditPolicy, type EffectiveAuditPolicy } from './audit/policyResolution.js';
+import { AuditSnapshotValidationError } from './audit/errors.js';
 import {
   normalizeAuditMutationForPersistence,
   requireAuditPersistenceDefinition,
   type NormalizedAuditPersistenceMutation,
 } from './audit/persistenceValidation.js';
+import { auditEventRegistry } from './audit/registry.js';
 import type { DrizzleDatabase } from '../db/client.js';
 import { entitySnapshots, events, outbox } from '../db/schema/audit.js';
 
@@ -32,6 +34,7 @@ export interface AuditEventInput extends AuditIdentity {
   readonly category: string;
   readonly source: string;
   readonly idempotencyKey: string;
+  readonly status?: AuditEventStatus;
   readonly actorId?: string;
   readonly actorType?: string;
   readonly correlationId?: string;
@@ -49,17 +52,31 @@ export interface AuditChange<TSnapshot extends Record<string, unknown>> {
   readonly changes?: Record<string, unknown>;
   readonly metadata?: Record<string, unknown>;
   readonly snapshotStatus?: AuditEntitySnapshotStatus;
-  readonly snapshotData: TSnapshot;
+  readonly snapshotData: TSnapshot | null;
 }
 
 export type AuditMutationResult<TSnapshot extends Record<string, unknown>> = AuditChange<TSnapshot>;
 
-type AuditTransaction = Pick<DrizzleDatabase, 'select' | 'insert' | 'update' | 'delete' | 'execute'>;
+export type AuditTransaction = Pick<DrizzleDatabase, 'select' | 'insert' | 'update' | 'delete' | 'execute'>;
 
 export class AuditIdempotencyConflictError extends Error {
   public constructor() {
     super('Audit idempotency key is already associated with another operation.');
     this.name = 'AuditIdempotencyConflictError';
+  }
+}
+
+/**
+ * BOTS-9 review round-2 (BLOCKER-1): thrown when the resolved audit policy
+ * deliberately disables the event. Finalizers must map this to
+ * `{ status: 'policy_skipped' }` — the audit is *not* owed, the operation
+ * row becomes terminal for audit purposes — while any other (infrastructure)
+ * error keeps the audit owed and the outbox retries it.
+ */
+export class AuditPolicyDisabledError extends Error {
+  public constructor(eventType: string, eventVersion: string) {
+    super(`Audit policy is unavailable for ${eventType}@${eventVersion}`);
+    this.name = 'AuditPolicyDisabledError';
   }
 }
 
@@ -72,6 +89,108 @@ export class ForbiddenAuditValueError extends Error {
 
 export class AuditService {
   public constructor(private readonly db: DrizzleDatabase) {}
+
+  /** Apply BOTS-8 masking to outbox metadata before it is persisted. */
+  public async maskOutboxMetadata(input: {
+    readonly tenantId: string;
+    readonly eventType: string;
+    readonly eventVersion: string;
+    readonly moduleId?: string;
+    readonly metadata: Record<string, unknown>;
+  }): Promise<Record<string, unknown>> {
+    const policy = await resolveEffectiveAuditPolicy(this.db, {
+      eventType: input.eventType,
+      eventVersion: input.eventVersion,
+      chatId: input.tenantId,
+      ...(input.moduleId !== undefined ? { moduleId: input.moduleId } : {}),
+    });
+    const definition = requireAuditPersistenceDefinition({
+      eventType: input.eventType,
+      eventVersion: input.eventVersion,
+      category: policyCategory(input.eventType, input.eventVersion),
+    });
+    return applyAllowlist(input.metadata, definition.allowlist, {
+      allowMessageTextLogging: policy.values.allowlist.includes('text'),
+      allowlist: policy.values.allowlist,
+      ...(policy.values.masking.length > 0 ? { masking: policy.values.masking } : {}),
+    });
+  }
+
+  /**
+   * Persist the last observed subject snapshot without inventing an audit
+   * event (no message.created in the registry). Used for ordinary `message`
+   * updates so a later edit/delete has a real `before`.
+   */
+  public async observeCurrentSnapshot(input: {
+    readonly tenantId: string;
+    readonly subjectType: string;
+    readonly subjectId: string;
+    readonly eventType: string;
+    readonly eventVersion: string;
+    readonly moduleId?: string;
+    readonly snapshotData: Record<string, unknown>;
+    readonly observedUpdateId: number;
+  }): Promise<void> {
+    const snapshotWhere = and(
+      eq(entitySnapshots.tenantId, input.tenantId),
+      eq(entitySnapshots.entityType, input.subjectType),
+      eq(entitySnapshots.entityId, input.subjectId),
+    );
+    await this.db.transaction(async (tx) => {
+      const policy = await resolveEffectiveAuditPolicy(tx, {
+        eventType: input.eventType,
+        eventVersion: input.eventVersion,
+        chatId: input.tenantId,
+        ...(input.moduleId !== undefined ? { moduleId: input.moduleId } : {}),
+      });
+      if (!policy.values.enabled || policy.values.snapshotMode !== 'snapshot') return;
+      const definition = requireAuditPersistenceDefinition({
+        eventType: input.eventType,
+        eventVersion: input.eventVersion,
+        category: 'message',
+      });
+      const schema = definition.sparseSnapshotSchema ?? definition.snapshotSchema;
+      const parsed = schema.safeParse(input.snapshotData);
+      if (!parsed.success) {
+        throw new AuditSnapshotValidationError(definition.name, 'snapshotData', parsed.error.message);
+      }
+      const masked: Record<string, unknown> = applyAllowlist(
+        parsed.data as Record<string, unknown>,
+        definition.allowlist,
+        {
+          allowMessageTextLogging: policy.values.allowlist.includes('text'),
+          allowlist: policy.values.allowlist,
+          ...(policy.values.masking.length > 0 ? { masking: policy.values.masking } : {}),
+        },
+      );
+      await tx
+        .insert(entitySnapshots)
+        .values({
+          tenantId: input.tenantId,
+          entityType: input.subjectType,
+          entityId: input.subjectId,
+          snapshotStatus: 'current',
+          snapshotData: null,
+          lastSubjectSequence: 0,
+        })
+        .onConflictDoNothing({ target: [entitySnapshots.tenantId, entitySnapshots.entityType, entitySnapshots.entityId] });
+      const rows = await tx
+        .select({ snapshotData: entitySnapshots.snapshotData })
+        .from(entitySnapshots)
+        .where(snapshotWhere)
+        .limit(1)
+        .for('update');
+      const existing = rows[0]?.snapshotData as Record<string, unknown> | null | undefined;
+      const existingId = typeof existing?.observedUpdateId === 'number' ? existing.observedUpdateId : undefined;
+      if (existing && Object.keys(existing).length > 0 && existingId !== undefined && existingId >= input.observedUpdateId) {
+        return;
+      }
+      await tx
+        .update(entitySnapshots)
+        .set({ snapshotStatus: 'current', snapshotData: masked, updatedAt: new Date() })
+        .where(snapshotWhere);
+    });
+  }
 
   public async recordEntityChange<TSnapshot extends Record<string, unknown>>(
     input: AuditEventInput,
@@ -91,6 +210,7 @@ export class AuditService {
           eventVersion: events.eventVersion,
           category: events.category,
           source: events.source,
+          status: events.status,
           actorId: events.actorId,
           actorType: events.actorType,
           subjectType: events.subjectType,
@@ -114,7 +234,7 @@ export class AuditService {
         ...(input.moduleId !== undefined ? { moduleId: input.moduleId } : {}),
       });
       if (!effectivePolicy.values.enabled) {
-        throw new Error(`Audit policy is unavailable for ${input.eventType}@${input.eventVersion}`);
+        throw new AuditPolicyDisabledError(input.eventType, input.eventVersion);
       }
 
       const snapshotWhere = and(
@@ -129,7 +249,7 @@ export class AuditService {
           entityType: input.subjectType,
           entityId: input.subjectId,
           snapshotStatus: 'current',
-          snapshotData: {},
+          snapshotData: null,
           lastSubjectSequence: 0,
         })
         .onConflictDoNothing({ target: [entitySnapshots.tenantId, entitySnapshots.entityType, entitySnapshots.entityId] });
@@ -172,6 +292,7 @@ export class AuditService {
           category: input.category,
           occurredAt: new Date(),
           source: input.source,
+          status: input.status ?? 'recorded',
           tenantId: input.tenantId,
           actorId: input.actorId,
           actorType: input.actorType,
@@ -200,6 +321,7 @@ export class AuditService {
           eventType: input.eventType,
           eventVersion: input.eventVersion,
           category: input.category,
+          status: input.status ?? 'recorded',
           tenantId: input.tenantId,
           subjectType: input.subjectType,
           subjectId: input.subjectId,
@@ -236,6 +358,7 @@ function sameIdempotentOperation(
     readonly eventVersion: string;
     readonly category: string;
     readonly source: string;
+    readonly status: AuditEventStatus;
     readonly actorId: string | null;
     readonly actorType: string | null;
     readonly subjectType: string;
@@ -249,11 +372,18 @@ function sameIdempotentOperation(
     existing.eventVersion === input.eventVersion &&
     existing.category === input.category &&
     existing.source === input.source &&
+    existing.status === (input.status ?? 'recorded') &&
     existing.actorId === (input.actorId ?? null) &&
     existing.actorType === (input.actorType ?? null) &&
     existing.subjectType === input.subjectType &&
     existing.subjectId === input.subjectId
   );
+}
+
+function policyCategory(eventType: string, eventVersion: string): string {
+  const match = /^v(\d+)$/.exec(eventVersion);
+  if (!match) throw new Error(`Audit event version must use v<number> format, received "${eventVersion}"`);
+  return auditEventRegistry.requireSupportedVersion(eventType, Number(match[1])).category;
 }
 
 function buildPersistencePolicy(
@@ -277,8 +407,7 @@ function applySnapshotMode(
     after: undefined,
     beforeSnapshotStatus: redactObservedStatus(mutation.beforeSnapshotStatus),
     afterSnapshotStatus: redactObservedStatus(mutation.afterSnapshotStatus),
-    ...(mutation.changes === undefined ? {} : { changes: mutation.changes }),
-    snapshotData: {},
+    snapshotData: null,
   };
 }
 

@@ -21,18 +21,33 @@ function fakeModule(id: string, defaultEnabled: boolean): TelegramBotModule {
  */
 function fakeAuditService(existingEnabled: boolean | undefined) {
   const calls: Array<{ input: unknown; result: unknown }> = [];
+  let row: { enabled: boolean } | undefined = existingEnabled === undefined ? undefined : { enabled: existingEnabled };
+  const currentRows = () => (row === undefined ? [] : [row]);
+  const limited = () => {
+    const data = currentRows();
+    const promise = Promise.resolve(data);
+    return Object.assign(promise, { for: () => promise });
+  };
   const fakeTx = {
     select: () => ({
       from: () => ({
         where: () => ({
-          limit: () => ({
-            for: async () => (existingEnabled === undefined ? [] : [{ enabled: existingEnabled }]),
-          }),
+          limit: limited,
         }),
       }),
     }),
-    insert: () => ({ values: () => ({ onConflictDoUpdate: async () => undefined }) }),
-    delete: () => ({ where: async () => undefined }),
+    insert: () => ({
+      values: (values: { enabled: boolean }) => ({
+        onConflictDoUpdate: async () => {
+          row = { enabled: values.enabled };
+        },
+      }),
+    }),
+    delete: () => ({
+      where: async () => {
+        row = undefined;
+      },
+    }),
   };
   const audit = {
     recordEntityChange: vi.fn(async (input: unknown, mutate: (tx: unknown) => Promise<unknown>) => {
@@ -201,12 +216,12 @@ describe('ModuleRegistry.setEnabled — BOTS-7/BOTS-6 wiring', () => {
     const module = fakeModule('welcome', true);
     const { registry, calls } = fakeRegistry(module, true);
 
-    await runWithUpdateContext({ updateId: 'update-42', chatId: 'chat-1', userId: 'user-1' }, () =>
+    await runWithUpdateContext({ updateId: 'update-42', botId: 'bot-42', chatId: 'chat-1', userId: 'user-1' }, () =>
       registry.setEnabled('chat-1', 'welcome', true, 'user-1'),
     );
 
     const call = calls[0] as { input: { idempotencyKey: string } };
-    expect(call.input.idempotencyKey).toBe('module.state.changed:telegram-update:update-42:chat-1:welcome');
+    expect(call.input.idempotencyKey).toBe('module.state.changed:telegram-update:bot-42:update-42:chat-1:welcome');
   });
 
   it('uses an explicit idempotency key when setEnabled is called outside a Telegram update context', async () => {

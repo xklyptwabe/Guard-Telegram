@@ -1,0 +1,539 @@
+import { and, eq, sql } from 'drizzle-orm';
+import { migrate } from 'drizzle-orm/node-postgres/migrator';
+import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
+
+import { validateConfig } from '../../src/config.js';
+import { UpdateInbox } from '../../src/core/updateInbox.js';
+import { createDatabase, type DatabaseClient } from '../../src/db/client.js';
+import { eventPolicies, events } from '../../src/db/schema/audit.js';
+import { processedUpdates } from '../../src/db/schema/core.js';
+import { pendingOperations } from '../../src/db/schema/moderation.js';
+import { AuditService } from '../../src/lib/auditService.js';
+import { runWithUpdateContext } from '../../src/lib/context.js';
+import { makeIntegrationAuditFinalizer } from '../../src/lib/integrations/externalOperationGateway.js';
+import type { Logger } from '../../src/lib/logger.js';
+import { ModerationService } from '../../src/lib/moderation/moderationService.js';
+import {
+  PendingOperationIdempotencyConflictError,
+  PendingOperationResolvers,
+  PendingOperationsOutbox,
+} from '../../src/lib/moderation/pendingOperationsOutbox.js';
+
+const testDatabaseUrl = process.env.TEST_DATABASE_URL;
+
+function silentLogger(): Logger {
+  return { info: vi.fn(), debug: vi.fn(), warn: vi.fn(), error: vi.fn() } as unknown as Logger;
+}
+
+/**
+ * Drizzle wraps driver errors as `Failed query: …` with the original
+ * Postgres error on `.cause` — assert against both texts.
+ */
+async function expectDbError(query: Promise<unknown>, pattern: RegExp): Promise<void> {
+  try {
+    await query;
+  } catch (error: unknown) {
+    const message = `${error instanceof Error ? error.message : String(error)} ${(error as { cause?: Error }).cause?.message ?? ''}`;
+    expect(message).toMatch(pattern);
+    return;
+  }
+  throw new Error(`Expected a database error matching ${pattern}, but the query succeeded`);
+}
+
+async function expectTelegramBotPermissionDenied(
+  client: DatabaseClient,
+  query: string,
+  values: readonly unknown[] = [],
+): Promise<void> {
+  const connection = await client.pool.connect();
+  let denied: unknown;
+  try {
+    await connection.query('BEGIN');
+    await connection.query('SET LOCAL ROLE telegram_bot');
+    try {
+      await connection.query(query, [...values]);
+    } catch (error: unknown) {
+      denied = error;
+    }
+  } finally {
+    await connection.query('ROLLBACK');
+    connection.release();
+  }
+  expect((denied as { code?: string } | undefined)?.code).toBe('42501');
+}
+
+async function canSetTelegramBotRole(client: DatabaseClient): Promise<boolean> {
+  const result = await client.pool.query<{ canSetRole: boolean }>(`
+    SELECT rolsuper OR pg_has_role(current_user, 'telegram_bot', 'SET') AS "canSetRole"
+    FROM pg_roles
+    WHERE rolname = current_user
+  `);
+  return result.rows[0]?.canSetRole ?? false;
+}
+
+function fakeBot() {
+  return {
+    botInfo: { id: 42 },
+    api: {
+      raw: {
+        banChatMember: vi.fn(async () => true),
+        unbanChatMember: vi.fn(async () => true),
+        restrictChatMember: vi.fn(async () => true),
+        deleteMessage: vi.fn(async () => true),
+      },
+    },
+  };
+}
+
+/**
+ * BOTS-9 review — DB-backed verification of the blocker fixes that unit
+ * fakes cannot prove: real `FOR UPDATE SKIP LOCKED` semantics, real CHECK
+ * constraints, real `SET ROLE` privileges, real lease expiry/redelivery,
+ * and negative-marker scans over actual JSONB columns. Requires a real
+ * PostgreSQL at `TEST_DATABASE_URL` (skipped otherwise, per repo
+ * convention — see bot13.e2e.test.ts).
+ */
+describe.skipIf(!testDatabaseUrl)('BOTS-9 blockers: real-DB verification', () => {
+  let client: DatabaseClient;
+  let audit: AuditService;
+
+  beforeAll(async () => {
+    const config = validateConfig({
+      TELEGRAM_BOT_TOKEN: 'bots9-test-token',
+      DATABASE_URL: testDatabaseUrl,
+      NODE_ENV: 'test',
+      // CI runs against a properly CA-signed instance; a local portable
+      // PostgreSQL uses a self-signed cert — allow opting out per env.
+      DATABASE_TLS_REJECT_UNAUTHORIZED: process.env.TEST_DATABASE_TLS_REJECT_UNAUTHORIZED ?? 'true',
+    });
+    client = createDatabase(config);
+    audit = new AuditService(client.db);
+    // Self-provisioning: idempotent — applies 0016/0017 (constraints,
+    // audit_status, inbox) on top of whatever the environment already has.
+    await migrate(client.db, { migrationsFolder: 'src/db/migrations' });
+  });
+
+  afterAll(async () => {
+    await client.close();
+  });
+
+  beforeEach(async () => {
+    await client.db.execute(sql`DELETE FROM audit.events`);
+    await client.db.execute(sql`DELETE FROM audit.entity_snapshots`);
+    await client.db.execute(sql`DELETE FROM audit.outbox`);
+    await client.db.execute(sql`DELETE FROM moderation.pending_operations`);
+    await client.db.execute(sql`DELETE FROM core.processed_updates`);
+    await client.db.execute(sql`DELETE FROM audit.event_policies WHERE chat_id IS NOT NULL`);
+    await client.db.execute(sql`DELETE FROM core.chat_module_states`);
+    await client.db.execute(sql`DELETE FROM public.telegram_chats`);
+    await client.db.execute(sql`INSERT INTO public.telegram_chats (chat_id, type) VALUES ('-100900', 'supergroup') ON CONFLICT DO NOTHING`);
+  });
+
+  it('BLOCKER-2 DoD: two concurrent recovery workers on one row — exactly one executor invocation (real SKIP LOCKED)', async () => {
+    const resolvers = new PendingOperationResolvers();
+    let release: () => void = () => undefined;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const executor = vi.fn(async () => {
+      await gate;
+      return { ok: true };
+    });
+    resolvers.register('telegram.banChatMember', executor);
+
+    await client.db.insert(pendingOperations).values({
+      kind: 'telegram.banChatMember',
+      chatId: '-100900',
+      requestPayload: { chat_id: -100900, user_id: 2 },
+      metadata: { action: 'ban', actorUserId: '9', targetUserId: '2' },
+      idempotencyKey: 'bots9-concurrent-1',
+      status: 'pending',
+    });
+
+    const workerA = new PendingOperationsOutbox(client.db, silentLogger(), resolvers);
+    const workerB = new PendingOperationsOutbox(client.db, silentLogger(), resolvers);
+    const onFinalA = vi.fn(async () => ({ status: 'recorded' as const }));
+    const onFinalB = vi.fn(async () => ({ status: 'recorded' as const }));
+
+    // Both sweeps start before either executor finishes — the gated
+    // executor guarantees real overlap against the same row.
+    const a = workerA.recoverPending(onFinalA);
+    const b = workerB.recoverPending(onFinalB);
+    await new Promise((resolve) => setTimeout(resolve, 150));
+    release();
+    await Promise.all([a, b]);
+
+    expect(executor).toHaveBeenCalledTimes(1);
+    const [row] = await client.db.select().from(pendingOperations).where(eq(pendingOperations.idempotencyKey, 'bots9-concurrent-1'));
+    expect(row?.status).toBe('succeeded');
+    expect(row?.auditStatus).toBe('written');
+  });
+
+  it('BLOCKER-2: late resolution after a stolen lease is discarded (CAS), never overwriting the new owner', async () => {
+    const resolvers = new PendingOperationResolvers();
+    resolvers.register('telegram.banChatMember', vi.fn(async () => ({ ok: true })));
+    const outbox = new PendingOperationsOutbox(client.db, silentLogger(), resolvers);
+
+    await client.db.insert(pendingOperations).values({
+      kind: 'telegram.banChatMember',
+      chatId: '-100900',
+      requestPayload: {},
+      metadata: { action: 'ban', actorUserId: '9', targetUserId: '2' },
+      idempotencyKey: 'bots9-cas-1',
+      status: 'pending',
+    });
+
+    // Worker claims, then a "new owner" steals the lease (simulating
+    // lease-expiry reclaim while the first worker is still in flight).
+    const claim = await client.db
+      .update(pendingOperations)
+      .set({ status: 'in_progress', workerId: 'first-worker', leaseExpiresAt: new Date(Date.now() + 60_000) })
+      .where(eq(pendingOperations.idempotencyKey, 'bots9-cas-1'))
+      .returning({ id: pendingOperations.id });
+    expect(claim).toHaveLength(1);
+
+    // The first worker's resolve() CAS must lose to the new owner.
+    const resolveByDisplacedOwner = await client.db
+      .update(pendingOperations)
+      .set({ status: 'succeeded', workerId: null, leaseExpiresAt: null })
+      .where(and(eq(pendingOperations.id, claim[0]!.id), eq(pendingOperations.workerId, 'first-worker')))
+      .returning({ id: pendingOperations.id });
+    expect(resolveByDisplacedOwner).toHaveLength(1); // lease not stolen yet — CAS still valid
+
+    await client.db.update(pendingOperations).set({ workerId: 'new-owner' }).where(eq(pendingOperations.id, claim[0]!.id));
+    const resolveByStolenOwner = await client.db
+      .update(pendingOperations)
+      .set({ status: 'succeeded', workerId: null, leaseExpiresAt: null })
+      .where(and(eq(pendingOperations.id, claim[0]!.id), eq(pendingOperations.workerId, 'first-worker')))
+      .returning({ id: pendingOperations.id });
+    expect(resolveByStolenOwner).toHaveLength(0); // CAS discarded — new owner untouched
+    const [row] = await client.db.select().from(pendingOperations).where(eq(pendingOperations.idempotencyKey, 'bots9-cas-1'));
+    // The displaced worker's write never landed: the row keeps whatever the
+    // new owner last wrote (here: the earlier valid resolve, with ownership
+    // transferred) — not the stale overwrite attempt.
+    expect(row?.workerId).toBe('new-owner');
+    expect(row?.status).toBe('succeeded');
+    void outbox;
+  });
+
+  it('BLOCKER-4 DoD: secret markers never reach any audit/outbox JSONB column (real DB scan)', async () => {
+    const resolvers = new PendingOperationResolvers();
+    const outbox = new PendingOperationsOutbox(client.db, silentLogger(), resolvers);
+    const bot = fakeBot();
+    const moderation = new ModerationService(bot as never, audit, outbox, resolvers, silentLogger());
+
+    // Succeeded path: a DSN pasted into the moderation reason.
+    await runWithUpdateContext({ updateId: '9001', chatId: '-100900', botId: '42' }, () =>
+      moderation.ban({ chatId: '-100900', targetUserId: '2', actorUserId: '9', reason: 'spam see postgres://admin:sup3rs3cret@db.internal:5432/audit' }),
+    );
+    // Failed/unknown path: an unknown error carrying a credential-bearing DSN.
+    bot.api.raw.unbanChatMember.mockRejectedValueOnce(new Error('connect failed postgres://bot:an0therpass@db.internal:5432/x'));
+    await runWithUpdateContext({ updateId: '9002', chatId: '-100900', botId: '42' }, () =>
+      moderation.unban({ chatId: '-100900', targetUserId: '3', actorUserId: '9' }),
+    );
+
+    const scan = await client.db.execute<{ table_name: string; col: string }>(sql`
+      SELECT 'events.after' AS table_name, after::text AS col FROM audit.events WHERE after::text LIKE '%sup3rs3cret%' OR after::text LIKE '%an0therpass%'
+      UNION ALL SELECT 'events.metadata', metadata::text FROM audit.events WHERE metadata::text LIKE '%sup3rs3cret%' OR metadata::text LIKE '%an0therpass%'
+      UNION ALL SELECT 'outbox.payload', payload::text FROM audit.outbox WHERE payload::text LIKE '%sup3rs3cret%' OR payload::text LIKE '%an0therpass%'
+      UNION ALL SELECT 'snapshots.snapshot_data', snapshot_data::text FROM audit.entity_snapshots WHERE snapshot_data::text LIKE '%sup3rs3cret%' OR snapshot_data::text LIKE '%an0therpass%'
+      UNION ALL SELECT 'pending.request_payload', request_payload::text FROM moderation.pending_operations WHERE request_payload::text LIKE '%sup3rs3cret%' OR request_payload::text LIKE '%an0therpass%'
+      UNION ALL SELECT 'pending.metadata', metadata::text FROM moderation.pending_operations WHERE metadata::text LIKE '%sup3rs3cret%' OR metadata::text LIKE '%an0therpass%'
+      UNION ALL SELECT 'pending.result', result::text FROM moderation.pending_operations WHERE result::text LIKE '%sup3rs3cret%' OR result::text LIKE '%an0therpass%'
+      UNION ALL SELECT 'pending.last_error', last_error::text FROM core.processed_updates WHERE last_error::text LIKE '%sup3rs3cret%'
+    `);
+    expect(scan.rows).toEqual([]);
+    // Migration 0024 deliberately reduces finalized rows to an idempotency
+    // tombstone after the sanitized audit has been written.
+    const [reasonRow] = await client.db.select().from(pendingOperations).where(eq(pendingOperations.idempotencyKey, 'moderation.action:telegram-update:42:9001:-100900:2:ban'));
+    expect(reasonRow?.metadata).toEqual({});
+  });
+
+  it('scopes recovery claims by owner and allows the same logical key for different bots', async () => {
+    const resolvers = new PendingOperationResolvers();
+    const ownerAExecutor = vi.fn(async () => ({ owner: 'a' }));
+    const ownerBExecutor = vi.fn(async () => ({ owner: 'b' }));
+    const ownerA = new PendingOperationsOutbox(client.db, silentLogger(), resolvers, undefined, undefined, undefined, 'bot-a');
+    const ownerB = new PendingOperationsOutbox(client.db, silentLogger(), resolvers, undefined, undefined, undefined, 'bot-b');
+
+    await client.db.insert(pendingOperations).values({
+      ownerId: 'bot-a',
+      kind: 'telegram.banChatMember',
+      chatId: '-100900',
+      idempotencyKey: 'shared-update-key',
+      operationFingerprint: 'legacy-test-row',
+      requestPayload: { chat_id: -100900, user_id: 1 },
+      status: 'pending',
+    });
+    resolvers.register('telegram.banChatMember', ownerBExecutor);
+
+    await ownerB.recoverPending();
+    expect(ownerBExecutor).not.toHaveBeenCalled();
+    expect((await client.db.select().from(pendingOperations).where(eq(pendingOperations.ownerId, 'bot-a')))[0]?.status).toBe('pending');
+
+    resolvers.register('telegram.banChatMember', ownerAExecutor);
+    await ownerA.recoverPending();
+    expect(ownerAExecutor).toHaveBeenCalledTimes(1);
+
+    await expect(
+      ownerB.execute(
+        { kind: 'telegram.banChatMember', chatId: '-100900', idempotencyKey: 'shared-update-key', requestPayload: { chat_id: -100900, user_id: 2 } },
+        ownerBExecutor,
+      ),
+    ).resolves.toMatchObject({ outcome: { status: 'succeeded' }, duplicate: false });
+    const rows = await client.db.select({ ownerId: pendingOperations.ownerId }).from(pendingOperations).where(eq(pendingOperations.idempotencyKey, 'shared-update-key'));
+    expect(rows.map((row) => row.ownerId).sort()).toEqual(['bot-a', 'bot-b']);
+  });
+
+  it('rejects a conflicting operation behind an existing owner-scoped idempotency key', async () => {
+    const resolvers = new PendingOperationResolvers();
+    const outbox = new PendingOperationsOutbox(client.db, silentLogger(), resolvers, undefined, undefined, undefined, 'bot-a');
+    const executor = vi.fn(async () => ({ ok: true }));
+
+    await outbox.execute(
+      { kind: 'telegram.banChatMember', chatId: '-100900', idempotencyKey: 'conflicting-key', requestPayload: { chat_id: -100900, user_id: 1 } },
+      executor,
+    );
+    await expect(
+      outbox.execute(
+        { kind: 'telegram.unbanChatMember', chatId: '-100901', idempotencyKey: 'conflicting-key', requestPayload: { chat_id: -100901, user_id: 2 } },
+        executor,
+      ),
+    ).rejects.toBeInstanceOf(PendingOperationIdempotencyConflictError);
+    expect(executor).toHaveBeenCalledTimes(1);
+  });
+
+  it('BLOCKER-3: a restrictive audit policy cannot remove the recovery envelope required to finalize a moderation outbox row', async () => {
+    await client.db.insert(eventPolicies).values({
+      policyId: 'bots9-outbox-recovery-policy',
+      chatId: '-100900',
+      eventType: 'moderation.action',
+      eventVersion: 'v1',
+      allowlist: ['chatId'],
+    });
+
+    const resolvers = new PendingOperationResolvers();
+    const outbox = new PendingOperationsOutbox(client.db, silentLogger(), resolvers);
+    outbox.setMetadataSanitizer((input) =>
+      audit.maskOutboxMetadata({
+        tenantId: input.chatId,
+        eventType: input.auditEvent.eventType,
+        eventVersion: input.auditEvent.eventVersion,
+        ...(input.auditEvent.moduleId !== undefined ? { moduleId: input.auditEvent.moduleId } : {}),
+        metadata: input.metadata,
+      }),
+    );
+    const bot = {
+      botInfo: { id: 42 },
+      api: {
+        raw: {
+          banChatMember: vi.fn(async () => true),
+          unbanChatMember: vi.fn(async () => true),
+          restrictChatMember: vi.fn(async () => true),
+          deleteMessage: vi.fn(async () => true),
+        },
+      },
+    };
+    const moderation = new ModerationService(bot as never, audit, outbox, resolvers, silentLogger());
+
+    const result = await runWithUpdateContext({ updateId: '9003', chatId: '-100900', botId: '42' }, () =>
+      moderation.ban({ chatId: '-100900', targetUserId: '2', actorUserId: '9', reason: 'policy-hidden-reason' }),
+    );
+
+    expect(result.status).toBe('succeeded');
+    expect(bot.api.raw.banChatMember).toHaveBeenCalledTimes(1);
+    const [row] = await client.db.select().from(pendingOperations).where(eq(pendingOperations.idempotencyKey, 'moderation.action:telegram-update:42:9003:-100900:2:ban'));
+    expect(row).toMatchObject({
+      status: 'succeeded',
+      auditStatus: 'written',
+      metadata: {},
+    });
+    expect(JSON.stringify(row?.metadata)).not.toContain('policy-hidden-reason');
+
+    const auditRows = await client.db.select().from(events).where(eq(events.idempotencyKey, 'moderation.action:telegram-update:42:9003:-100900:2:ban:audit'));
+    expect(auditRows).toHaveLength(1);
+    expect(auditRows[0]).toMatchObject({
+      eventType: 'moderation.action',
+      actorId: '9',
+      subjectId: '-100900:2',
+      after: { chatId: '-100900' },
+    });
+  });
+
+  it('HIGH-4: a finalized terminal operation keeps only its idempotency tombstone, not recovery payloads indefinitely', async () => {
+    const resolvers = new PendingOperationResolvers();
+    const outbox = new PendingOperationsOutbox(client.db, silentLogger(), resolvers);
+    const executor = vi.fn(async () => ({ messageId: 'retention-sensitive-provider-result' }));
+    const recoveryMetadata = {
+      integrationId: 'rabbitmq',
+      action: 'audit.test',
+      targetType: 'queue',
+      targetId: 'retention-sensitive-target',
+    };
+    const input = {
+      kind: 'rabbitmq.publish',
+      chatId: 'platform',
+      idempotencyKey: 'rabbitmq.publish:retention-sensitive-envelope',
+      requestPayload: {
+        envelope: {
+          id: 'retention-sensitive-envelope',
+          type: 'audit.test',
+          attempt: 0,
+          payload: { marker: 'retention-sensitive-request' },
+        },
+      },
+      auditEvent: { eventType: 'integration.action', eventVersion: 'v1' },
+      metadata: { ...recoveryMetadata, marker: 'retention-sensitive-metadata' },
+      recoveryMetadata,
+    } as const;
+    const finalizer = makeIntegrationAuditFinalizer(audit, silentLogger());
+
+    const result = await outbox.execute(input, executor, finalizer);
+
+    expect(result).toMatchObject({ isFinal: true, auditFinalized: true, outcome: { status: 'succeeded' } });
+    const [row] = await client.db.select().from(pendingOperations).where(eq(pendingOperations.idempotencyKey, input.idempotencyKey));
+    expect(row).toMatchObject({
+      kind: input.kind,
+      chatId: input.chatId,
+      idempotencyKey: input.idempotencyKey,
+      status: 'succeeded',
+      auditStatus: 'written',
+      requestPayload: {},
+      metadata: {},
+      result: null,
+    });
+
+    const duplicateExecutor = vi.fn(async () => ({ messageId: 'must-not-run' }));
+    const duplicate = await outbox.execute(input, duplicateExecutor, finalizer);
+    expect(duplicate).toMatchObject({ duplicate: true, auditFinalized: true, outcome: { status: 'succeeded' } });
+    expect(executor).toHaveBeenCalledTimes(1);
+    expect(duplicateExecutor).not.toHaveBeenCalled();
+    const auditRows = await client.db.select().from(events).where(eq(events.idempotencyKey, `${input.idempotencyKey}:audit`));
+    expect(auditRows).toHaveLength(1);
+
+    const debtInput = {
+      ...input,
+      idempotencyKey: 'rabbitmq.publish:retention-audit-debt',
+      requestPayload: { marker: 'must-survive-until-audit-finalizes' },
+    };
+    const debt = await outbox.execute(debtInput, async () => ({ messageId: 'must-survive-until-audit-finalizes' }), async () => {
+      throw new Error('audit unavailable');
+    });
+    expect(debt).toMatchObject({ isFinal: true, auditFinalized: false, outcome: { status: 'succeeded' } });
+    const [owedRow] = await client.db.select().from(pendingOperations).where(eq(pendingOperations.idempotencyKey, debtInput.idempotencyKey));
+    expect(owedRow).toMatchObject({
+      auditStatus: 'pending',
+      requestPayload: debtInput.requestPayload,
+      result: { messageId: 'must-survive-until-audit-finalizes' },
+    });
+    expect(owedRow?.metadata).not.toEqual({});
+  });
+
+  it('BLOCKER-5 DoD: inbox partial failure on a real DB — redelivery resumes, completion dedupes, retention-safe', async () => {
+    const inbox = new UpdateInbox(client.db, silentLogger(), 5, 45_000);
+
+    const first = await inbox.begin('42', '7001');
+    expect(first.claim).toBe('claimed');
+    // "Crash": no complete() — row stays processing with a live lease.
+    const earlyRedelivery = await inbox.begin('42', '7001');
+    expect(earlyRedelivery.claim).toBe('busy');
+
+    // Lease genuinely expires → redelivery reprocesses.
+    await client.db.update(processedUpdates).set({ leaseExpiresAt: new Date(Date.now() - 1) }).where(and(eq(processedUpdates.botId, '42'), eq(processedUpdates.updateId, '7001')));
+    const retry = await inbox.begin('42', '7001');
+    expect(retry.claim).toBe('claimed');
+    expect(retry.attemptCount).toBe(2);
+
+    await inbox.complete('42', '7001');
+    const afterCompletion = await inbox.begin('42', '7001');
+    expect(afterCompletion.claim).toBe('completed'); // dedup only from this moment
+
+    const [row] = await client.db.select().from(processedUpdates).where(and(eq(processedUpdates.botId, '42'), eq(processedUpdates.updateId, '7001')));
+    expect(row?.status).toBe('completed');
+    expect(row?.workerId).toBeNull();
+  });
+
+  it('HIGH-4 DoD: telegram_bot can advance state machines but cannot rewrite inbox/outbox identity or payload', async ({ skip }) => {
+    if (!(await canSetTelegramBotRole(client))) skip();
+
+    await client.db.execute(sql`INSERT INTO moderation.pending_operations (kind, chat_id, request_payload, metadata, idempotency_key, status) VALUES ('telegram.banChatMember', '-100900', '{"chat_id":-100900,"user_id":2}', '{"action":"ban","actorUserId":"9","targetUserId":"2"}', 'bots9-role-1', 'pending')`);
+    await client.db.execute(sql`INSERT INTO core.processed_updates (bot_id, update_id, status) VALUES ('42','7002','received')`);
+
+    const connection = await client.pool.connect();
+    try {
+      await connection.query('BEGIN');
+      await connection.query('SET LOCAL ROLE telegram_bot');
+      // Claim + resolve shape (worker_id/lease/audit_status columns included).
+      await connection.query(`UPDATE moderation.pending_operations SET status='in_progress', worker_id='w', lease_expires_at=now()+interval '45 seconds', attempt_count=attempt_count+1, audit_status='pending' WHERE idempotency_key='bots9-role-1'`);
+      await connection.query(`UPDATE moderation.pending_operations SET status='succeeded', result='{"ok":true}'::jsonb, worker_id=NULL, lease_expires_at=NULL, audit_status='written' WHERE idempotency_key='bots9-role-1'`);
+      // Inbox claim shape.
+      await connection.query(`UPDATE core.processed_updates SET status='processing', worker_id='w', lease_expires_at=now()+interval '45 seconds', attempt_count=attempt_count+1 WHERE bot_id='42' AND update_id='7002'`);
+
+      const allowedOutbox = await connection.query<{ status: string; request_payload: unknown; metadata: unknown; result: unknown }>(`SELECT status, request_payload, metadata, result FROM moderation.pending_operations WHERE idempotency_key='bots9-role-1'`);
+      const allowedInbox = await connection.query<{ status: string }>(`SELECT status FROM core.processed_updates WHERE bot_id='42' AND update_id='7002'`);
+      expect(allowedOutbox.rows[0]?.status).toBe('succeeded');
+      expect(allowedOutbox.rows[0]?.request_payload).toEqual({});
+      expect(allowedOutbox.rows[0]?.metadata).toEqual({});
+      expect(allowedOutbox.rows[0]?.result).toBeNull();
+      expect(allowedInbox.rows[0]?.status).toBe('processing');
+    } finally {
+      await connection.query('ROLLBACK');
+      connection.release();
+    }
+
+    const forbiddenUpdates: ReadonlyArray<readonly [string, readonly unknown[]]> = [
+      ['UPDATE moderation.pending_operations SET id = id WHERE idempotency_key = $1', ['bots9-role-1']],
+      ['UPDATE moderation.pending_operations SET kind = kind WHERE idempotency_key = $1', ['bots9-role-1']],
+      ['UPDATE moderation.pending_operations SET chat_id = chat_id WHERE idempotency_key = $1', ['bots9-role-1']],
+      ['UPDATE moderation.pending_operations SET request_payload = request_payload WHERE idempotency_key = $1', ['bots9-role-1']],
+      ['UPDATE moderation.pending_operations SET metadata = metadata WHERE idempotency_key = $1', ['bots9-role-1']],
+      ['UPDATE moderation.pending_operations SET idempotency_key = idempotency_key WHERE idempotency_key = $1', ['bots9-role-1']],
+      ['UPDATE core.processed_updates SET bot_id = bot_id WHERE bot_id = $1 AND update_id = $2', ['42', '7002']],
+      ['UPDATE core.processed_updates SET update_id = update_id WHERE bot_id = $1 AND update_id = $2', ['42', '7002']],
+      ['DELETE FROM moderation.pending_operations WHERE idempotency_key = $1', ['bots9-role-1']],
+    ];
+    for (const [query, values] of forbiddenUpdates) {
+      await expectTelegramBotPermissionDenied(client, query, values);
+    }
+
+    const [survivor] = await client.db.select().from(pendingOperations).where(eq(pendingOperations.idempotencyKey, 'bots9-role-1'));
+    expect(survivor).toMatchObject({ kind: 'telegram.banChatMember', chatId: '-100900', idempotencyKey: 'bots9-role-1', status: 'pending' });
+  });
+
+  it('MEDIUM-3 DoD: DB-level invariants reject illegal state (CHECK constraints from migration 0016)', async () => {
+    await expectDbError(
+      client.db.execute(sql`INSERT INTO moderation.pending_operations (kind, chat_id, request_payload, metadata, idempotency_key, status) VALUES ('x.y','-100900','{}','{}','bots9-check-1','teleported')`),
+      /pending_operations_status_check/i,
+    );
+    await expectDbError(
+      client.db.execute(sql`INSERT INTO moderation.pending_operations (kind, chat_id, request_payload, metadata, idempotency_key, status, attempt_count) VALUES ('x.y','-100900','{}','{}','bots9-check-2','pending', -1)`),
+      /pending_operations_attempt_count_check/i,
+    );
+    await expectDbError(
+      client.db.execute(sql`INSERT INTO moderation.pending_operations (kind, chat_id, request_payload, metadata, idempotency_key, status, next_attempt_at) VALUES ('x.y','-100900','{}','{}','bots9-check-3','succeeded', now())`),
+      /pending_operations_terminal_next_attempt_check/i,
+    );
+  });
+
+  it('HIGH-3 DoD: terminal audit backfill on a real DB — audit written later, executor never re-run', async () => {
+    const resolvers = new PendingOperationResolvers();
+    const executor = vi.fn(async () => ({ ok: true }));
+    resolvers.register('telegram.banChatMember', executor);
+    const outbox = new PendingOperationsOutbox(client.db, silentLogger(), resolvers);
+
+    const failing = vi.fn(async () => {
+      throw new Error('audit layer down');
+    });
+    await outbox.execute({ kind: 'telegram.banChatMember', chatId: '-100900', idempotencyKey: 'bots9-h3-1', requestPayload: {}, metadata: {} }, executor, failing);
+    let [row] = await client.db.select().from(pendingOperations).where(eq(pendingOperations.idempotencyKey, 'bots9-h3-1'));
+    expect(row?.status).toBe('succeeded');
+    expect(row?.auditStatus).toBe('pending');
+
+    const working = vi.fn(async () => ({ status: 'recorded' as const }));
+    await outbox.recoverPending(working);
+    [row] = await client.db.select().from(pendingOperations).where(eq(pendingOperations.idempotencyKey, 'bots9-h3-1'));
+    expect(row?.auditStatus).toBe('written');
+    expect(executor).toHaveBeenCalledTimes(1); // audit retried, operation NOT
+    expect(working).toHaveBeenCalledTimes(1);
+  });
+});
