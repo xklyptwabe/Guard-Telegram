@@ -409,13 +409,7 @@ function auditEventsWhereConditions(
   if (filters.correlationId !== undefined) conditions.push(eq(events.correlationId, filters.correlationId));
   if (cursor !== undefined) {
     conditions.push(
-      or(
-        sql`${events.occurredAt} < ${cursor.occurredAt}::timestamptz`,
-        and(
-          sql`${events.occurredAt} = ${cursor.occurredAt}::timestamptz`,
-          sql`${events.id} < ${cursor.id}::uuid`,
-        ),
-      )!,
+      sql`(${events.occurredAt}, ${events.id}) < (${cursor.occurredAt}::timestamptz, ${cursor.id}::uuid)`,
     );
   }
   return conditions;
