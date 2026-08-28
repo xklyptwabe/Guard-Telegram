@@ -19,6 +19,7 @@
     "db:studio": "drizzle-kit studio",
     "check:locales": "tsx scripts/check-locales.ts",
     "seed:audit-event-types": "tsx scripts/seedAuditEventTypes.ts",
+    "audit:diagnose": "tsx scripts/diagnoseAudit.ts",
     "audit:retention": "tsx scripts/runAuditRetention.ts"
   },
   "dependencies": {
