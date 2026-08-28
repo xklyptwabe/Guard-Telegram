@@ -428,6 +428,45 @@ describe('AuditService persistence safety', () => {
     expect(captured.writes).toEqual([]);
     expect(captured.rejections).toEqual([]);
   });
+
+  it('reports an infrastructure failure as a mandatory audit write failure', async () => {
+    const databaseError = new Error('database unavailable');
+    const captured = fakeAuditMetrics();
+    const audit = new AuditService(
+      { transaction: async () => Promise.reject(databaseError) } as never,
+      captured.metrics,
+    );
+    let mutationCalled = false;
+
+    await expect(
+      audit.recordEntityChange(
+        {
+          tenantId: 'chat-1',
+          subjectType: 'chat_module_state',
+          subjectId: 'chat-1:moderation',
+          eventType: 'module.state.changed',
+          eventVersion: 'v1',
+          category: 'module',
+          source: 'unit-test',
+          idempotencyKey: 'unit:audit-service:write-failure',
+        },
+        async () => {
+          mutationCalled = true;
+          return {
+            before: undefined,
+            after: { enabled: true, source: 'override' },
+            snapshotData: { chatId: 'chat-1', moduleId: 'moderation', enabled: true, source: 'override' },
+          };
+        },
+      ),
+    ).rejects.toBe(databaseError);
+
+    expect(mutationCalled).toBe(false);
+    expect(captured.writes).toEqual([]);
+    expect(captured.rejections).toEqual([
+      expect.objectContaining({ eventType: 'module.state.changed', status: 'write_failed' }),
+    ]);
+  });
 });
 
 function fakeAuditMetrics(): {
