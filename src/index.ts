@@ -24,6 +24,7 @@ import { ModerationService } from './lib/moderation/moderationService.js';
 import { PendingOperationResolvers, PendingOperationsOutbox } from './lib/moderation/pendingOperationsOutbox.js';
 import { buildOutboxFinalizer, makeIntegrationAuditFinalizer } from './lib/integrations/externalOperationGateway.js';
 import { makeCommandAuditFinalizer, registerCommandAuditResolver } from './lib/audit/commandAudit.js';
+import { AuditMetrics } from './lib/audit/metrics.js';
 import { createRabbitMq, registerPlatformRabbitActionSchemas } from './lib/rabbitmq.js';
 import { ReplyService } from './lib/reply.js';
 import { createStorage } from './lib/storage.js';
@@ -73,7 +74,8 @@ async function bootstrap(): Promise<void> {
     await purgeExpiredProcessedUpdates(database.db);
     await purgeExpiredConsumedEnvelopes(database.db);
     redis = await createRedis(config, logger);
-    const audit = new AuditService(database.db);
+    const auditMetrics = new AuditMetrics(database.db);
+    const audit = new AuditService(database.db, auditMetrics);
     const bot = createTelegramBot(config, logger);
     await bot.init();
 
