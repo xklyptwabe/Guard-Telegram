@@ -108,7 +108,8 @@ export const events = auditSchema.table(
     metadata: jsonb('metadata'),
   },
   (table) => [
-    index('events_tenant_occurred_idx').on(table.tenantId, table.occurredAt.desc()),
+    index('events_tenant_occurred_id_idx').on(table.tenantId, table.occurredAt.desc(), table.id.desc()),
+    index('events_occurred_id_idx').on(table.occurredAt.desc(), table.id.desc()),
     index('events_subject_sequence_idx').on(table.tenantId, table.subjectType, table.subjectId, table.subjectSequence),
     index('events_correlation_idx').on(table.correlationId),
     index('events_type_occurred_idx').on(table.eventType, table.occurredAt.desc()),

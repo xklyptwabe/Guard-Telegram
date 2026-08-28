@@ -222,4 +222,15 @@ describe('audit migrations', () => {
     expect(sql).toContain('USING (true)');
     expect(sql).toContain('WITH CHECK (true)');
   });
+
+  it('indexes both scoped and system-wide audit cursor pagination', () => {
+    const sql = readFileSync('src/db/migrations/0032_optimize_audit_event_pagination.sql', 'utf8');
+
+    expect(sql).toContain('CREATE INDEX "events_tenant_occurred_id_idx"');
+    expect(sql).toContain('("tenant_id", "occurred_at" DESC, "id" DESC)');
+    expect(sql).toContain('CREATE INDEX "events_occurred_id_idx"');
+    expect(sql).toContain('("occurred_at" DESC, "id" DESC)');
+    expect(sql).toContain('DROP INDEX "audit"."events_tenant_occurred_idx"');
+    expect(sql).not.toMatch(/\bOFFSET\b/i);
+  });
 });

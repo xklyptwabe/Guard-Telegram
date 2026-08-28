@@ -7,11 +7,14 @@ import { createDatabase, type DatabaseClient } from '../../src/db/client.js';
 import { purgeExpiredAuditEventsBatch } from '../../src/db/retention.js';
 import { chatModuleStates, telegramChats } from '../../src/db/schema/core.js';
 import { AuditService, ForbiddenAuditValueError } from '../../src/lib/auditService.js';
+import { AuditMetrics } from '../../src/lib/audit/metrics.js';
+import { healthSnapshot } from '../../src/lib/health.js';
 import { events, entitySnapshots, eventPolicies, outbox } from '../../src/db/schema/audit.js';
 
 const testDatabaseUrl = process.env.TEST_DATABASE_URL;
 let database: DatabaseClient | undefined;
 let audit: AuditService | undefined;
+let metrics: AuditMetrics | undefined;
 
 describe.skipIf(!testDatabaseUrl)('Audit transaction integration', () => {
   beforeAll(async () => {
@@ -23,10 +26,14 @@ describe.skipIf(!testDatabaseUrl)('Audit transaction integration', () => {
     });
     database = createDatabase(config);
     await migrate(database.db, { migrationsFolder: 'src/db/migrations' });
-    audit = new AuditService(database.db);
+    metrics = new AuditMetrics(database.db);
+    audit = new AuditService(database.db, metrics);
   });
 
-  beforeEach(cleanup);
+  beforeEach(async () => {
+    await cleanup();
+    metrics?.registry.resetMetrics();
+  });
 
   afterAll(async () => {
     await cleanup();
@@ -459,6 +466,65 @@ describe.skipIf(!testDatabaseUrl)('Audit transaction integration', () => {
     expect(mutationCalled).toBe(false);
     expect(await database!.db.select().from(telegramChats)).toHaveLength(0);
     expect(await database!.db.select().from(events)).toHaveLength(0);
+  });
+
+  it('updates observability metrics from committed, duplicate, unknown, and outbox scenarios', async () => {
+    const input = {
+      tenantId: '1010',
+      subjectType: 'chat_module_state',
+      subjectId: '1010:module-admin',
+      eventType: 'module.state.changed',
+      eventVersion: 'v1',
+      category: 'module',
+      source: 'integration-test',
+      idempotencyKey: 'audit:test:metrics:recorded',
+    } as const;
+    const mutation = async () => ({
+      before: undefined,
+      after: { enabled: true, source: 'override' },
+      snapshotData: { chatId: '1010', moduleId: 'module-admin', enabled: true, source: 'override' },
+    });
+
+    await audit!.recordEntityChange(input, mutation);
+    await audit!.recordEntityChange(input, async () => Promise.reject(new Error('duplicate mutation must not run')));
+    await audit!.recordEntityChange(
+      { ...input, status: 'unknown', idempotencyKey: 'audit:test:metrics:unknown' },
+      mutation,
+    );
+
+    const output = await metrics!.registry.metrics();
+    expect(output).toContain('audit_events_written_total{event_type="module.state.changed",status="recorded"} 1');
+    expect(output).toContain('audit_events_written_total{event_type="module.state.changed",status="unknown"} 1');
+    expect(output).toContain('audit_duplicates_total{event_type="module.state.changed",status="recorded"} 1');
+    expect(output).toContain('audit_unknown_outcomes_total{event_type="module.state.changed",status="unknown"} 1');
+    expect(output).toContain('audit_outbox_pending{queue="audit_delivery",status="pending"} 2');
+
+    const operationalState = await metrics!.readOperationalState();
+    expect(operationalState.delivery).toMatchObject({ pending: 2, failed: 0 });
+    expect(operationalState.externalOperations).toMatchObject({
+      pending: 0,
+      inProgress: 0,
+      retryScheduled: 0,
+      auditPending: 0,
+      terminalUnknown: 0,
+    });
+
+    const health = await healthSnapshot(
+      {
+        telegramTransport: 'long_polling',
+        redisEnabled: false,
+        s3Enabled: false,
+        rabbitMqEnabled: false,
+      },
+      { isAvailable: () => true } as never,
+      { enabled: false } as never,
+      { enabled: false } as never,
+      metrics!,
+    );
+    expect(health.status).toBe('ok');
+    expect(JSON.stringify(health)).not.toMatch(
+      /before|after|metadata|payload|telegramContext|chatId|tenantId|subjectId|correlationId|idempotency/i,
+    );
   });
 });
 

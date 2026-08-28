@@ -178,9 +178,8 @@ describe('audit event read repository', () => {
       occurredAt: '2026-08-06 10:00:00.123456+00',
       id: 'bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb',
     });
-    expect(query.sql).toContain('"audit"."events"."occurred_at" < $2::timestamptz');
     expect(query.sql).toContain(
-      '"audit"."events"."occurred_at" = $3::timestamptz and "audit"."events"."id" < $4::uuid',
+      '("audit"."events"."occurred_at", "audit"."events"."id") < ($2::timestamptz, $3::uuid)',
     );
   });
 

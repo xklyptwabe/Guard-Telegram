@@ -1,0 +1,46 @@
+rule_files:
+  - audit-alerts.yml
+
+evaluation_interval: 1m
+
+tests:
+  - name: mandatory audit write failure fires and recovers
+    interval: 1m
+    input_series:
+      - series: 'audit_events_rejected_total{event_type="module.state.changed",status="write_failed"}'
+        values: '0 0 1+0x7'
+    alert_rule_test:
+      - eval_time: 2m
+        alertname: AuditMandatoryWriteFailed
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              service: telegram-bot
+              component: audit
+            exp_annotations:
+              summary: Mandatory audit write failed
+              description: At least one mandatory audit event could not be committed during the last five minutes.
+      - eval_time: 8m
+        alertname: AuditMandatoryWriteFailed
+        exp_alerts: []
+
+  - name: growing outbox fires after five minutes and recovers when growth stops
+    interval: 1m
+    input_series:
+      - series: 'audit_outbox_pending{queue="external_operations",status="pending"}'
+        values: '0+0x9 1+0x21'
+    alert_rule_test:
+      - eval_time: 20m
+        alertname: AuditOutboxBacklogGrowing
+        exp_alerts:
+          - exp_labels:
+              queue: external_operations
+              severity: warning
+              service: telegram-bot
+              component: audit
+            exp_annotations:
+              summary: Audit outbox backlog is growing
+              description: The external_operations queue has remained above its value from 15 minutes ago for five minutes.
+      - eval_time: 30m
+        alertname: AuditOutboxBacklogGrowing
+        exp_alerts: []

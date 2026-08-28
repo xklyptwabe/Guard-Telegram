@@ -3,6 +3,7 @@ import 'dotenv/config';
 import { migrate } from 'drizzle-orm/node-postgres/migrator';
 
 import { validateConfig } from './config.js';
+import { startBackendApiServer, type BackendApiController } from './api/server.js';
 import { collectCommands, registerCommands } from './core/commandRegistrar.js';
 import { CommandDispatcher } from './core/dispatcher.js';
 import { validateModules } from './core/loader.js';
@@ -13,8 +14,9 @@ import { createDatabase } from './db/client.js';
 import { purgeExpiredConsumedEnvelopes, purgeExpiredProcessedUpdates } from './db/retention.js';
 import { createRedis } from './db/redis.js';
 import { initializeI18n } from './i18n/index.js';
+import { makeCommandAuditFinalizer, registerCommandAuditResolver } from './lib/audit/commandAudit.js';
+import { AuditMetrics } from './lib/audit/metrics.js';
 import { AuditService } from './lib/auditService.js';
-import { startBackendApiServer, type BackendApiController } from './api/server.js';
 import { ChatSettingsService } from './lib/chatSettings.js';
 import { Cooldowns } from './lib/cooldowns.js';
 import { EventBus } from './lib/eventBus.js';
@@ -23,11 +25,11 @@ import { Logger } from './lib/logger.js';
 import { ModerationService } from './lib/moderation/moderationService.js';
 import { PendingOperationResolvers, PendingOperationsOutbox } from './lib/moderation/pendingOperationsOutbox.js';
 import { buildOutboxFinalizer, makeIntegrationAuditFinalizer } from './lib/integrations/externalOperationGateway.js';
-import { makeCommandAuditFinalizer, registerCommandAuditResolver } from './lib/audit/commandAudit.js';
 import { createRabbitMq, registerPlatformRabbitActionSchemas } from './lib/rabbitmq.js';
 import { ReplyService } from './lib/reply.js';
 import { createStorage } from './lib/storage.js';
 import { createModules } from './modules/index.js';
+import { startOperationalServer, type OperationalServerController } from './ops/server.js';
 
 async function bootstrap(): Promise<void> {
   const config = validateConfig();
@@ -42,6 +44,7 @@ async function bootstrap(): Promise<void> {
   let moderation: ModerationService | undefined;
   let sharedOutbox: PendingOperationsOutbox | undefined;
   let backendApi: BackendApiController | undefined;
+  let operationalServer: OperationalServerController | undefined;
   let shuttingDown = false;
 
   const shutdown = async (signal: string): Promise<void> => {
@@ -54,7 +57,7 @@ async function bootstrap(): Promise<void> {
     // return while a sweep was mid-finalize, stranding rows and re-running
     // the whole operation after restart).
     await sharedOutbox?.stopAndDrain();
-    const closers = [transport?.stop(), backendApi?.stop(), rabbitMq?.close(), redis?.close(), storage?.close(), database.close()].filter(
+    const closers = [transport?.stop(), backendApi?.stop(), operationalServer?.stop(), rabbitMq?.close(), redis?.close(), storage?.close(), database.close()].filter(
       (operation): operation is Promise<void> => operation !== undefined,
     );
     const results = await Promise.allSettled(closers);
@@ -72,8 +75,10 @@ async function bootstrap(): Promise<void> {
     logger.info({ event: 'database.migrations.completed' });
     await purgeExpiredProcessedUpdates(database.db);
     await purgeExpiredConsumedEnvelopes(database.db);
-    redis = await createRedis(config, logger);
-    const audit = new AuditService(database.db);
+    const connectedRedis = await createRedis(config, logger);
+    redis = connectedRedis;
+    const auditMetrics = new AuditMetrics(database.db);
+    const audit = new AuditService(database.db, auditMetrics);
     const bot = createTelegramBot(config, logger);
     await bot.init();
 
@@ -101,9 +106,11 @@ async function bootstrap(): Promise<void> {
       }),
     );
     sharedOutbox = pendingOperationsOutbox;
-    storage = createStorage(config, logger, pendingOperationsOutbox, pendingOperationResolvers);
-    rabbitMq = await createRabbitMq(config, logger, audit, pendingOperationsOutbox, pendingOperationResolvers, database.db);
-    registerPlatformRabbitActionSchemas(rabbitMq);
+    const objectStorage = createStorage(config, logger, pendingOperationsOutbox, pendingOperationResolvers);
+    storage = objectStorage;
+    const rabbitMqBridge = await createRabbitMq(config, logger, audit, pendingOperationsOutbox, pendingOperationResolvers, database.db);
+    rabbitMq = rabbitMqBridge;
+    registerPlatformRabbitActionSchemas(rabbitMqBridge);
     const chatSettings = new ChatSettingsService(database.db, audit);
     moderation = new ModerationService(bot, audit, pendingOperationsOutbox, pendingOperationResolvers, logger);
     registerCommandAuditResolver(pendingOperationResolvers);
@@ -137,7 +144,13 @@ async function bootstrap(): Promise<void> {
     if (config.backendApiEnabled) {
       backendApi = await startBackendApiServer(config, database.db, audit, logger);
     }
-    logger.info({ event: 'bootstrap.completed', details: { ...healthSnapshot(config, redis, storage, rabbitMq) } });
+    const getHealth = () => healthSnapshot(config, connectedRedis, objectStorage, rabbitMqBridge, auditMetrics, logger);
+    operationalServer = await startOperationalServer(
+      config,
+      { health: getHealth, metricsRegistry: auditMetrics.registry },
+      logger,
+    );
+    logger.info({ event: 'bootstrap.completed', details: { ...(await getHealth()) } });
   } catch (error: unknown) {
     logger.error({ event: 'bootstrap.failed', error: { name: error instanceof Error ? error.name : 'UnknownError', message: error instanceof Error ? error.message : String(error) } });
     await shutdown('bootstrap_failed');

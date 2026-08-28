@@ -2,6 +2,8 @@ import { describe, expect, it } from 'vitest';
 
 import { entitySnapshots, events, outbox } from '../../src/db/schema/audit.js';
 import { AuditService, ForbiddenAuditValueError } from '../../src/lib/auditService.js';
+import type { AuditMetricsRecorder, AuditRejectionStatus } from '../../src/lib/audit/metrics.js';
+import type { AuditEventStatus } from '../../src/lib/audit/enums.js';
 import type { AuditPolicyResolutionRow } from '../../src/lib/audit/policyResolution.js';
 
 describe('AuditService persistence safety', () => {
@@ -340,7 +342,153 @@ describe('AuditService persistence safety', () => {
     expect(mutationCalled).toBe(false);
     expect(database.captured.event).toBeUndefined();
   });
+
+  it('records metrics only after a successful audit transaction', async () => {
+    const database = fakeAuditDatabase();
+    const captured = fakeAuditMetrics();
+    const audit = new AuditService(database.db as never, captured.metrics);
+
+    await audit.recordEntityChange(
+      {
+        tenantId: 'chat-1',
+        subjectType: 'chat_module_state',
+        subjectId: 'chat-1:moderation',
+        eventType: 'module.state.changed',
+        eventVersion: 'v1',
+        category: 'module',
+        source: 'unit-test',
+        idempotencyKey: 'unit:audit-service:metrics',
+      },
+      async () => ({
+        before: undefined,
+        after: { enabled: true, source: 'override' },
+        snapshotData: { chatId: 'chat-1', moduleId: 'moderation', enabled: true, source: 'override' },
+      }),
+    );
+
+    expect(captured.writes).toEqual([
+      expect.objectContaining({ eventType: 'module.state.changed', status: 'recorded', duplicate: false }),
+    ]);
+    expect(captured.rejections).toEqual([]);
+  });
+
+  it('records a validation rejection without swallowing the original error', async () => {
+    const database = fakeAuditDatabase();
+    const captured = fakeAuditMetrics();
+    const audit = new AuditService(database.db as never, captured.metrics);
+
+    await expect(
+      audit.recordEntityChange(
+        {
+          tenantId: 'chat-1',
+          subjectType: 'chat_module_state',
+          subjectId: 'chat-1:moderation',
+          eventType: 'module.state.changed',
+          eventVersion: 'v1',
+          category: 'module',
+          source: 'postgres://must-not-be-persisted',
+          idempotencyKey: 'unit:audit-service:metrics-rejection',
+        },
+        async () => ({
+          before: undefined,
+          after: { enabled: true, source: 'override' },
+          snapshotData: { chatId: 'chat-1', moduleId: 'moderation', enabled: true, source: 'override' },
+        }),
+      ),
+    ).rejects.toThrow(ForbiddenAuditValueError);
+
+    expect(captured.writes).toEqual([]);
+    expect(captured.rejections).toEqual([
+      expect.objectContaining({ eventType: 'module.state.changed', status: 'validation_failed' }),
+    ]);
+  });
+
+  it('does not report a business mutation failure as an audit write failure', async () => {
+    const database = fakeAuditDatabase();
+    const captured = fakeAuditMetrics();
+    const audit = new AuditService(database.db as never, captured.metrics);
+    const businessError = new Error('business mutation failed');
+
+    await expect(
+      audit.recordEntityChange(
+        {
+          tenantId: 'chat-1',
+          subjectType: 'chat_module_state',
+          subjectId: 'chat-1:moderation',
+          eventType: 'module.state.changed',
+          eventVersion: 'v1',
+          category: 'module',
+          source: 'unit-test',
+          idempotencyKey: 'unit:audit-service:business-failure',
+        },
+        async () => Promise.reject(businessError),
+      ),
+    ).rejects.toBe(businessError);
+
+    expect(captured.writes).toEqual([]);
+    expect(captured.rejections).toEqual([]);
+  });
+
+  it('reports an infrastructure failure as a mandatory audit write failure', async () => {
+    const databaseError = new Error('database unavailable');
+    const captured = fakeAuditMetrics();
+    const audit = new AuditService(
+      { transaction: async () => Promise.reject(databaseError) } as never,
+      captured.metrics,
+    );
+    let mutationCalled = false;
+
+    await expect(
+      audit.recordEntityChange(
+        {
+          tenantId: 'chat-1',
+          subjectType: 'chat_module_state',
+          subjectId: 'chat-1:moderation',
+          eventType: 'module.state.changed',
+          eventVersion: 'v1',
+          category: 'module',
+          source: 'unit-test',
+          idempotencyKey: 'unit:audit-service:write-failure',
+        },
+        async () => {
+          mutationCalled = true;
+          return {
+            before: undefined,
+            after: { enabled: true, source: 'override' },
+            snapshotData: { chatId: 'chat-1', moduleId: 'moderation', enabled: true, source: 'override' },
+          };
+        },
+      ),
+    ).rejects.toBe(databaseError);
+
+    expect(mutationCalled).toBe(false);
+    expect(captured.writes).toEqual([]);
+    expect(captured.rejections).toEqual([
+      expect.objectContaining({ eventType: 'module.state.changed', status: 'write_failed' }),
+    ]);
+  });
 });
+
+function fakeAuditMetrics(): {
+  readonly metrics: AuditMetricsRecorder;
+  readonly writes: Array<{ eventType: string; status: AuditEventStatus; duplicate: boolean; durationMs: number }>;
+  readonly rejections: Array<{ eventType: string; status: AuditRejectionStatus; durationMs: number }>;
+} {
+  const writes: Array<{ eventType: string; status: AuditEventStatus; duplicate: boolean; durationMs: number }> = [];
+  const rejections: Array<{ eventType: string; status: AuditRejectionStatus; durationMs: number }> = [];
+  return {
+    writes,
+    rejections,
+    metrics: {
+      recordWrite(eventType, status, duplicate, durationMs) {
+        writes.push({ eventType, status, duplicate, durationMs });
+      },
+      recordRejection(eventType, status, durationMs) {
+        rejections.push({ eventType, status, durationMs });
+      },
+    },
+  };
+}
 
 function fakeAuditDatabase(policyOverrides: Partial<AuditPolicyResolutionRow> = {}) {
   const captured: { event?: Record<string, unknown>; outbox?: Record<string, unknown> } = {};

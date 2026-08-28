@@ -225,6 +225,13 @@
       "when": 1787755000000,
       "tag": "0031_order_pending_operations_by_supersession",
       "breakpoints": true
+    },
+    {
+      "idx": 32,
+      "version": "7",
+      "when": 1787930000000,
+      "tag": "0032_optimize_audit_event_pagination",
+      "breakpoints": true
     }
   ]
 }
