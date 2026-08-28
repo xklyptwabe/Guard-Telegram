@@ -106,6 +106,6 @@ GitLab CI follows `quality → build → deploy`. Stage and production deploy jo
 - Telegram IDs are stored as `text`, preserving every external ID exactly.
 - Any state-changing module operation must rely on the `processed_updates` idempotency gate and Drizzle transactions/services rather than event-bus delivery.
 - RabbitMQ uses a confirm channel and persistent messages. Failed actions retry through a TTL queue; exhausted or malformed items go to DLQ.
-- Health reports transport and optional dependency state without messages or payloads. A degraded Redis/S3 path does not make the process unhealthy; an enabled RabbitMQ bridge without a connection does.
+- The loopback operational server exposes `GET /health` and Prometheus `GET /metrics`. Health contains only aggregate dependency and audit/outbox state; it never includes audit snapshots, metadata, Telegram context, or business identifiers. A degraded Redis path does not make the process unhealthy; an enabled RabbitMQ bridge without a connection does.
 
 Detailed implementation contracts are in [docs/modules](docs/modules), design decisions in [docs/adr](docs/adr), and runbooks in [docs/infra](docs/infra).

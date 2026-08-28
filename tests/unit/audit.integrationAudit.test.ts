@@ -72,6 +72,8 @@ describe('recordIntegrationAction', () => {
     expect(failed.result.after).toMatchObject({ outcome: 'failed', success: false });
     expect(unknown.result.after).toMatchObject({ outcome: 'unknown', success: false });
     expect(failed.result.after.outcome).not.toBe(unknown.result.after.outcome);
+    expect((calls[0] as { input: { status: string } }).input.status).toBe('failed');
+    expect((calls[1] as { input: { status: string } }).input.status).toBe('unknown');
   });
 
   it('includes statusCode only when provided (never fabricates one)', async () => {
@@ -135,5 +137,21 @@ describe('recordIntegrationAction', () => {
 
     const call = calls[0] as { input: { tenantId: string } };
     expect(call.input.tenantId).toBe('-100555');
+  });
+
+  it('passes moduleId to AuditService so module-specific effective policy can win', async () => {
+    const { audit, calls } = fakeAuditService();
+
+    await recordIntegrationAction(audit, fakeLogger(), {
+      integrationId: 'telegram',
+      action: 'sendMessage',
+      targetType: 'chat',
+      targetId: '-100555',
+      chatId: '-100555',
+      moduleId: 'moderation',
+      outcome: 'succeeded',
+    });
+
+    expect((calls[0] as { input: { moduleId?: string } }).input.moduleId).toBe('moderation');
   });
 });

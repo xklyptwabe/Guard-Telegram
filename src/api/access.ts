@@ -79,4 +79,3 @@ function bearerToken(authorizationHeader: string | readonly string[] | undefined
   return match?.[1];
 }
 
-

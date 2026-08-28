@@ -1,4 +1,4 @@
-import type { SnapshotStatus } from './enums.js';
+import type { AuditEventStatus, AuditOperation, SnapshotStatus } from './enums.js';
 import type { AuditEventName } from './eventMap.js';
 import { auditEventRegistry, type AuditEventRegistry } from './registry.js';
 import type { AuditRecord } from './types.js';
@@ -115,6 +115,7 @@ export interface DownstreamAuditEventInput extends DownstreamAuditIdentity {
   readonly category: string;
   readonly source: string;
   readonly idempotencyKey: string;
+  readonly status?: AuditEventStatus;
   /**
    * Feeds BOTS-8's hierarchical policy resolution (global → chat → module →
    * event_type). Without it, a module-level policy override can never
@@ -338,6 +339,11 @@ export function buildMetadataBridge(record: AuditRecord): Record<string, unknown
   return { operation: record.operation };
 }
 
+export function auditEventStatusForOperation(operation: AuditOperation): AuditEventStatus {
+  if (operation === 'failed' || operation === 'unknown') return operation;
+  return 'recorded';
+}
+
 /**
  * Builds the `AuditEventInput` half of a `recordEntityChange` call.
  * `idempotencyKey` follows the same `${eventType}:${...identity}` shape
@@ -390,6 +396,7 @@ export function toDownstreamInput(record: AuditRecord, registry: AuditEventRegis
     category: definition.category,
     source: 'bots7-registry',
     idempotencyKey: idempotencyKeyFor(record, subject, afterFields),
+    status: auditEventStatusForOperation(record.operation),
     // `exactOptionalPropertyTypes` in the real repo's tsconfig forbids
     // assigning `undefined` to an optional field directly — these must be
     // omitted entirely, not set to undefined, when there's no value.

@@ -216,12 +216,12 @@ describe('ModuleRegistry.setEnabled — BOTS-7/BOTS-6 wiring', () => {
     const module = fakeModule('welcome', true);
     const { registry, calls } = fakeRegistry(module, true);
 
-    await runWithUpdateContext({ updateId: 'update-42', chatId: 'chat-1', userId: 'user-1' }, () =>
+    await runWithUpdateContext({ updateId: 'update-42', botId: 'bot-42', chatId: 'chat-1', userId: 'user-1' }, () =>
       registry.setEnabled('chat-1', 'welcome', true, 'user-1'),
     );
 
     const call = calls[0] as { input: { idempotencyKey: string } };
-    expect(call.input.idempotencyKey).toBe('module.state.changed:telegram-update:unscoped-bot:update-42:chat-1:welcome');
+    expect(call.input.idempotencyKey).toBe('module.state.changed:telegram-update:bot-42:update-42:chat-1:welcome');
   });
 
   it('uses an explicit idempotency key when setEnabled is called outside a Telegram update context', async () => {

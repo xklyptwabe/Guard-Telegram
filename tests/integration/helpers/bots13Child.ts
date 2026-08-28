@@ -41,6 +41,7 @@ const silentLogger = { info: () => undefined, debug: () => undefined, warn: () =
 
 function hangBot() {
   return {
+    botInfo: { id: 42 },
     api: {
       raw: {
         banChatMember: () => new Promise<never>(() => undefined),
@@ -63,7 +64,7 @@ function workingBot() {
     restrictChatMember: async () => true,
     deleteMessage: async () => true,
   };
-  return { api: { raw } };
+  return { botInfo: { id: 42 }, api: { raw } };
 }
 
 async function main(): Promise<void> {

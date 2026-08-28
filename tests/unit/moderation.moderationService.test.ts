@@ -33,6 +33,7 @@ function fakeAuditService() {
 
 function fakeBot() {
   return {
+    botInfo: { id: 777 },
     api: {
       raw: {
         banChatMember: vi.fn(async () => true),
@@ -60,11 +61,13 @@ describe('ModerationService', () => {
     const { audit, calls } = fakeAuditService();
     const service = new ModerationService(bot as never, audit, outbox, resolvers, logger());
 
-    const outcome = await runWithUpdateContext({ updateId: '1', chatId: '-100111' }, () => service.ban({ chatId: '-100111', targetUserId: '2', actorUserId: '9', reason: 'spam' }));
+    const outcome = await runWithUpdateContext({ updateId: '1', botId: 'bot-42', chatId: '-100111' }, () => service.ban({ chatId: '-100111', targetUserId: '2', actorUserId: '9', reason: 'spam' }));
 
     expect(outcome).toEqual({ status: 'succeeded', willRetry: false, detail: {} });
     expect(bot.api.raw.banChatMember).toHaveBeenCalledTimes(1);
     expect(bot.api.raw.banChatMember).toHaveBeenCalledWith({ chat_id: -100111, user_id: 2 });
+    expect(db.rows[0]?.idempotencyKey).toBe('moderation.action:telegram-update:bot-42:1:-100111:2:ban');
+    expect(db.rows[0]?.supersessionKey).toBe('moderation.member-state:-100111:2');
     expect(calls).toHaveLength(1);
     const call = calls[0] as { input: { eventType: string }; result: { after?: Record<string, unknown>; metadata?: Record<string, unknown> } };
     expect(call.input.eventType).toBe('moderation.action');
@@ -81,7 +84,8 @@ describe('ModerationService', () => {
     const outcome = await runWithUpdateContext({ updateId: '1', chatId: '-100111' }, () => service.ban({ chatId: '-100111', targetUserId: '2', actorUserId: '9' }));
 
     expect(outcome.status).toBe('failed');
-    const call = calls[0] as { result: { metadata?: Record<string, unknown> } };
+    const call = calls[0] as { input: { status?: string }; result: { metadata?: Record<string, unknown> } };
+    expect(call.input.status).toBe('failed');
     expect(call.result.metadata).toMatchObject({ operation: 'failed' });
   });
 
@@ -110,6 +114,44 @@ describe('ModerationService', () => {
     expect(calls).toHaveLength(1);
     const call = calls[0] as { result: { after?: Record<string, unknown> } };
     expect(call.result.after).toMatchObject({ action: 'kick' });
+  });
+
+  it.each([
+    ['the acting user', '9'],
+    ['the bot itself', '777'],
+  ])('kick(): rejects %s before WAL, Telegram, or audit work', async (_case, targetUserId) => {
+    const bot = fakeBot();
+    const { audit, calls } = fakeAuditService();
+    const service = new ModerationService(bot as never, audit, outbox, resolvers, logger());
+
+    await expect(
+      runWithUpdateContext({ updateId: 'unsafe-kick', chatId: '-100111', botId: '777' }, () =>
+        service.kick({ chatId: '-100111', targetUserId, actorUserId: '9' }),
+      ),
+    ).rejects.toThrow(/unsafe moderation target/i);
+
+    expect(bot.api.raw.banChatMember).not.toHaveBeenCalled();
+    expect(bot.api.raw.unbanChatMember).not.toHaveBeenCalled();
+    expect(audit.maskOutboxMetadata).not.toHaveBeenCalled();
+    expect(calls).toHaveLength(0);
+    expect(db.rows).toHaveLength(0);
+  });
+
+  it('applies the same service-level self-target guard to non-kick moderation paths', async () => {
+    const bot = fakeBot();
+    const { audit, calls } = fakeAuditService();
+    const service = new ModerationService(bot as never, audit, outbox, resolvers, logger());
+
+    await expect(
+      runWithUpdateContext({ updateId: 'unsafe-ban', chatId: '-100111', botId: '777' }, () =>
+        service.ban({ chatId: '-100111', targetUserId: '9', actorUserId: '9' }),
+      ),
+    ).rejects.toThrow(/unsafe moderation target/i);
+
+    expect(bot.api.raw.banChatMember).not.toHaveBeenCalled();
+    expect(audit.maskOutboxMetadata).not.toHaveBeenCalled();
+    expect(calls).toHaveLength(0);
+    expect(db.rows).toHaveLength(0);
   });
 
   it('kick(): stops after a confirmed ban failure and never attempts the unban step', async () => {
@@ -182,10 +224,11 @@ describe('ModerationService', () => {
     const { audit, calls } = fakeAuditService();
     const service = new ModerationService(bot as never, audit, outbox, resolvers, logger());
 
-    const outcome = await runWithUpdateContext({ updateId: '1', chatId: '-100111' }, () => service.deleteMessage('-100111', '55', '9', '2'));
+    const outcome = await runWithUpdateContext({ updateId: '1', botId: 'bot-42', chatId: '-100111' }, () => service.deleteMessage('-100111', '55', '9', '2'));
 
     expect(outcome.status).toBe('succeeded');
     expect(bot.api.raw.deleteMessage).toHaveBeenCalledWith({ chat_id: -100111, message_id: 55 });
+    expect(db.rows[0]?.idempotencyKey).toBe('moderation.delete:telegram-update:bot-42:1:-100111:55');
     expect(calls).toHaveLength(1);
     const call = calls[0] as unknown as { input: { eventType: string } };
     expect(call.input.eventType).toBe('message.deleted');

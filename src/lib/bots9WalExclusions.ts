@@ -4,10 +4,6 @@
  * Changing the set requires an explicit review, not a silent new call site.
  */
 export const BOTS9_WAL_EXCLUSIONS = [
-  'telegram.sendMessage',
-  'telegram.answerCallbackQuery',
-  'telegram.setMyCommands',
-  'telegram.setWebhook',
   'rabbitmq.ack',
   'rabbitmq.nack',
 ] as const;

@@ -3,7 +3,7 @@ import { z } from 'zod';
 
 import type { DrizzleDatabase } from '../../db/client.js';
 import { eventPolicies, events, eventTypes } from '../../db/schema/audit.js';
-import type { EventCategory } from './enums.js';
+import type { AuditEventStatus, EventCategory } from './enums.js';
 import {
   readAuditPolicyResolutionRows,
   resolveEffectiveAuditPolicyFromRows,
@@ -14,7 +14,7 @@ import { PLATFORM_TENANT_SENTINEL } from './serviceAdapter.js';
 export const AUDIT_EVENTS_DEFAULT_LIMIT = 50;
 export const AUDIT_EVENTS_MAX_LIMIT = 100;
 
-export type AuditEventStatus = 'recorded' | 'failed';
+export type { AuditEventStatus } from './enums.js';
 
 export interface AuditEventsReadScope {
   readonly systemAdmin: boolean;
@@ -409,13 +409,7 @@ function auditEventsWhereConditions(
   if (filters.correlationId !== undefined) conditions.push(eq(events.correlationId, filters.correlationId));
   if (cursor !== undefined) {
     conditions.push(
-      or(
-        sql`${events.occurredAt} < ${cursor.occurredAt}::timestamptz`,
-        and(
-          sql`${events.occurredAt} = ${cursor.occurredAt}::timestamptz`,
-          sql`${events.id} < ${cursor.id}::uuid`,
-        ),
-      )!,
+      sql`(${events.occurredAt}, ${events.id}) < (${cursor.occurredAt}::timestamptz, ${cursor.id}::uuid)`,
     );
   }
   return conditions;

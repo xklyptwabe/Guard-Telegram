@@ -13,11 +13,11 @@ export type InboxClaim =
   | 'claimed'
   /** A previous delivery of this update already fully completed — the dedup case. */
   | 'completed'
-  /** Someone else is processing it right now (live lease) or attempts are exhausted — skip, redelivery will retry if allowed. */
+  /** Someone else is processing it right now or the retry backoff has not elapsed. */
   | 'busy';
 
 /** Why a `busy` claim happened — lets the webhook transport decide whether to answer 409 (retry later) or 200 (give up). */
-export type InboxBusyReason = 'lease_held' | 'backoff' | 'exhausted';
+export type InboxBusyReason = 'lease_held' | 'backoff';
 
 /**
  * BOTS-9 review finding (BLOCKER-5): replaces the old insert-marker-before-
@@ -36,7 +36,7 @@ export type InboxBusyReason = 'lease_held' | 'backoff' | 'exhausted';
  * processing completed, atomically:
  *
  *  - `begin()` inserts-if-absent then claims via a single conditional
- *    UPDATE (status eligible AND attempts remaining) — two concurrent
+ *    UPDATE (status eligible) — two concurrent
  *    deliveries of the same update_id cannot both claim.
  *  - `complete()`/`fail()` are compare-and-swaps on this worker's claim:
  *    if the lease expired and someone else took over, this worker's
@@ -48,7 +48,7 @@ export class UpdateInbox {
   public constructor(
     private readonly db: DrizzleDatabase,
     private readonly logger: Logger,
-    private readonly maxAttempts: number = INBOX_MAX_ATTEMPTS,
+    private readonly backoffExponentCap: number = INBOX_MAX_ATTEMPTS,
     private readonly leaseDurationMs: number = INBOX_LEASE_DURATION_MS,
   ) {}
 
@@ -74,7 +74,7 @@ export class UpdateInbox {
         nextAttemptAt: null,
         updatedAt: now,
       })
-      .where(and(eq(processedUpdates.botId, botId), eq(processedUpdates.updateId, updateId), this.eligibility(now), sql`${processedUpdates.attemptCount} < ${this.maxAttempts}`))
+      .where(and(eq(processedUpdates.botId, botId), eq(processedUpdates.updateId, updateId), this.eligibility(now)))
       .returning({ attemptCount: processedUpdates.attemptCount });
     if (claimed[0]) return { claim: 'claimed', attemptCount: claimed[0].attemptCount };
 
@@ -89,7 +89,6 @@ export class UpdateInbox {
     // confirming a 200 for an update that is still owed work.
     const leaseHeld = row?.status === 'processing' && row.leaseExpiresAt !== null && new Date(row.leaseExpiresAt) > now;
     if (leaseHeld) return { claim: 'busy', attemptCount: row?.attemptCount ?? 0, busyReason: 'lease_held' };
-    if ((row?.attemptCount ?? 0) >= this.maxAttempts) return { claim: 'busy', attemptCount: row?.attemptCount ?? 0, busyReason: 'exhausted' };
     return { claim: 'busy', attemptCount: row?.attemptCount ?? 0, busyReason: 'backoff' };
   }
 
@@ -125,7 +124,7 @@ export class UpdateInbox {
         status: 'failed',
         workerId: null,
         leaseExpiresAt: null,
-        nextAttemptAt: new Date(now.getTime() + INBOX_RETRY_BASE_DELAY_MS * 2 ** Math.max(attemptCount - 1, 0)),
+        nextAttemptAt: new Date(now.getTime() + INBOX_RETRY_BASE_DELAY_MS * 2 ** Math.min(Math.max(attemptCount - 1, 0), this.backoffExponentCap - 1)),
         lastError: errorSummary,
         updatedAt: now,
       })

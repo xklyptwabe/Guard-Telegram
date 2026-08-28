@@ -1,21 +1,26 @@
 import { and, eq } from 'drizzle-orm';
 
 import { getUpdateContext } from './context.js';
-import type { SnapshotStatus } from './audit/enums.js';
+import type { AuditEventStatus, SnapshotStatus } from './audit/enums.js';
 import {
   AUDIT_OPERATIONAL_METADATA_ALLOWLIST,
   applyAllowlist,
   isForbiddenAuditString,
-  stripForbidden,
   type AuditPolicyContext,
 } from './audit/masking.js';
 import { resolveEffectiveAuditPolicy, type EffectiveAuditPolicy } from './audit/policyResolution.js';
-import { AuditSnapshotValidationError } from './audit/errors.js';
+import {
+  AuditSnapshotValidationError,
+  UnregisteredAuditEventError,
+  UnsupportedAuditEventVersionError,
+} from './audit/errors.js';
+import type { AuditMetricsRecorder, AuditRejectionStatus } from './audit/metrics.js';
 import {
   normalizeAuditMutationForPersistence,
   requireAuditPersistenceDefinition,
   type NormalizedAuditPersistenceMutation,
 } from './audit/persistenceValidation.js';
+import { auditEventRegistry } from './audit/registry.js';
 import type { DrizzleDatabase } from '../db/client.js';
 import { entitySnapshots, events, outbox } from '../db/schema/audit.js';
 
@@ -34,6 +39,7 @@ export interface AuditEventInput extends AuditIdentity {
   readonly category: string;
   readonly source: string;
   readonly idempotencyKey: string;
+  readonly status?: AuditEventStatus;
   readonly actorId?: string;
   readonly actorType?: string;
   readonly correlationId?: string;
@@ -51,7 +57,7 @@ export interface AuditChange<TSnapshot extends Record<string, unknown>> {
   readonly changes?: Record<string, unknown>;
   readonly metadata?: Record<string, unknown>;
   readonly snapshotStatus?: AuditEntitySnapshotStatus;
-  readonly snapshotData: TSnapshot;
+  readonly snapshotData: TSnapshot | null;
 }
 
 export type AuditMutationResult<TSnapshot extends Record<string, unknown>> = AuditChange<TSnapshot>;
@@ -87,7 +93,10 @@ export class ForbiddenAuditValueError extends Error {
 }
 
 export class AuditService {
-  public constructor(private readonly db: DrizzleDatabase) {}
+  public constructor(
+    private readonly db: DrizzleDatabase,
+    private readonly metrics?: AuditMetricsRecorder,
+  ) {}
 
   /** Apply BOTS-8 masking to outbox metadata before it is persisted. */
   public async maskOutboxMetadata(input: {
@@ -103,11 +112,16 @@ export class AuditService {
       chatId: input.tenantId,
       ...(input.moduleId !== undefined ? { moduleId: input.moduleId } : {}),
     });
-    const metadata = { ...input.metadata };
-    for (const field of policy.values.masking) {
-      if (field in metadata) metadata[field] = '[redacted]';
-    }
-    return stripForbidden(metadata);
+    const definition = requireAuditPersistenceDefinition({
+      eventType: input.eventType,
+      eventVersion: input.eventVersion,
+      category: policyCategory(input.eventType, input.eventVersion),
+    });
+    return applyAllowlist(input.metadata, definition.allowlist, {
+      allowMessageTextLogging: policy.values.allowlist.includes('text'),
+      allowlist: policy.values.allowlist,
+      ...(policy.values.masking.length > 0 ? { masking: policy.values.masking } : {}),
+    });
   }
 
   /**
@@ -137,6 +151,7 @@ export class AuditService {
         chatId: input.tenantId,
         ...(input.moduleId !== undefined ? { moduleId: input.moduleId } : {}),
       });
+      if (!policy.values.enabled || policy.values.snapshotMode !== 'snapshot') return;
       const definition = requireAuditPersistenceDefinition({
         eventType: input.eventType,
         eventVersion: input.eventVersion,
@@ -152,6 +167,7 @@ export class AuditService {
         definition.allowlist,
         {
           allowMessageTextLogging: policy.values.allowlist.includes('text'),
+          allowlist: policy.values.allowlist,
           ...(policy.values.masking.length > 0 ? { masking: policy.values.masking } : {}),
         },
       );
@@ -162,7 +178,7 @@ export class AuditService {
           entityType: input.subjectType,
           entityId: input.subjectId,
           snapshotStatus: 'current',
-          snapshotData: {},
+          snapshotData: null,
           lastSubjectSequence: 0,
         })
         .onConflictDoNothing({ target: [entitySnapshots.tenantId, entitySnapshots.entityType, entitySnapshots.entityId] });
@@ -172,7 +188,7 @@ export class AuditService {
         .where(snapshotWhere)
         .limit(1)
         .for('update');
-      const existing = rows[0]?.snapshotData as Record<string, unknown> | undefined;
+      const existing = rows[0]?.snapshotData as Record<string, unknown> | null | undefined;
       const existingId = typeof existing?.observedUpdateId === 'number' ? existing.observedUpdateId : undefined;
       if (existing && Object.keys(existing).length > 0 && existingId !== undefined && existingId >= input.observedUpdateId) {
         return;
@@ -185,6 +201,32 @@ export class AuditService {
   }
 
   public async recordEntityChange<TSnapshot extends Record<string, unknown>>(
+    input: AuditEventInput,
+    mutate: (tx: AuditTransaction, nextSubjectSequence: number) => Promise<AuditMutationResult<TSnapshot>>,
+  ): Promise<{ readonly eventId: string; readonly subjectSequence: number; readonly duplicate: boolean }> {
+    const startedAt = performance.now();
+    let mutationFailed = false;
+    let result: { readonly eventId: string; readonly subjectSequence: number; readonly duplicate: boolean };
+    try {
+      result = await this.persistEntityChange(input, async (tx, nextSubjectSequence) => {
+        try {
+          return await mutate(tx, nextSubjectSequence);
+        } catch (error: unknown) {
+          mutationFailed = true;
+          throw error;
+        }
+      });
+    } catch (error: unknown) {
+      if (!mutationFailed) {
+        this.metrics?.recordRejection(input.eventType, auditRejectionStatus(error), performance.now() - startedAt);
+      }
+      throw error;
+    }
+    this.metrics?.recordWrite(input.eventType, input.status ?? 'recorded', result.duplicate, performance.now() - startedAt);
+    return result;
+  }
+
+  private async persistEntityChange<TSnapshot extends Record<string, unknown>>(
     input: AuditEventInput,
     mutate: (tx: AuditTransaction, nextSubjectSequence: number) => Promise<AuditMutationResult<TSnapshot>>,
   ): Promise<{ readonly eventId: string; readonly subjectSequence: number; readonly duplicate: boolean }> {
@@ -202,6 +244,7 @@ export class AuditService {
           eventVersion: events.eventVersion,
           category: events.category,
           source: events.source,
+          status: events.status,
           actorId: events.actorId,
           actorType: events.actorType,
           subjectType: events.subjectType,
@@ -240,7 +283,7 @@ export class AuditService {
           entityType: input.subjectType,
           entityId: input.subjectId,
           snapshotStatus: 'current',
-          snapshotData: {},
+          snapshotData: null,
           lastSubjectSequence: 0,
         })
         .onConflictDoNothing({ target: [entitySnapshots.tenantId, entitySnapshots.entityType, entitySnapshots.entityId] });
@@ -283,6 +326,7 @@ export class AuditService {
           category: input.category,
           occurredAt: new Date(),
           source: input.source,
+          status: input.status ?? 'recorded',
           tenantId: input.tenantId,
           actorId: input.actorId,
           actorType: input.actorType,
@@ -311,6 +355,7 @@ export class AuditService {
           eventType: input.eventType,
           eventVersion: input.eventVersion,
           category: input.category,
+          status: input.status ?? 'recorded',
           tenantId: input.tenantId,
           subjectType: input.subjectType,
           subjectId: input.subjectId,
@@ -340,6 +385,20 @@ export class AuditService {
   }
 }
 
+function auditRejectionStatus(error: unknown): AuditRejectionStatus {
+  if (error instanceof AuditPolicyDisabledError) return 'policy_disabled';
+  if (error instanceof AuditIdempotencyConflictError) return 'idempotency_conflict';
+  if (
+    error instanceof AuditSnapshotValidationError ||
+    error instanceof UnregisteredAuditEventError ||
+    error instanceof UnsupportedAuditEventVersionError ||
+    error instanceof ForbiddenAuditValueError
+  ) {
+    return 'validation_failed';
+  }
+  return 'write_failed';
+}
+
 function sameIdempotentOperation(
   existing: {
     readonly tenantId: string;
@@ -347,6 +406,7 @@ function sameIdempotentOperation(
     readonly eventVersion: string;
     readonly category: string;
     readonly source: string;
+    readonly status: AuditEventStatus;
     readonly actorId: string | null;
     readonly actorType: string | null;
     readonly subjectType: string;
@@ -360,11 +420,18 @@ function sameIdempotentOperation(
     existing.eventVersion === input.eventVersion &&
     existing.category === input.category &&
     existing.source === input.source &&
+    existing.status === (input.status ?? 'recorded') &&
     existing.actorId === (input.actorId ?? null) &&
     existing.actorType === (input.actorType ?? null) &&
     existing.subjectType === input.subjectType &&
     existing.subjectId === input.subjectId
   );
+}
+
+function policyCategory(eventType: string, eventVersion: string): string {
+  const match = /^v(\d+)$/.exec(eventVersion);
+  if (!match) throw new Error(`Audit event version must use v<number> format, received "${eventVersion}"`);
+  return auditEventRegistry.requireSupportedVersion(eventType, Number(match[1])).category;
 }
 
 function buildPersistencePolicy(
@@ -388,8 +455,7 @@ function applySnapshotMode(
     after: undefined,
     beforeSnapshotStatus: redactObservedStatus(mutation.beforeSnapshotStatus),
     afterSnapshotStatus: redactObservedStatus(mutation.afterSnapshotStatus),
-    ...(mutation.changes === undefined ? {} : { changes: mutation.changes }),
-    snapshotData: {},
+    snapshotData: null,
   };
 }
 

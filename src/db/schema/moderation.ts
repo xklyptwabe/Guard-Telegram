@@ -6,10 +6,10 @@ const updatedAt = () => timestamp('updated_at', { withTimezone: true }).defaultN
 export const moderationSchema = pgSchema('moderation');
 
 /**
- * BOTS-9's write-ahead log / outbox for *external* operations — currently
- * Telegram Bot API calls that change moderation state (ban, unban, restrict,
- * unrestrict, kick, and the bot's own message deletions). This is a
- * different concern from `audit.outbox` (BOTS-6/7), which delivers an
+ * BOTS-9's shared durable operation/audit-debt outbox. It writes ahead
+ * external operations such as Telegram moderation calls, and retains
+ * audit-only checkpoints after already-observable command/Rabbit work. This
+ * is a different concern from `audit.outbox` (BOTS-6/7), which delivers an
  * *already-recorded* audit event onward to a destination. This table exists
  * to make the external call itself reliable:
  *
@@ -39,14 +39,20 @@ export const pendingOperations = moderationSchema.table(
   'pending_operations',
   {
     id: uuid('id').defaultRandom().primaryKey(),
-    /** Dot-separated operation kind, e.g. `telegram.banChatMember` — used to look up the retry handler on restart. */
+    /** Stable bot/deployment owner. Background recovery only claims rows owned by the current bot instance. */
+    ownerId: text('owner_id').notNull().default('legacy'),
+    /** Dot-separated operation kind, e.g. `telegram.banChatMember` or `command.audit` — used to look up the recovery handler after restart. */
     kind: text('kind').notNull(),
     chatId: text('chat_id').notNull(),
-    /** The Telegram API call's own arguments, exactly as they will be/were sent. Never contains secrets — enforced by the same forbidden-key scan the audit layer uses. */
+    /** The Telegram API call's own arguments, exactly as they will be/were sent. Retained only while execution or audit recovery is still owed, then minimized to an empty tombstone payload. */
     requestPayload: jsonb('request_payload').notNull(),
-    /** Everything needed to reconstruct the eventual audit record (actor, target, action, reason) — deliberately kept separate from requestPayload so requestPayload always stays exactly what gets forwarded to Telegram. Read by PendingOperationsOutbox.recoverPending()'s callers after a restart, when there is no live Update/actor on the call stack to ask. */
+    /** Everything needed to reconstruct the eventual audit record — deliberately kept separate from requestPayload and cleared by the DB once terminal audit finalization succeeds or is deliberately policy-skipped. */
     metadata: jsonb('metadata'),
     idempotencyKey: text('idempotency_key').notNull(),
+    /** Immutable digest of the logical operation. It survives payload minimization so one key cannot alias different work. */
+    operationFingerprint: text('operation_fingerprint'),
+    /** Stable state domain used to prevent an older retry from overwriting a newer intent for the same remote entity. */
+    supersessionKey: text('supersession_key'),
     status: text('status', { enum: ['pending', 'in_progress', 'succeeded', 'failed', 'unknown'] }).notNull().default('pending'),
     attemptCount: integer('attempt_count').notNull().default(0),
     /** Set only once the row leaves `pending`/`in_progress` for a terminal-ish state. */
@@ -75,15 +81,16 @@ export const pendingOperations = moderationSchema.table(
     /** Lease pair for the audit-backfill claim — separate from the operation's own worker_id so backfilling a terminal row never looks like an operation retry. */
     auditWorkerId: text('audit_worker_id'),
     auditLeaseExpiresAt: timestamp('audit_lease_expires_at', { withTimezone: true }),
-    /** Telegram's own response once confirmed (success payload, or a GrammyError's error_code/description). Never the raw HTTP transport error, which may carry connection details. */
+    /** Telegram's own response once confirmed. Available to the audit finalizer, then cleared together with the recovery payload once no audit debt remains. */
     result: jsonb('result'),
     createdAt: createdAt(),
     updatedAt: updatedAt(),
   },
   (table) => [
-    uniqueIndex('pending_operations_idempotency_key_idx').on(table.idempotencyKey),
-    index('pending_operations_status_next_attempt_idx').on(table.status, table.nextAttemptAt),
-    index('pending_operations_lease_idx').on(table.status, table.leaseExpiresAt),
-    index('pending_operations_chat_idx').on(table.chatId),
+    uniqueIndex('pending_operations_owner_idempotency_key_idx').on(table.ownerId, table.idempotencyKey),
+    index('pending_operations_owner_status_next_attempt_idx').on(table.ownerId, table.status, table.nextAttemptAt),
+    index('pending_operations_owner_lease_idx').on(table.ownerId, table.status, table.leaseExpiresAt),
+    index('pending_operations_owner_chat_idx').on(table.ownerId, table.chatId),
+    index('pending_operations_owner_supersession_created_idx').on(table.ownerId, table.supersessionKey, table.createdAt),
   ],
 );

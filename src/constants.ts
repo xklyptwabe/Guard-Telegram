@@ -69,3 +69,9 @@ export const INBOX_RETRY_BASE_DELAY_MS = 2000;
  * only a crashed/hung worker leaves an expired lease behind.
  */
 export const INBOX_LEASE_DURATION_MS = 45_000;
+
+/**
+ * Lease for one Rabbit consumer claim. A completed row is the dedup marker;
+ * an expired processing row may be reclaimed after a worker crash.
+ */
+export const RABBIT_CONSUMER_LEASE_DURATION_MS = 45_000;

@@ -1,6 +1,6 @@
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 
-import { and, eq, inArray, isNotNull, isNull, lte, or, sql } from 'drizzle-orm';
+import { and, eq, inArray, isNotNull, isNull, lte, ne, or, sql } from 'drizzle-orm';
 import { GrammyError } from 'grammy';
 
 import {
@@ -19,15 +19,23 @@ export type PendingOperationStatus = 'pending' | 'in_progress' | 'succeeded' | '
 
 export interface PendingOperationRow {
   readonly id: string;
+  readonly ownerId?: string;
   readonly kind: string;
   readonly chatId: string;
   readonly requestPayload: Record<string, unknown>;
-  /** Everything needed to reconstruct the audit record once this operation resolves — actor, target, action, reason. Never sent to Telegram. See EnqueueExternalOperationInput.metadata. */
+  /** Policy-projected audit metadata. Never used as the source of required recovery identity. */
   readonly metadata: Record<string, unknown>;
+  /** Minimal operational identity required to finalize the audit after a restart. Never sent to Telegram or filtered by an audit display policy. */
+  readonly recoveryMetadata: Record<string, unknown>;
   readonly idempotencyKey: string;
+  readonly operationFingerprint?: string | null;
+  readonly supersessionKey?: string | null;
   readonly status: PendingOperationStatus;
   readonly attemptCount: number;
+  readonly nextAttemptAt: Date | null;
+  readonly leaseExpiresAt: Date | null;
   readonly result: Record<string, unknown> | null;
+  readonly createdAt: Date;
   /** 'pending' | 'written' | 'policy_skipped' — see the schema column doc. */
   readonly auditStatus: string;
 }
@@ -129,6 +137,13 @@ export class AuditFinalizationPendingError extends Error {
   }
 }
 
+export class PendingOperationIdempotencyConflictError extends Error {
+  public constructor() {
+    super('Pending operation idempotency key is already associated with another operation.');
+    this.name = 'PendingOperationIdempotencyConflictError';
+  }
+}
+
 export function isAuditPendingError(error: unknown): boolean {
   if (error instanceof AuditFinalizationPendingError) return true;
   return error instanceof Error && (error.name === 'AuditFinalizationPendingError' || error.name.endsWith('AuditPendingError'));
@@ -156,15 +171,46 @@ export interface EnqueueExternalOperationInput {
   readonly kind: string;
   readonly chatId: string;
   readonly idempotencyKey: string;
+  /** State domain whose newer intent makes an older retry stale. */
+  readonly supersessionKey?: string;
   readonly requestPayload: Record<string, unknown>;
-  /**
-   * Actor/target/action/reason needed to write the eventual audit record —
-   * kept separate from requestPayload (which is exactly what's forwarded to
-   * Telegram) so it survives a restart: recoverPending() has no live Update
-   * or actor on the call stack to ask, only what was written ahead here.
-   */
+  readonly auditEvent?: PendingOperationAuditEventContext;
+  /** Optional audit data, projected through the effective policy before persistence. */
   readonly metadata?: Record<string, unknown>;
+  /**
+   * Minimal immutable identity needed to reconstruct the eventual audit
+   * record after a restart. Keep optional descriptive data in `metadata`;
+   * this envelope bypasses display-policy projection and is only protected
+   * by the forbidden-data filter.
+   */
+  readonly recoveryMetadata?: PendingOperationRecoveryMetadata;
 }
+
+export interface PendingOperationRecoveryMetadata {
+  readonly action?: string;
+  readonly actorUserId?: string;
+  readonly targetUserId?: string;
+  readonly integrationId?: string;
+  readonly targetType?: string;
+  readonly targetId?: string;
+  readonly moduleId?: string;
+  readonly durationMs?: number;
+  readonly success?: boolean;
+}
+
+export interface PendingOperationAuditEventContext {
+  readonly eventType: string;
+  readonly eventVersion: string;
+  readonly moduleId?: string;
+}
+
+export type PendingOperationMetadataSanitizer = (input: {
+  readonly kind: string;
+  readonly chatId: string;
+  readonly idempotencyKey: string;
+  readonly auditEvent: PendingOperationAuditEventContext;
+  readonly metadata: Record<string, unknown>;
+}) => Promise<Record<string, unknown>>;
 
 /**
  * Registry of "how to actually perform operation kind X" — keyed the same
@@ -187,6 +233,14 @@ export interface PendingOperationResolver {
   readonly executor: PendingOperationExecutor;
   readonly retryAfterUnknown: boolean;
 }
+
+interface ClaimedPendingOperation {
+  readonly row: PendingOperationRow;
+  readonly interruptedNonRetryable: boolean;
+}
+
+const interruptedOperationResult = { reason: 'worker_lease_expired' } as const;
+const supersededOperationResult = { reason: 'superseded_by_newer_intent' } as const;
 
 export class PendingOperationResolvers {
   private readonly resolvers = new Map<string, PendingOperationResolver>();
@@ -213,30 +267,104 @@ function withTimeout<T>(promise: Promise<T>, ms: number): Promise<T> {
   return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
 }
 
+const pendingOperationMetadataFormatVersion = 1;
+const pendingOperationRecoveryMetadataStringFields = ['action', 'actorUserId', 'targetUserId', 'integrationId', 'targetType', 'targetId', 'moduleId'] as const;
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === 'object' && !Array.isArray(value);
+}
+
+function decodeStoredMetadata(value: unknown): { readonly metadata: Record<string, unknown>; readonly recoveryMetadata: Record<string, unknown> } {
+  if (
+    isRecord(value) &&
+    value.formatVersion === pendingOperationMetadataFormatVersion &&
+    isRecord(value.audit) &&
+    isRecord(value.recovery)
+  ) {
+    return { metadata: value.audit, recoveryMetadata: value.recovery };
+  }
+
+  // Rows created before the split stored one flat object. Treat it as both
+  // projections so already-valid pending operations remain recoverable.
+  const legacyMetadata = isRecord(value) ? value : {};
+  return { metadata: legacyMetadata, recoveryMetadata: legacyMetadata };
+}
+
+function sanitizeRecoveryMetadata(metadata: PendingOperationRecoveryMetadata): Record<string, unknown> {
+  const sanitized = stripForbidden(metadata) as Record<string, unknown>;
+  return {
+    ...Object.fromEntries(pendingOperationRecoveryMetadataStringFields.flatMap((field) => (typeof sanitized[field] === 'string' ? [[field, sanitized[field]]] : []))),
+    ...(typeof sanitized.durationMs === 'number' && Number.isFinite(sanitized.durationMs) && sanitized.durationMs >= 0 ? { durationMs: sanitized.durationMs } : {}),
+    ...(typeof sanitized.success === 'boolean' ? { success: sanitized.success } : {}),
+  };
+}
+
+function canonicalJson(value: unknown): string {
+  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(',')}]`;
+  if (isRecord(value)) {
+    return `{${Object.keys(value)
+      .sort()
+      .filter((key) => value[key] !== undefined)
+      .map((key) => `${JSON.stringify(key)}:${canonicalJson(value[key])}`)
+      .join(',')}}`;
+  }
+  return JSON.stringify(value);
+}
+
+function fingerprintOperation(input: EnqueueExternalOperationInput): string {
+  return createHash('sha256')
+    .update(
+      canonicalJson({
+        kind: input.kind,
+        chatId: input.chatId,
+        requestPayload: stripForbidden(input.requestPayload),
+        auditEvent: input.auditEvent ?? null,
+        recoveryMetadata: sanitizeRecoveryMetadata(input.recoveryMetadata ?? {}),
+      }),
+    )
+    .digest('hex');
+}
+
+function ownerEncodedInIdempotencyKey(idempotencyKey: string): string | undefined {
+  const updateScoped = /:telegram-update:([^:]+):/.exec(idempotencyKey);
+  if (updateScoped?.[1]) return updateScoped[1];
+  const integrationScoped = /^telegram\.(?:sendMessage|answerCallbackQuery):([^:]+):/.exec(idempotencyKey);
+  return integrationScoped?.[1];
+}
+
 function toRow(row: typeof pendingOperations.$inferSelect): PendingOperationRow {
+  const storedMetadata = decodeStoredMetadata(row.metadata);
   return {
     id: row.id,
+    ownerId: row.ownerId,
     kind: row.kind,
     chatId: row.chatId,
     requestPayload: row.requestPayload as Record<string, unknown>,
-    metadata: (row.metadata as Record<string, unknown> | null) ?? {},
+    metadata: storedMetadata.metadata,
+    recoveryMetadata: storedMetadata.recoveryMetadata,
     idempotencyKey: row.idempotencyKey,
+    operationFingerprint: row.operationFingerprint,
+    supersessionKey: row.supersessionKey,
     status: row.status,
     attemptCount: row.attemptCount,
+    nextAttemptAt: row.nextAttemptAt,
+    leaseExpiresAt: row.leaseExpiresAt,
     result: (row.result as Record<string, unknown> | null) ?? null,
+    createdAt: row.createdAt,
     auditStatus: row.auditStatus,
   };
 }
 
 /**
  * ============================================================================
- * BOTS-9: write-ahead log / outbox for external operations.
+ * BOTS-9: shared write-ahead and durable audit-debt outbox.
  * ============================================================================
- * `execute()` is the write-ahead: the intent to call an external system
- * (currently: the Telegram Bot API for moderation actions) is durably
- * recorded in `moderation.pending_operations` *before* the call happens, so
- * a crash mid-call is recoverable — {@link PendingOperationsOutbox.recoverPending}/
- * {@link PendingOperationsOutbox.startWorker} find it again and retry, per
+ * For external operations, `execute()` durably records the intent in
+ * `moderation.pending_operations` before the call. For audit-only rows, the
+ * already-observable operation remains represented by its upstream durable
+ * source until `execute()` stores the finalization debt. Once the row exists,
+ * {@link PendingOperationsOutbox.recoverPending}/
+ * {@link PendingOperationsOutbox.startWorker} find it again and recover, per
  * the "outbox продолжает обработку после рестарта" acceptance criterion.
  *
  * LEASE-BASED CLAIMING (BOTS-9 review BLOCKER-2 fix): a row is never acted
@@ -283,6 +411,7 @@ export class PendingOperationsOutbox {
   private workerTimer: ReturnType<typeof setTimeout> | undefined;
   private workerStopped = true;
   private defaultFinalizer: PendingOperationFinalizer | undefined;
+  private metadataSanitizer: PendingOperationMetadataSanitizer | undefined;
   /** Every background sweep currently in flight, so {@link stopAndDrain} can await them before the process tears down its database pool. */
   private readonly activeSweeps = new Set<Promise<unknown>>();
 
@@ -293,11 +422,17 @@ export class PendingOperationsOutbox {
     private readonly maxAttempts: number = PENDING_OPERATION_MAX_ATTEMPTS,
     private readonly callTimeoutMs: number = PENDING_OPERATION_CALL_TIMEOUT_MS,
     private readonly leaseDurationMs: number = PENDING_OPERATION_LEASE_DURATION_MS,
+    private readonly ownerId: string = 'legacy',
   ) {}
 
   /** Used when execute()/worker omit onFinal (S3/Rabbit live path). */
   public setDefaultFinalizer(onFinal: PendingOperationFinalizer): void {
     this.defaultFinalizer = onFinal;
+  }
+
+  /** Applies policy-aware metadata filtering before WAL rows are inserted. */
+  public setMetadataSanitizer(sanitizer: PendingOperationMetadataSanitizer): void {
+    this.metadataSanitizer = sanitizer;
   }
 
   /**
@@ -316,7 +451,24 @@ export class PendingOperationsOutbox {
    */
   public async execute(input: EnqueueExternalOperationInput, executor: PendingOperationExecutor, onFinal?: PendingOperationFinalizer): Promise<PendingOperationResult> {
     const row = await this.writeAhead(input);
-    if (row.status === 'succeeded' || row.status === 'failed' || (row.status === 'unknown' && row.attemptCount >= this.maxAttempts)) {
+    return this.executeRow(row, executor, onFinal);
+  }
+
+  /**
+   * Resumes an already-written operation without creating a new intent.
+   * Audit-only checkpoints use this on upstream redelivery: the existence of
+   * the row proves the observable work already completed, so only its durable
+   * finalization may run again.
+   */
+  public async resume(idempotencyKey: string, executor: PendingOperationExecutor, onFinal?: PendingOperationFinalizer): Promise<PendingOperationResult | undefined> {
+    const row =
+      (await this.findByIdempotencyKey(idempotencyKey)) ??
+      (ownerEncodedInIdempotencyKey(idempotencyKey) === this.ownerId ? await this.findLegacyByIdempotencyKey(idempotencyKey) : undefined);
+    return row ? this.executeRow(row, executor, onFinal) : undefined;
+  }
+
+  private async executeRow(row: PendingOperationRow, executor: PendingOperationExecutor, onFinal?: PendingOperationFinalizer): Promise<PendingOperationResult> {
+    if (row.status === 'succeeded' || row.status === 'failed' || (row.status === 'unknown' && row.nextAttemptAt === null)) {
       const outcome: AttemptOutcome = row.result ? { status: row.status, result: row.result } : { status: row.status };
       // The original attempt resolved earlier — possibly with an audit that
       // never got written. A redelivery reaching this branch is exactly the
@@ -350,8 +502,18 @@ export class PendingOperationsOutbox {
    */
   public async recoverPending(onFinal?: PendingOperationFinalizer): Promise<void> {
     for (;;) {
-      const claimed = await this.claimNextDue();
-      if (!claimed) break; // nothing eligible left this sweep
+      const claim = await this.claimNextDue();
+      if (!claim) break; // nothing eligible left this sweep
+      const claimed = claim.row;
+      if (claim.interruptedNonRetryable) {
+        const outcome: AttemptOutcome = { status: 'unknown', result: interruptedOperationResult };
+        this.logger.warn({
+          event: 'pending_operations.recover.unknown_non_retryable',
+          details: { kind: claimed.kind, id: claimed.id, attemptCount: claimed.attemptCount },
+        });
+        await this.finalizeAudit(claimed, outcome, onFinal);
+        continue;
+      }
       const executor = this.resolvers.get(claimed.kind);
       if (!executor) {
         // Claimed but nothing knows how to run it — release the claim
@@ -435,44 +597,105 @@ export class PendingOperationsOutbox {
   }
 
   private async writeAhead(input: EnqueueExternalOperationInput): Promise<PendingOperationRow> {
-    const existing = await this.db
-      .select()
-      .from(pendingOperations)
-      .where(eq(pendingOperations.idempotencyKey, input.idempotencyKey))
-      .limit(1);
-    if (existing[0]) return toRow(existing[0]);
+    const operationFingerprint = fingerprintOperation(input);
+    const existing = await this.findByIdempotencyKey(input.idempotencyKey);
+    if (existing) return this.requireSameOperation(existing, input, operationFingerprint);
+
+    const encodedOwner = ownerEncodedInIdempotencyKey(input.idempotencyKey);
+    if (encodedOwner === undefined || encodedOwner === this.ownerId) {
+      const legacy = await this.findLegacyByIdempotencyKey(input.idempotencyKey);
+      if (legacy) return this.requireSameOperation(legacy, input, operationFingerprint);
+    }
 
     const inserted = await this.db
       .insert(pendingOperations)
       .values({
+        ownerId: this.ownerId,
         kind: input.kind,
         chatId: input.chatId,
         idempotencyKey: input.idempotencyKey,
+        operationFingerprint,
+        supersessionKey: input.supersessionKey,
         requestPayload: stripForbidden(input.requestPayload),
-        metadata: input.metadata ? stripForbidden(input.metadata) : {},
+        metadata: await this.prepareStoredMetadata(input),
         status: 'pending',
       })
-      .onConflictDoNothing({ target: pendingOperations.idempotencyKey })
+      .onConflictDoNothing({ target: [pendingOperations.ownerId, pendingOperations.idempotencyKey] })
       .returning();
     if (inserted[0]) return toRow(inserted[0]);
 
     // Lost the insert race to a concurrent caller — read back what they wrote.
-    const [row] = await this.db.select().from(pendingOperations).where(eq(pendingOperations.idempotencyKey, input.idempotencyKey)).limit(1);
+    const [row] = await this.db
+      .select()
+      .from(pendingOperations)
+      .where(and(eq(pendingOperations.ownerId, this.ownerId), eq(pendingOperations.idempotencyKey, input.idempotencyKey)))
+      .limit(1);
     if (!row) throw new Error(`PendingOperationsOutbox: failed to write ahead operation "${input.idempotencyKey}"`);
-    return toRow(row);
+    return this.requireSameOperation(toRow(row), input, operationFingerprint);
+  }
+
+  private async findByIdempotencyKey(idempotencyKey: string): Promise<PendingOperationRow | undefined> {
+    const [row] = await this.db
+      .select()
+      .from(pendingOperations)
+      .where(and(eq(pendingOperations.ownerId, this.ownerId), eq(pendingOperations.idempotencyKey, idempotencyKey)))
+      .limit(1);
+    return row ? toRow(row) : undefined;
+  }
+
+  private async findLegacyByIdempotencyKey(idempotencyKey: string): Promise<PendingOperationRow | undefined> {
+    const [row] = await this.db
+      .select()
+      .from(pendingOperations)
+      .where(and(eq(pendingOperations.ownerId, 'legacy'), eq(pendingOperations.idempotencyKey, idempotencyKey)))
+      .limit(1);
+    return row ? toRow(row) : undefined;
+  }
+
+  private requireSameOperation(row: PendingOperationRow, input: EnqueueExternalOperationInput, operationFingerprint: string): PendingOperationRow {
+    const sameLegacyIdentity = row.operationFingerprint == null && row.kind === input.kind && row.chatId === input.chatId;
+    if (!sameLegacyIdentity && row.operationFingerprint !== operationFingerprint) {
+      throw new PendingOperationIdempotencyConflictError();
+    }
+    return row;
+  }
+
+  private async prepareStoredMetadata(input: EnqueueExternalOperationInput): Promise<Record<string, unknown>> {
+    const metadata = input.metadata ? stripForbidden(input.metadata) : {};
+    const auditMetadata =
+      !this.metadataSanitizer || input.auditEvent === undefined
+        ? metadata
+        : stripForbidden(
+            await this.metadataSanitizer({
+              kind: input.kind,
+              chatId: input.chatId,
+              idempotencyKey: input.idempotencyKey,
+              auditEvent: input.auditEvent,
+              metadata,
+            }),
+          );
+    if (input.recoveryMetadata === undefined) return auditMetadata;
+    return {
+      formatVersion: pendingOperationMetadataFormatVersion,
+      audit: auditMetadata,
+      recovery: sanitizeRecoveryMetadata(input.recoveryMetadata),
+    };
   }
 
   /** Eligibility shared by both claim paths: `pending` outright; an `unknown` only once its backoff elapsed AND attempts remain; an `in_progress` only once its lease has expired (or, for pre-lease rows, was never set). An *exhausted* `unknown` (`next_attempt_at` null) is deliberately NOT claimable — see the class doc's LATE COMPLETION note: never blindly re-run a possibly non-idempotent call that already timed out. */
   private eligibilityCondition(now: Date) {
-    return or(
-      eq(pendingOperations.status, 'pending'),
-      and(
-        eq(pendingOperations.status, 'unknown'),
-        isNotNull(pendingOperations.nextAttemptAt),
-        lte(pendingOperations.nextAttemptAt, now),
-        sql`${pendingOperations.attemptCount} < ${this.maxAttempts}`,
+    return and(
+      eq(pendingOperations.ownerId, this.ownerId),
+      or(
+        eq(pendingOperations.status, 'pending'),
+        and(
+          eq(pendingOperations.status, 'unknown'),
+          isNotNull(pendingOperations.nextAttemptAt),
+          lte(pendingOperations.nextAttemptAt, now),
+          sql`${pendingOperations.attemptCount} < ${this.maxAttempts}`,
+        ),
+        and(eq(pendingOperations.status, 'in_progress'), or(isNull(pendingOperations.leaseExpiresAt), lte(pendingOperations.leaseExpiresAt, now))),
       ),
-      and(eq(pendingOperations.status, 'in_progress'), or(isNull(pendingOperations.leaseExpiresAt), lte(pendingOperations.leaseExpiresAt, now))),
     );
   }
 
@@ -502,25 +725,35 @@ export class PendingOperationsOutbox {
    * or double-claim the same row — a locked-by-someone-else row is simply
    * skipped, not waited for.
    */
-  private async claimNextDue(): Promise<PendingOperationRow | undefined> {
+  private async claimNextDue(): Promise<ClaimedPendingOperation | undefined> {
     return this.db.transaction(async (tx) => {
       const now = new Date();
       const candidates = await tx
-        .select({ id: pendingOperations.id })
+        .select({ id: pendingOperations.id, kind: pendingOperations.kind, status: pendingOperations.status })
         .from(pendingOperations)
         .where(this.eligibilityCondition(now))
         .orderBy(pendingOperations.createdAt)
         .limit(1)
         .for('update', { skipLocked: true });
-      const candidateId = candidates[0]?.id;
-      if (!candidateId) return undefined;
+      const candidate = candidates[0];
+      if (!candidate) return undefined;
+
+      if (candidate.status === 'in_progress' && this.resolvers.get(candidate.kind) && !this.resolvers.retryAfterUnknown(candidate.kind)) {
+        const interrupted = await tx
+          .update(pendingOperations)
+          .set({ status: 'unknown', nextAttemptAt: null, result: interruptedOperationResult, workerId: null, leaseExpiresAt: null, updatedAt: now })
+          .where(and(eq(pendingOperations.id, candidate.id), eq(pendingOperations.ownerId, this.ownerId)))
+          .returning();
+        if (!interrupted[0]) return undefined;
+        return { row: toRow(interrupted[0]), interruptedNonRetryable: true };
+      }
 
       const claimed = await tx
         .update(pendingOperations)
         .set({ status: 'in_progress', workerId: this.workerId, leaseExpiresAt: new Date(now.getTime() + this.leaseDurationMs), attemptCount: sql`${pendingOperations.attemptCount} + 1`, lastAttemptAt: now, updatedAt: now })
-        .where(eq(pendingOperations.id, candidateId))
+        .where(and(eq(pendingOperations.id, candidate.id), eq(pendingOperations.ownerId, this.ownerId)))
         .returning();
-      return claimed[0] ? toRow(claimed[0]) : undefined;
+      return claimed[0] ? { row: toRow(claimed[0]), interruptedNonRetryable: false } : undefined;
     });
   }
 
@@ -539,10 +772,22 @@ export class PendingOperationsOutbox {
     await this.db
       .update(pendingOperations)
       .set({ workerId: null, leaseExpiresAt: new Date(now.getTime() + this.leaseDurationMs), updatedAt: now })
-      .where(and(eq(pendingOperations.id, id), eq(pendingOperations.workerId, this.workerId)));
+      .where(and(eq(pendingOperations.id, id), eq(pendingOperations.ownerId, this.ownerId), eq(pendingOperations.workerId, this.workerId)));
   }
 
   private async attemptById(row: PendingOperationRow, executor: PendingOperationExecutor): Promise<PendingOperationResult> {
+    if (this.resolvers.get(row.kind) && !this.resolvers.retryAfterUnknown(row.kind)) {
+      const now = new Date();
+      const interrupted = await this.db
+        .update(pendingOperations)
+        .set({ status: 'unknown', nextAttemptAt: null, result: interruptedOperationResult, workerId: null, leaseExpiresAt: null, updatedAt: now })
+        .where(and(eq(pendingOperations.id, row.id), eq(pendingOperations.ownerId, this.ownerId), eq(pendingOperations.status, 'in_progress'), or(isNull(pendingOperations.leaseExpiresAt), lte(pendingOperations.leaseExpiresAt, now))))
+        .returning();
+      if (interrupted[0]) {
+        const terminal = toRow(interrupted[0]);
+        return { row: terminal, outcome: { status: 'unknown', result: interruptedOperationResult }, isFinal: true, duplicate: true, auditFinalized: true };
+      }
+    }
     const claimed = await this.claimById(row.id);
     if (!claimed) {
       // Lost the claim — someone else (a concurrent call, or the polling
@@ -553,6 +798,8 @@ export class PendingOperationsOutbox {
   }
 
   private async runClaimed(claimed: PendingOperationRow, executor: PendingOperationExecutor): Promise<PendingOperationResult> {
+    const superseded = await this.supersedeIfStale(claimed);
+    if (superseded) return superseded;
     try {
       const result = await withTimeout(executor(claimed.requestPayload), this.callTimeoutMs);
       const resultPayload = result ? stripForbidden(result) : {};
@@ -582,6 +829,44 @@ export class PendingOperationsOutbox {
     }
   }
 
+  private async supersedeIfStale(claimed: PendingOperationRow): Promise<PendingOperationResult | undefined> {
+    if (!claimed.supersessionKey) return undefined;
+    const [newer] = await this.db
+      .select({ id: pendingOperations.id })
+      .from(pendingOperations)
+      .where(
+        and(
+          eq(pendingOperations.ownerId, this.ownerId),
+          eq(pendingOperations.supersessionKey, claimed.supersessionKey),
+          ne(pendingOperations.id, claimed.id),
+          sql`${pendingOperations.createdAt} > (
+            SELECT candidate."created_at"
+            FROM "moderation"."pending_operations" AS candidate
+            WHERE candidate."id" = ${claimed.id}
+          )`,
+        ),
+      )
+      .limit(1);
+    if (!newer) return undefined;
+
+    const resolved = await this.db
+      .update(pendingOperations)
+      .set({ status: 'unknown', nextAttemptAt: null, result: supersededOperationResult, workerId: null, leaseExpiresAt: null, updatedAt: new Date() })
+      .where(and(eq(pendingOperations.id, claimed.id), eq(pendingOperations.ownerId, this.ownerId), eq(pendingOperations.workerId, this.workerId)))
+      .returning();
+    if (!resolved[0]) return this.orphanedResult(claimed, { status: 'unknown', result: supersededOperationResult });
+
+    this.logger.info({ event: 'pending_operations.attempt.superseded', details: { kind: claimed.kind, id: claimed.id } });
+    const row = toRow(resolved[0]);
+    return {
+      row,
+      outcome: { status: 'unknown', result: supersededOperationResult },
+      isFinal: true,
+      duplicate: true,
+      auditFinalized: true,
+    };
+  }
+
   /** A CAS on resolve() failed: this worker's lease was reclaimed by someone else before it could report its own result — see the class doc's "LATE COMPLETION" note. Logged distinctly because it's a rare, operationally important signal, and reported as non-final/duplicate so the caller never writes an audit record for an outcome this worker no longer has authority over. */
   private orphanedResult(row: PendingOperationRow, attempted: AttemptOutcome): PendingOperationResult {
     this.logger.error({ event: 'pending_operations.attempt.lease_lost', details: { kind: row.kind, id: row.id, attemptedStatus: attempted.status } });
@@ -607,7 +892,7 @@ export class PendingOperationsOutbox {
     const resolved = await this.db
       .update(pendingOperations)
       .set({ status: 'unknown', nextAttemptAt, result: errorSummary, workerId: null, leaseExpiresAt: null, updatedAt: new Date() })
-      .where(and(eq(pendingOperations.id, row.id), eq(pendingOperations.workerId, this.workerId)))
+      .where(and(eq(pendingOperations.id, row.id), eq(pendingOperations.ownerId, this.ownerId), eq(pendingOperations.workerId, this.workerId)))
       .returning();
     if (resolved.length === 0) return this.orphanedResult(row, { status: 'unknown', result: errorSummary });
     this.logger.warn({
@@ -629,7 +914,7 @@ export class PendingOperationsOutbox {
     const updated = await this.db
       .update(pendingOperations)
       .set({ status, result, nextAttemptAt: null, workerId: null, leaseExpiresAt: null, updatedAt: new Date() })
-      .where(and(eq(pendingOperations.id, id), eq(pendingOperations.workerId, this.workerId)))
+      .where(and(eq(pendingOperations.id, id), eq(pendingOperations.ownerId, this.ownerId), eq(pendingOperations.workerId, this.workerId)))
       .returning({ id: pendingOperations.id });
     return updated.length > 0;
   }
@@ -675,14 +960,14 @@ export class PendingOperationsOutbox {
     await this.db
       .update(pendingOperations)
       .set({ auditStatus: 'written', auditWorkerId: null, auditLeaseExpiresAt: null, updatedAt: new Date() })
-      .where(and(eq(pendingOperations.id, id), eq(pendingOperations.auditStatus, 'pending')));
+      .where(and(eq(pendingOperations.id, id), eq(pendingOperations.ownerId, this.ownerId), eq(pendingOperations.auditStatus, 'pending')));
   }
 
   private async markAuditSkipped(id: string): Promise<void> {
     await this.db
       .update(pendingOperations)
       .set({ auditStatus: 'policy_skipped', auditWorkerId: null, auditLeaseExpiresAt: null, updatedAt: new Date() })
-      .where(and(eq(pendingOperations.id, id), eq(pendingOperations.auditStatus, 'pending')));
+      .where(and(eq(pendingOperations.id, id), eq(pendingOperations.ownerId, this.ownerId), eq(pendingOperations.auditStatus, 'pending')));
   }
 
   /** A row is terminal for audit purposes once the operation itself resolved: confirmed `succeeded`/`failed`, or an `unknown` that exhausted its retries (no next attempt scheduled). */
@@ -722,7 +1007,7 @@ export class PendingOperationsOutbox {
       const candidates = await tx
         .select({ id: pendingOperations.id })
         .from(pendingOperations)
-        .where(and(this.terminalForAudit(), eq(pendingOperations.auditStatus, 'pending'), or(isNull(pendingOperations.auditWorkerId), lte(pendingOperations.auditLeaseExpiresAt, now))))
+        .where(and(eq(pendingOperations.ownerId, this.ownerId), this.terminalForAudit(), eq(pendingOperations.auditStatus, 'pending'), or(isNull(pendingOperations.auditWorkerId), lte(pendingOperations.auditLeaseExpiresAt, now))))
         .orderBy(pendingOperations.createdAt)
         .limit(1)
         .for('update', { skipLocked: true });
@@ -731,13 +1016,13 @@ export class PendingOperationsOutbox {
       const claimed = await tx
         .update(pendingOperations)
         .set({ auditWorkerId: this.workerId, auditLeaseExpiresAt: new Date(now.getTime() + this.leaseDurationMs), updatedAt: now })
-        .where(eq(pendingOperations.id, candidateId))
+        .where(and(eq(pendingOperations.id, candidateId), eq(pendingOperations.ownerId, this.ownerId)))
         .returning();
       return claimed[0] ? toRow(claimed[0]) : undefined;
     });
   }
 
   private async releaseAuditClaim(id: string): Promise<void> {
-    await this.db.update(pendingOperations).set({ auditWorkerId: null, auditLeaseExpiresAt: null, updatedAt: new Date() }).where(and(eq(pendingOperations.id, id), eq(pendingOperations.auditWorkerId, this.workerId)));
+    await this.db.update(pendingOperations).set({ auditWorkerId: null, auditLeaseExpiresAt: null, updatedAt: new Date() }).where(and(eq(pendingOperations.id, id), eq(pendingOperations.ownerId, this.ownerId), eq(pendingOperations.auditWorkerId, this.workerId)));
   }
 }

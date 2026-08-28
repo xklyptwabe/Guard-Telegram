@@ -36,32 +36,34 @@ export interface IntegrationOperationMetadata {
   readonly targetType: string;
   readonly targetId: string;
   readonly chatId?: string;
+  readonly moduleId?: string;
 }
 
-export function integrationOperationMetadata(metadata: IntegrationOperationMetadata): Record<string, unknown> {
+export function integrationOperationMetadata(metadata: IntegrationOperationMetadata): IntegrationOperationMetadata & Record<string, unknown> {
   return { ...metadata };
 }
 
 /**
  * Terminal `integration.action` audit for any `s3.*`/`rabbitmq.*` outbox
  * row. Everything needed comes from what was written ahead in
- * `row.metadata` (see {@link IntegrationOperationMetadata}) plus the
+ * `row.recoveryMetadata` (see {@link IntegrationOperationMetadata}) plus the
  * resolved outcome — a row recovered after a restart has no live call site
  * to ask.
  */
 export function makeIntegrationAuditFinalizer(audit: AuditService, logger: Logger): PendingOperationFinalizer {
   return async (row: PendingOperationRow, outcome: AttemptOutcome) => {
-    const integrationId = typeof row.metadata.integrationId === 'string' ? row.metadata.integrationId : undefined;
-    const action = typeof row.metadata.action === 'string' ? row.metadata.action : undefined;
-    const targetType = typeof row.metadata.targetType === 'string' ? row.metadata.targetType : undefined;
-    const targetId = typeof row.metadata.targetId === 'string' ? row.metadata.targetId : undefined;
+    const integrationId = typeof row.recoveryMetadata.integrationId === 'string' ? row.recoveryMetadata.integrationId : undefined;
+    const action = typeof row.recoveryMetadata.action === 'string' ? row.recoveryMetadata.action : undefined;
+    const targetType = typeof row.recoveryMetadata.targetType === 'string' ? row.recoveryMetadata.targetType : undefined;
+    const targetId = typeof row.recoveryMetadata.targetId === 'string' ? row.recoveryMetadata.targetId : undefined;
+    const moduleId = typeof row.recoveryMetadata.moduleId === 'string' ? row.recoveryMetadata.moduleId : undefined;
     if (!integrationId || !action || !targetType || !targetId) {
       // BLOCKER-1: missing metadata must never finalize as 'written'.
       logger.error({ event: 'audit.integration_action.recovered_without_metadata', details: { kind: row.kind, id: row.id } });
       throw new Error(`pending_operations row ${row.id} (${row.kind}) reached terminal state without the integration metadata needed to finalize its audit record`);
     }
     const statusCode = typeof outcome.result?.statusCode === 'number' ? outcome.result.statusCode : undefined;
-    const chatId = typeof row.metadata.chatId === 'string' ? row.metadata.chatId : undefined;
+    const chatId = typeof row.metadata.chatId === 'string' ? row.metadata.chatId : row.chatId === 'platform' ? undefined : row.chatId;
     return recordIntegrationAction(audit, logger, {
       integrationId,
       action,
@@ -72,6 +74,7 @@ export function makeIntegrationAuditFinalizer(audit: AuditService, logger: Logge
       outcome: outcome.status,
       ...(statusCode !== undefined ? { statusCode } : {}),
       ...(chatId !== undefined ? { chatId } : {}),
+      ...(moduleId !== undefined ? { moduleId } : {}),
       idempotencyKey: `${row.idempotencyKey}:audit`,
     });
   };
@@ -79,15 +82,21 @@ export function makeIntegrationAuditFinalizer(audit: AuditService, logger: Logge
 
 /**
  * One finalizer for the whole outbox, routing on the kind namespace:
- * `telegram.*` rows complete their audit via ModerationService (which
- * dispatches moderation.action vs message.deleted on its own), everything
- * else via the integration finalizer. Installed once at bootstrap for both
- * the boot sweep and the persistent worker.
+ * `telegram.*` rows complete via ModerationService, `command.audit` via the
+ * command finalizer, and provider operations via the integration finalizer.
+ * Installed once for both the boot sweep and the persistent worker.
  */
-export function buildOutboxFinalizer(moderation: ModerationService, integration: PendingOperationFinalizer): PendingOperationFinalizer {
+export function buildOutboxFinalizer(
+  moderation: ModerationService,
+  integration: PendingOperationFinalizer,
+  command: PendingOperationFinalizer,
+): PendingOperationFinalizer {
   return async (row, outcome) => {
     if (row.kind.startsWith('telegram.')) {
       return moderation.auditRecoveredOperation(row, outcome);
+    }
+    if (row.kind === 'command.audit') {
+      return command(row, outcome);
     }
     return integration(row, outcome);
   };

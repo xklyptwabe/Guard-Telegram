@@ -121,7 +121,7 @@ describe('AuditEventProcessor.process', () => {
       version: 1,
       operation: 'unknown',
       before: { status: 'not_observed' },
-      after: observed({ chatId: '1', status: 'left' }),
+      after: observed({ chatId: '1', botId: '42', status: 'left' }),
     });
 
     expect(record.before).toEqual({ status: 'not_observed' });

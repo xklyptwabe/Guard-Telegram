@@ -31,6 +31,8 @@ export interface IntegrationActionInput {
    * can pass it to get that chat's own audit policy instead.
    */
   readonly chatId?: string;
+  /** Module that initiated the external call, when the call is command-scoped. */
+  readonly moduleId?: string;
   /**
    * BOTS-9 review finding (BLOCKER-3): when the audit is the terminal
    * record of a write-ahead outbox operation, the key is the operation's
@@ -73,10 +75,11 @@ export async function recordIntegrationAction(
   try {
     const idempotencyKey = input.idempotencyKey ?? `integration.action:${input.integrationId}:${input.action}:${randomUUID()}`;
     const success = input.outcome === 'succeeded';
+    const operation = input.outcome === 'succeeded' ? ('create' as const) : input.outcome;
     const record = auditProcessor.process({
       name: 'integration.action',
       version: 1,
-      operation: 'create',
+      operation,
       idempotencyKey,
       ...(input.chatId !== undefined ? { chatId: input.chatId } : {}),
       before: notApplicable(),
@@ -92,7 +95,10 @@ export async function recordIntegrationAction(
     });
     const downstreamInput = toDownstreamInput(record);
     const mutationResult = toDownstreamMutationResult(record);
-    await audit.recordEntityChange(downstreamInput, () => Promise.resolve(mutationResult));
+    await audit.recordEntityChange(
+      { ...downstreamInput, ...(input.moduleId !== undefined ? { moduleId: input.moduleId } : {}) },
+      () => Promise.resolve(mutationResult),
+    );
     return { status: 'recorded' };
   } catch (error: unknown) {
     if (error instanceof AuditPolicyDisabledError) {

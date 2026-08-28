@@ -9,6 +9,8 @@ export interface UpdateContext {
   readonly chatId?: string;
   readonly userId?: string;
   readonly messageThreadId?: string;
+  /** Module currently executing inside this Update; propagated to nested integration audit. */
+  readonly moduleId?: string;
 }
 
 const updateContext = new AsyncLocalStorage<UpdateContext>();
@@ -19,4 +21,10 @@ export function getUpdateContext(): UpdateContext | undefined {
 
 export function runWithUpdateContext<T>(metadata: Omit<UpdateContext, 'correlationId'>, operation: () => Promise<T>): Promise<T> {
   return updateContext.run({ correlationId: randomUUID(), ...metadata }, operation);
+}
+
+export function runWithModuleContext<T>(moduleId: string, operation: () => Promise<T>): Promise<T> {
+  const current = updateContext.getStore();
+  if (!current) return operation();
+  return updateContext.run({ ...current, moduleId }, operation);
 }

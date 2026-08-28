@@ -120,7 +120,7 @@ export const AUDIT_EVENT_DEFINITIONS: AuditEventDefinitions = {
     canBeDisabled: false,
     snapshotSchema: botMembershipChangedSchema,
     sparseSnapshotSchema: botMembershipSnapshotSchema,
-    allowlist: ['chatId', 'status', 'observedAt', 'observedUpdateId', 'rights'],
+    allowlist: ['chatId', 'botId', 'status', 'observedAt', 'observedUpdateId', 'rights'],
   }),
 
   'moderation.action': defineAuditEvent('moderation.action', {

@@ -67,7 +67,7 @@ const configSchema = z
     telegramTransport: z.enum(['long_polling', 'webhook']).default('long_polling'),
     telegramAllowedUpdates: z
       .string()
-      .default('message,edited_message,callback_query,my_chat_member,chat_member')
+      .default('message,edited_message,channel_post,edited_channel_post,callback_query,my_chat_member,chat_member')
       .transform((value) => value.split(',').map((item) => item.trim()).filter(Boolean))
       .pipe(z.array(z.enum(telegramUpdateTypes)))
       .refine((items) => items.length > 0, 'TELEGRAM_ALLOWED_UPDATES must not be empty'),
@@ -85,6 +85,8 @@ const configSchema = z
     backendApiHost: z.string().trim().min(1).default('127.0.0.1'),
     backendApiPort: positiveInteger(8081),
     backendApiPrincipals,
+    operationalHost: z.string().trim().min(1).default('127.0.0.1'),
+    operationalPort: positiveInteger(8082),
     auditRetentionDatabaseUrl: optionalString.pipe(databaseUrl.optional()),
     redisEnabled: booleanFromEnv(false),
     redisHost: z.string().trim().min(1).default('127.0.0.1'),
@@ -171,6 +173,8 @@ function envToConfigInput(env: NodeJS.ProcessEnv): Record<string, string | undef
     backendApiHost: env.BACKEND_API_HOST,
     backendApiPort: env.BACKEND_API_PORT,
     backendApiPrincipals: env.BACKEND_API_TOKENS,
+    operationalHost: env.OPERATIONAL_HOST,
+    operationalPort: env.OPERATIONAL_PORT,
     auditRetentionDatabaseUrl: env.AUDIT_RETENTION_DATABASE_URL,
     redisEnabled: env.REDIS_ENABLED,
     redisHost: env.REDIS_HOST,

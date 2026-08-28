@@ -38,14 +38,36 @@ describe('recordBotMembershipChanged', () => {
     const { audit, calls } = fakeAuditService();
     const ctx = { myChatMember: fixture.my_chat_member } as never;
 
-    await runWithUpdateContext({ updateId: String(fixture.update_id), chatId: '-1001111111111' }, () => recordBotMembershipChanged(audit, logger(), ctx));
+    await runWithUpdateContext({ updateId: String(fixture.update_id), botId: 'bot-42', chatId: '-1001111111111' }, () => recordBotMembershipChanged(audit, logger(), ctx));
 
     expect(calls).toHaveLength(1);
-    const call = calls[0] as { input: { eventType: string; subjectId: string }; result: { before?: Record<string, unknown>; after?: Record<string, unknown> } };
+    const call = calls[0] as { input: { eventType: string; subjectId: string; idempotencyKey: string }; result: { before?: Record<string, unknown>; after?: Record<string, unknown> } };
     expect(call.input.eventType).toBe('bot.membership.changed');
-    expect(call.input.subjectId).toBe('-1001111111111');
-    expect(call.result.before).toMatchObject({ status: 'member' });
-    expect(call.result.after).toMatchObject({ status: 'administrator' });
+    expect(call.input.subjectId).toBe('-1001111111111:777777');
+    expect(call.input.idempotencyKey).toBe('bot.membership.changed:telegram-update:777777:100005:-1001111111111');
+    expect(call.result.before).toMatchObject({ botId: '777777', status: 'member' });
+    expect(call.result.after).toMatchObject({ botId: '777777', status: 'administrator' });
+  });
+
+  it('uses a bot-scoped snapshot identity when two bots receive membership updates for the same chat', async () => {
+    const fixture = loadFixture('my_chat_member.promoted.json');
+    const { audit, calls } = fakeAuditService();
+    const first = { myChatMember: fixture.my_chat_member } as never;
+    const second = {
+      myChatMember: {
+        ...fixture.my_chat_member,
+        old_chat_member: { ...fixture.my_chat_member.old_chat_member, user: { ...fixture.my_chat_member.old_chat_member.user, id: 888888 } },
+        new_chat_member: { ...fixture.my_chat_member.new_chat_member, user: { ...fixture.my_chat_member.new_chat_member.user, id: 888888 } },
+      },
+    } as never;
+
+    await runWithUpdateContext({ updateId: '1', botId: '777777', chatId: '-1001111111111' }, () => recordBotMembershipChanged(audit, logger(), first));
+    await runWithUpdateContext({ updateId: '1', botId: '888888', chatId: '-1001111111111' }, () => recordBotMembershipChanged(audit, logger(), second));
+
+    expect(calls.map((call) => (call.input as { subjectId: string }).subjectId)).toEqual([
+      '-1001111111111:777777',
+      '-1001111111111:888888',
+    ]);
   });
 
   it('audits the bot being removed from a chat', async () => {
@@ -70,6 +92,91 @@ describe('recordBotMembershipChanged', () => {
     expect(call.result.metadata).toMatchObject({ operation: 'update' });
     expect((call.result.before as { rights?: { canRestrictMembers?: boolean } })?.rights?.canRestrictMembers).toBe(true);
     expect((call.result.after as { rights?: { canRestrictMembers?: boolean } })?.rights?.canRestrictMembers).toBe(false);
+  });
+
+  it('records the incoming after state for an older update without regressing the current snapshot', async () => {
+    const currentObservedAt = new Date(2_000_000_000 * 1000).toISOString();
+    const { audit, calls } = fakeAuditService([
+      {
+        snapshotData: {
+          chatId: '-1001111111111',
+          status: 'kicked',
+          observedAt: currentObservedAt,
+          observedUpdateId: 200,
+        },
+      },
+    ]);
+    const fixture = loadFixture('my_chat_member.promoted.json');
+    const ctx = {
+      myChatMember: {
+        ...fixture.my_chat_member,
+        date: 1_000_000_000,
+      },
+    } as never;
+
+    await runWithUpdateContext({ updateId: '100', chatId: '-1001111111111', botId: '42' }, () =>
+      recordBotMembershipChanged(audit, logger(), ctx),
+    );
+
+    const call = calls[0] as {
+      result: {
+        after?: Record<string, unknown>;
+        metadata?: Record<string, unknown>;
+        snapshotData?: Record<string, unknown>;
+      };
+    };
+    expect(call.result.after).toMatchObject({ status: 'administrator' });
+    expect(call.result.snapshotData).toMatchObject({
+      status: 'kicked',
+      observedAt: currentObservedAt,
+      observedUpdateId: 200,
+    });
+    expect(call.result.metadata).toMatchObject({ operation: 'noop', outOfOrder: true });
+  });
+
+  it('keeps newer bot rights in the snapshot while auditing rights from the stale update', async () => {
+    const currentObservedAt = new Date(2_000_000_000 * 1000).toISOString();
+    const currentRights = {
+      canManageChat: true,
+      canDeleteMessages: true,
+      canManageVideoChats: true,
+      canRestrictMembers: true,
+      canPromoteMembers: false,
+      canChangeInfo: true,
+      canInviteUsers: true,
+      isAnonymous: false,
+    };
+    const { audit, calls } = fakeAuditService([
+      {
+        snapshotData: {
+          chatId: '-1001111111111',
+          status: 'administrator',
+          rights: currentRights,
+          observedAt: currentObservedAt,
+          observedUpdateId: 200,
+        },
+      },
+    ]);
+    const fixture = loadFixture('my_chat_member.rights_changed.json');
+    const ctx = {
+      myChatMember: {
+        ...fixture.my_chat_member,
+        date: 1_000_000_000,
+      },
+    } as never;
+
+    await runWithUpdateContext({ updateId: '100', chatId: '-1001111111111', botId: '42' }, () =>
+      recordBotMembershipChanged(audit, logger(), ctx),
+    );
+
+    const call = calls[0] as {
+      result: {
+        after?: { rights?: { canRestrictMembers?: boolean } };
+        snapshotData?: { rights?: { canRestrictMembers?: boolean } };
+      };
+    };
+    expect(call.result.after?.rights?.canRestrictMembers).toBe(false);
+    expect(call.result.snapshotData?.rights?.canRestrictMembers).toBe(true);
   });
 
   it('is never gated by any module — this test calls it directly, matching how it is wired in core/updates.ts (registerBotMembershipAudit), not through registerModuleUpdateHandlers', async () => {

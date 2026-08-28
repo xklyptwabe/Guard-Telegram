@@ -14,10 +14,12 @@ export function buildDrizzleOrmMock(actual: Record<string, unknown>) {
   return {
     ...actual,
     eq: (col: unknown, val: unknown) => ({ kind: 'eq', col, val }),
+    ne: (col: unknown, val: unknown) => ({ kind: 'ne', col, val }),
     and: (...conds: unknown[]) => ({ kind: 'and', conds }),
     or: (...conds: unknown[]) => ({ kind: 'or', conds }),
     inArray: (col: unknown, vals: unknown[]) => ({ kind: 'inArray', col, vals }),
     lte: (col: unknown, val: unknown) => ({ kind: 'lte', col, val }),
+    gt: (col: unknown, val: unknown) => ({ kind: 'gt', col, val }),
     lt: (col: unknown, val: unknown) => ({ kind: 'lt', col, val }),
     isNull: (col: unknown) => ({ kind: 'isNull', col }),
     isNotNull: (col: unknown) => ({ kind: 'isNotNull', col }),
@@ -29,9 +31,12 @@ export function makeColumnKey(pendingOperations: object): Map<unknown, string> {
   const table = pendingOperations as Record<string, unknown>;
   return new Map<unknown, string>([
     [table.id, 'id'],
+    [table.ownerId, 'ownerId'],
     [table.kind, 'kind'],
     [table.chatId, 'chatId'],
     [table.idempotencyKey, 'idempotencyKey'],
+    [table.operationFingerprint, 'operationFingerprint'],
+    [table.supersessionKey, 'supersessionKey'],
     [table.status, 'status'],
     [table.nextAttemptAt, 'nextAttemptAt'],
     [table.attemptCount, 'attemptCount'],
@@ -50,13 +55,25 @@ function keyFor(columnKey: Map<unknown, string>, col: unknown): string {
   return key;
 }
 
-export function evalCond(columnKey: Map<unknown, string>, cond: any, row: Row): boolean {
+export function evalCond(columnKey: Map<unknown, string>, cond: any, row: Row, rows: Row[] = []): boolean {
   switch (cond.kind) {
-    case 'eq':
-      return row[keyFor(columnKey, cond.col)] === cond.val;
+    case 'eq': {
+      const key = keyFor(columnKey, cond.col);
+      const value = key === 'ownerId' ? (row[key] ?? 'legacy') : row[key];
+      return value === cond.val;
+    }
+    case 'ne': {
+      const key = keyFor(columnKey, cond.col);
+      const value = key === 'ownerId' ? (row[key] ?? 'legacy') : row[key];
+      return value !== cond.val;
+    }
     case 'lte': {
       const value = row[keyFor(columnKey, cond.col)];
       return value !== null && value !== undefined && (value as Date) <= cond.val;
+    }
+    case 'gt': {
+      const value = row[keyFor(columnKey, cond.col)];
+      return value !== null && value !== undefined && (value as Date) > cond.val;
     }
     case 'lt': {
       const value = row[keyFor(columnKey, cond.col)];
@@ -71,11 +88,15 @@ export function evalCond(columnKey: Map<unknown, string>, cond: any, row: Row): 
     case 'inArray':
       return cond.vals.includes(row[keyFor(columnKey, cond.col)]);
     case 'and':
-      return cond.conds.every((c: unknown) => evalCond(columnKey, c, row));
+      return cond.conds.every((c: unknown) => evalCond(columnKey, c, row, rows));
     case 'or':
-      return cond.conds.some((c: unknown) => evalCond(columnKey, c, row));
+      return cond.conds.some((c: unknown) => evalCond(columnKey, c, row, rows));
     case 'sqlExpr': {
       const value = row[keyFor(columnKey, cond.col)];
+      if (cond.template.includes('SELECT candidate."created_at"')) {
+        const source = rows.find((candidate) => candidate.id === cond.args[0]);
+        return source !== undefined && (value as Date) > (source.createdAt as Date);
+      }
       if (cond.template.includes('<')) return value !== null && value !== undefined && (value as number) < cond.args[0];
       if (cond.template.includes('>=')) return value !== null && value !== undefined && (value as number) >= cond.args[0];
       throw new Error(`fake db: unsupported sql template "${cond.template}"`);
@@ -137,7 +158,7 @@ export class FakePendingOperationsDb {
     return {
       from: () => ({
         where: (cond: unknown) => {
-          const filtered = () => this.rows.filter((row) => evalCond(this.columnKey, cond, row));
+          const filtered = () => this.rows.filter((row) => evalCond(this.columnKey, cond, row, this.rows));
           const projected = shape ? () => filtered().map((row) => this.project(row, shape)) : filtered;
           return deferredRows(projected);
         },
@@ -157,14 +178,18 @@ export class FakePendingOperationsDb {
         onConflictDoNothing: () => ({
           returning: () => {
             const idempotencyKey = values.idempotencyKey as string;
-            if (this.rows.some((row) => row.idempotencyKey === idempotencyKey)) return Promise.resolve([]);
+            const ownerId = (values.ownerId as string | undefined) ?? 'legacy';
+            if (this.rows.some((row) => row.ownerId === ownerId && row.idempotencyKey === idempotencyKey)) return Promise.resolve([]);
             const row: Row = {
               id: `row-${this.nextId++}`,
+              ownerId,
               kind: values.kind,
               chatId: values.chatId,
               requestPayload: values.requestPayload,
               metadata: values.metadata ?? {},
               idempotencyKey,
+              operationFingerprint: values.operationFingerprint ?? null,
+              supersessionKey: values.supersessionKey ?? null,
               status: values.status ?? 'pending',
               attemptCount: 0,
               lastAttemptAt: null,
@@ -191,7 +216,7 @@ export class FakePendingOperationsDb {
       set: (values: Row) => ({
         where: (cond: unknown) =>
           deferredMutation(() => {
-            const matched = this.rows.filter((row) => evalCond(this.columnKey, cond, row));
+            const matched = this.rows.filter((row) => evalCond(this.columnKey, cond, row, this.rows));
             for (const row of matched) {
               for (const [key, value] of Object.entries(values)) {
                 if (value && typeof value === 'object' && (value as { kind?: string }).kind === 'sqlExpr') {

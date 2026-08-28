@@ -50,12 +50,12 @@ describe('ChatSettingsService.setLocale', () => {
     (audit as unknown as { __tx: unknown }).__tx = tx;
     const service = new ChatSettingsService(db, audit);
 
-    await runWithUpdateContext({ updateId: '1', chatId: 'chat-1' }, () => service.setLocale('chat-1', 'en', 'user-1'));
+    await runWithUpdateContext({ updateId: '1', botId: 'bot-42', chatId: 'chat-1' }, () => service.setLocale('chat-1', 'en', 'user-1'));
 
     expect(calls).toHaveLength(1);
     const call = calls[0] as { input: { eventType: string; idempotencyKey: string }; result: { before?: Record<string, unknown>; after?: Record<string, unknown>; metadata?: Record<string, unknown> } };
     expect(call.input.eventType).toBe('chat.settings.changed');
-    expect(call.input.idempotencyKey).toBe('chat.settings.changed:telegram-update:unscoped-bot:1:chat-1');
+    expect(call.input.idempotencyKey).toBe('chat.settings.changed:telegram-update:bot-42:1:chat-1');
     expect(call.result.before).toMatchObject({ locale: 'ru' });
     expect(call.result.after).toMatchObject({ locale: 'en' });
     expect(call.result.metadata).toMatchObject({ operation: 'update' });

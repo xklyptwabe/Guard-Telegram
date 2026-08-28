@@ -1,0 +1,29 @@
+groups:
+  - name: telegram-bot-audit
+    interval: 30s
+    rules:
+      - alert: AuditMandatoryWriteFailed
+        expr: sum(increase(audit_events_rejected_total{status="write_failed"}[5m])) > 0
+        for: 0m
+        labels:
+          severity: critical
+          service: telegram-bot
+          component: audit
+        annotations:
+          summary: Mandatory audit write failed
+          description: At least one mandatory audit event could not be committed during the last five minutes.
+
+      - alert: AuditOutboxBacklogGrowing
+        expr: |
+          sum by (queue) (audit_outbox_pending) > 0
+          and
+          sum by (queue) (audit_outbox_pending)
+            > sum by (queue) (audit_outbox_pending offset 15m)
+        for: 5m
+        labels:
+          severity: warning
+          service: telegram-bot
+          component: audit
+        annotations:
+          summary: Audit outbox backlog is growing
+          description: The {{ $labels.queue }} queue has remained above its value from 15 minutes ago for five minutes.

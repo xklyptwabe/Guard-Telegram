@@ -178,6 +178,7 @@ export function createModerationModule(moderation: ModerationService): TelegramB
             await context.reply.send(context.ctx, context.t('moderation.needsTarget'));
             return;
           }
+          if (await rejectUnsafeTarget(context, target)) return;
           const reason = target.rest.join(' ').trim();
           const outcome = await moderation.kick({ chatId: context.chatId, targetUserId: target.userId, actorUserId: context.userId, ...(reason ? { reason } : {}) });
           await reportOutcome(context, 'kick', outcome);

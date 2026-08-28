@@ -46,13 +46,13 @@ describe('recordMemberStatusChanged', () => {
     const testLogger = logger();
     const ctx = { chatMember: fixture.chat_member } as never;
 
-    await runWithUpdateContext({ updateId: String(fixture.update_id), chatId: '-1001111111111' }, () => recordMemberStatusChanged(audit, testLogger, ctx));
+    await runWithUpdateContext({ updateId: String(fixture.update_id), botId: 'bot-42', chatId: '-1001111111111' }, () => recordMemberStatusChanged(audit, testLogger, ctx));
 
     expect(calls).toHaveLength(1);
     const call = calls[0] as { input: { eventType: string; subjectId: string; idempotencyKey: string }; result: { before?: Record<string, unknown>; after?: Record<string, unknown>; metadata?: Record<string, unknown> } };
     expect(call.input.eventType).toBe('member.status.changed');
     expect(call.input.subjectId).toBe('-1001111111111:222222');
-    expect(call.input.idempotencyKey).toBe('member.status.changed:telegram-update:unscoped-bot:100003:-1001111111111:222222');
+    expect(call.input.idempotencyKey).toBe('member.status.changed:telegram-update:bot-42:100003:-1001111111111:222222');
     expect(call.result.before).toMatchObject({ status: 'member' });
     expect(call.result.after).toMatchObject({ status: 'administrator' });
     expect(call.result.metadata).toMatchObject({ operation: 'update' });

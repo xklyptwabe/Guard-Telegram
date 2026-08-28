@@ -7,6 +7,7 @@ import type { Logger } from '../logger.js';
 import { normalizeError } from '../logger.js';
 import { AuditPolicyDisabledError, type AuditService } from '../auditService.js';
 import { AuditEventProcessor } from '../audit/eventProcessor.js';
+import { auditEventStatusForOperation } from '../audit/serviceAdapter.js';
 import { safeDownstreamMutationResult } from '../audit/mutationResult.js';
 import { observed, notApplicable } from '../audit/snapshot.js';
 import { recordMessageDeleted } from '../audit/messageAudit.js';
@@ -25,6 +26,15 @@ export class ModerationAuditPendingError extends AuditFinalizationPendingError {
   public constructor(rowId: string, kind: string) {
     super(`Terminal moderation operation ${rowId} (${kind}) resolved but its mandatory audit record is still owed`);
     this.name = 'ModerationAuditPendingError';
+  }
+}
+
+export type UnsafeModerationTargetReason = 'actor' | 'bot';
+
+export class UnsafeModerationTargetError extends Error {
+  public constructor(public readonly reason: UnsafeModerationTargetReason) {
+    super(`Unsafe moderation target: ${reason}`);
+    this.name = 'UnsafeModerationTargetError';
   }
 }
 
@@ -165,6 +175,7 @@ export class ModerationService {
         chatId,
         idempotencyKey,
         requestPayload: { chat_id: Number(chatId), message_id: Number(messageId) },
+        auditEvent: { eventType: 'message.deleted', eventVersion: 'v1', moduleId: MODULE_IDS.moderation },
         metadata: { deletedBy: actorUserId, ...(knownAuthorUserId !== undefined ? { knownAuthorUserId } : {}) },
       },
       this.resolvers.get(kind)!,
@@ -292,7 +303,16 @@ export class ModerationService {
       metadata: { action, actorUserId: input.actorUserId, targetUserId: input.targetUserId, ...(reason !== undefined && reason.length > 0 ? { reason } : {}) },
     });
     return this.outbox.execute(
-      { kind, chatId: input.chatId, idempotencyKey, requestPayload, metadata },
+      {
+        kind,
+        chatId: input.chatId,
+        idempotencyKey,
+        supersessionKey: `moderation.member-state:${input.chatId}:${input.targetUserId}`,
+        requestPayload,
+        auditEvent: { eventType: 'moderation.action', eventVersion: 'v1', moduleId: MODULE_IDS.moderation },
+        metadata,
+        recoveryMetadata: { action, actorUserId: input.actorUserId, targetUserId: input.targetUserId },
+      },
       this.resolvers.get(kind)!,
       // HIGH-3: audit-finalization is the outbox's durable responsibility —
       // see deleteMessage's note. auditRecoveredOperation dispatches on
@@ -302,17 +322,23 @@ export class ModerationService {
   }
 
   private async performAndAudit(action: ModerationAction, input: ModerationActionInput, kind: string, requestPayload: Record<string, unknown>): Promise<ModerationOutcome> {
+    this.assertSafeTarget(input);
     const result = await this.dispatch(action, input, kind, requestPayload);
     // BLOCKER-4: same mandatory-audit propagation as deleteMessage.
     if (result.isFinal && !result.auditFinalized) throw new ModerationAuditPendingError(result.row.id, kind);
     return result.isFinal ? this.toOutcome(result.outcome) : { status: 'unknown', willRetry: true };
   }
 
+  private assertSafeTarget(input: ModerationActionInput): void {
+    if (input.targetUserId === input.actorUserId) throw new UnsafeModerationTargetError('actor');
+    if (input.targetUserId === String(this.bot.botInfo.id)) throw new UnsafeModerationTargetError('bot');
+  }
+
   private toOutcome(outcome: AttemptOutcome): ModerationOutcome {
     return { status: outcome.status, willRetry: false, ...(outcome.result !== undefined ? { detail: outcome.result } : {}) };
   }
 
-  /** A row resolving during `recoverPending()` has no live command/actor on the call stack — everything needed comes from what was written ahead in `row.metadata` and `row.chatId`. `telegram.deleteMessage` and the moderation-action kinds need different audit events, so this dispatches on `row.kind`. Public so the shared outbox finalizer router (see core wiring / the integration gateway) can delegate `telegram.*` kinds here. */
+  /** A row resolving during `recoverPending()` has no live command/actor on the call stack — everything required comes from the write-ahead recovery envelope and `row.chatId`. `telegram.deleteMessage` and the moderation-action kinds need different audit events, so this dispatches on `row.kind`. Public so the shared outbox finalizer router (see core wiring / the integration gateway) can delegate `telegram.*` kinds here. */
   public async auditRecoveredOperation(row: PendingOperationRow, outcome: AttemptOutcome): Promise<{ readonly status: 'recorded' } | { readonly status: 'policy_skipped' }> {
     if (row.kind === 'telegram.deleteMessage') {
       const messageId = String(row.requestPayload.message_id);
@@ -328,9 +354,9 @@ export class ModerationService {
       });
     }
 
-    const action = typeof row.metadata.action === 'string' ? (row.metadata.action as ModerationAction) : undefined;
-    const targetUserId = typeof row.metadata.targetUserId === 'string' ? row.metadata.targetUserId : undefined;
-    const actorUserId = typeof row.metadata.actorUserId === 'string' ? row.metadata.actorUserId : undefined;
+    const action = typeof row.recoveryMetadata.action === 'string' ? (row.recoveryMetadata.action as ModerationAction) : undefined;
+    const targetUserId = typeof row.recoveryMetadata.targetUserId === 'string' ? row.recoveryMetadata.targetUserId : undefined;
+    const actorUserId = typeof row.recoveryMetadata.actorUserId === 'string' ? row.recoveryMetadata.actorUserId : undefined;
     if (!action || !targetUserId || !actorUserId) {
       // BLOCKER-1: missing audit metadata must NEVER finalize as 'written'.
       // Throw — the outbox keeps `audit_status='pending'` and the backfill
@@ -362,6 +388,7 @@ export class ModerationService {
           category: 'moderation',
           source: 'telegram.moderation_command',
           idempotencyKey,
+          status: auditEventStatusForOperation(operation),
           actorId: input.actorUserId,
           actorType: 'telegram_user',
           // HIGH (round-2): BOTS-9 events must carry the canonical module

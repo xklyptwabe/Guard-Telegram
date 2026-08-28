@@ -1,4 +1,4 @@
-import { createHash } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 
 import { HeadObjectCommand, PutObjectCommand, S3Client, S3ServiceException } from '@aws-sdk/client-s3';
 
@@ -9,7 +9,7 @@ import { integrationOperationMetadata } from './integrations/externalOperationGa
 
 export interface ObjectStorage {
   readonly enabled: boolean;
-  put(key: string, body: Uint8Array, contentType: string): Promise<void>;
+  put(key: string, body: Uint8Array, contentType: string, options?: { readonly idempotencyKey?: string }): Promise<void>;
   close(): Promise<void>;
 }
 
@@ -39,11 +39,11 @@ export function createStorage(
   if (outbox && resolvers) {
     // Recovery executor (BOTS-9 review BLOCKER-3): a row found after a
     // restart has no body to re-upload — files must never be persisted to
-    // the outbox (BLOCKER-4). Instead it RECONCILES: S3 objects are atomic,
-    // so a HEAD either proves the original upload landed (→ succeeded) or
-    // proves it never did (→ confirmed failed; the intent is unrecoverable
-    // without the caller, which the audit trail now states explicitly). A
-    // network-level HEAD failure stays `unknown` and retries — HEAD is
+    // the outbox (BLOCKER-4). Instead it RECONCILES: a successful HEAD proves
+    // the original upload landed. A 404 only proves that the object is not
+    // visible at that instant; the timed-out PUT may still be in flight, and
+    // custom S3-compatible endpoints need not share AWS S3's exact consistency
+    // contract. HEAD failures therefore stay `unknown` and retry — HEAD is
     // read-only, so retrying it is always safe.
     resolvers.register(
       kind,
@@ -71,17 +71,21 @@ export function createStorage(
       // body itself — plus the metadata the audit finalizer needs to write
       // the terminal `integration.action` record after any outcome,
       // including one resolved by recovery long after this call returned.
-      put: async (key, body, contentType) => {
+      put: async (key, body, contentType, options) => {
         const bodyDigest = createHash('sha256').update(body).digest('hex');
+        const operationId = options?.idempotencyKey ?? randomUUID();
+        const operationMetadata = integrationOperationMetadata({ integrationId: 's3', action: 'put', targetType: 'object', targetId: key });
         const result = await outbox.execute(
           {
             kind,
             // chat-less integration: the pending_operations row lives under
             // the platform pseudo-scope, mirroring audit's tenant sentinel.
             chatId: 'platform',
-            idempotencyKey: `s3.putObject:${key}:${bodyDigest}`,
+            idempotencyKey: `s3.putObject:${operationId}`,
             requestPayload: { key, contentType, bodyDigest, sizeBytes: body.byteLength },
-            metadata: integrationOperationMetadata({ integrationId: 's3', action: 'put', targetType: 'object', targetId: key }),
+            auditEvent: { eventType: 'integration.action', eventVersion: 'v1' },
+            metadata: operationMetadata,
+            recoveryMetadata: operationMetadata,
           },
           async (payload) => {
             try {

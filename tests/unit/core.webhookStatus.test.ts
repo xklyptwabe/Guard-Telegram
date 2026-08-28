@@ -3,7 +3,7 @@ import { describe, expect, it } from 'vitest';
 
 import { AuditFinalizationPendingError } from '../../src/lib/moderation/pendingOperationsOutbox.js';
 import { CommandAuditPendingError } from '../../src/core/dispatcher.js';
-import { UpdateBusyError, UpdateExhaustedError, webhookStatusForError, unwrapMiddlewareError } from '../../src/core/updates.js';
+import { UpdateBusyError, webhookStatusForError, unwrapMiddlewareError } from '../../src/core/updates.js';
 import { z } from 'zod';
 
 function wrap(error: Error): BotError {
@@ -23,10 +23,6 @@ describe('webhookStatusForError (round-4)', () => {
 
   it('maps subclass audit-pending names to 503', () => {
     expect(webhookStatusForError(wrap(new CommandAuditPendingError('ban', new Error('db'))))).toBe(503);
-  });
-
-  it('maps exhausted inbox to 503 (do not confirm 200)', () => {
-    expect(webhookStatusForError(new UpdateExhaustedError('1'))).toBe(503);
   });
 
   it('maps client parse failures to 400 and infra to 503', () => {

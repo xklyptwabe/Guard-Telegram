@@ -28,6 +28,9 @@ export type EventSeverity = 'debug' | 'info' | 'notice' | 'warning' | 'critical'
  */
 export type AuditOperation = 'create' | 'update' | 'delete' | 'soft_delete' | 'noop' | 'failed' | 'unknown';
 
+/** Terminal persistence status of an audit event occurrence. */
+export type AuditEventStatus = 'recorded' | 'failed' | 'unknown';
+
 /**
  * The status of a single snapshot (before or after) when it does not carry
  * observed data. Kept disjoint from "observed" so that "no data" is always

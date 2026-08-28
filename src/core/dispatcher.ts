@@ -1,18 +1,24 @@
+import { createHash, randomUUID } from 'node:crypto';
+
 import type { Context } from 'grammy';
 import type { i18n } from 'i18next';
 
 import { CALLBACK_VERSION } from '../constants.js';
 import { localeForTelegram } from '../i18n/index.js';
-import { AuditEventProcessor } from '../lib/audit/eventProcessor.js';
-import { toDownstreamInput, toDownstreamMutationResult } from '../lib/audit/serviceAdapter.js';
-import { notApplicable, observed } from '../lib/audit/snapshot.js';
-import { AuditPolicyDisabledError, type AuditService } from '../lib/auditService.js';
+import {
+  commandAuditOperationKind,
+  commandAuditRecoveryMetadata,
+  makeCommandAuditFinalizer,
+  recordCommandExecuted as writeCommandExecutedAudit,
+  type CommandExecutedAuditInput,
+} from '../lib/audit/commandAudit.js';
+import type { AuditService } from '../lib/auditService.js';
 import type { Cooldowns } from '../lib/cooldowns.js';
-import { getUpdateContext } from '../lib/context.js';
+import { getUpdateContext, runWithModuleContext } from '../lib/context.js';
 import type { EventBus } from '../lib/eventBus.js';
 import type { Logger } from '../lib/logger.js';
-import { bots9WalExclusion } from '../lib/bots9WalExclusions.js';
-import { AuditFinalizationPendingError } from '../lib/moderation/pendingOperationsOutbox.js';
+import { integrationOperationMetadata } from '../lib/integrations/externalOperationGateway.js';
+import { AuditFinalizationPendingError, type PendingOperationFinalizer, type PendingOperationResolvers, type PendingOperationsOutbox } from '../lib/moderation/pendingOperationsOutbox.js';
 import { hasPermission } from '../lib/permissions.js';
 import type { ReplyService } from '../lib/reply.js';
 import type { TelegramCommandDefinition } from './contracts.js';
@@ -33,12 +39,10 @@ function chatAndUser(ctx: Context): { chatId: string; userId: string } | undefin
 /**
  * BOTS-9 review round-2 (BLOCKER-4/HIGH-8): thrown when a command's
  * `command.executed` audit could not be written for an *infrastructure*
- * reason. `dispatchCommand` lets it propagate so the durable inbox does NOT
- * complete the update: Telegram redelivers it, the command re-runs (safe
- * for every state-changing command in this codebase — they are all
- * outbox-idempotent), and the idempotency key (keyed on the update) makes
- * the audit land exactly once. A policy-disabled event never reaches here —
- * it maps to a normal success instead.
+ * reason before durable command-audit debt could be established. Once the
+ * checkpoint exists, an audit outage no longer throws this error: the inbox
+ * may complete while the shared outbox backfills the one owed event. A
+ * policy-disabled event maps to a normal success too.
  */
 export class CommandAuditPendingError extends AuditFinalizationPendingError {
   public constructor(commandName: string, cause: unknown) {
@@ -72,7 +76,7 @@ export class CommandDispatcher {
   // all). Only wraps `command.execute()` itself, not the earlier gates
   // (disabled/permission/cooldown/invalid-args) — those are access-control
   // denials with their own `logger.warn` already, not "the module ran".
-  private readonly auditProcessor = new AuditEventProcessor();
+  private readonly commandAuditFinalizer: PendingOperationFinalizer;
 
   public constructor(
     commands: readonly TelegramCommandDefinition[],
@@ -83,8 +87,16 @@ export class CommandDispatcher {
     private readonly i18n: i18n,
     private readonly logger: Logger,
     private readonly audit: AuditService,
+    private readonly outbox?: PendingOperationsOutbox,
+    resolvers?: PendingOperationResolvers,
   ) {
     this.commandsByName = new Map(commands.map((command) => [command.name, command]));
+    this.commandAuditFinalizer = makeCommandAuditFinalizer(audit, logger);
+    resolvers?.register(
+      'integration.telegram.answerCallbackQuery',
+      () => Promise.reject(new Error('callback query identity is intentionally not persisted; interrupted answer remains unknown')),
+      { retryAfterUnknown: false },
+    );
   }
 
   public async dispatchCommand(ctx: Context, commandName: string, rawArguments: string): Promise<void> {
@@ -94,6 +106,18 @@ export class CommandDispatcher {
     const t = this.translator(ctx);
     const startedAt = Date.now();
     const cooldownKey = `${identity.chatId}:${identity.userId}:${command.id}`;
+    const auditIdempotencyKey = this.commandAuditIdempotencyKey(identity, command, commandName);
+    if (auditIdempotencyKey && this.outbox) {
+      try {
+        const resumed = await this.outbox.resume(auditIdempotencyKey, () => Promise.resolve({}), this.commandAuditFinalizer);
+        if (resumed) {
+          this.logger.info({ event: 'audit.command_executed.resumed_without_command', module: command.moduleId, chatId: identity.chatId, userId: identity.userId, commandName });
+          return;
+        }
+      } catch (error: unknown) {
+        throw new CommandAuditPendingError(commandName, error);
+      }
+    }
     try {
       if (!(await this.registry.isEnabled(identity.chatId, command.moduleId))) {
         this.logger.warn({ event: 'command.feature_disabled', module: command.moduleId, chatId: identity.chatId, userId: identity.userId, commandName });
@@ -116,40 +140,38 @@ export class CommandDispatcher {
         await this.reply.send(ctx, t('common.invalidArguments'));
         return;
       }
-      await command.execute(
-        {
-          ctx,
-          ...identity,
-          moduleId: command.moduleId,
-          registry: this.registry,
-          logger: this.logger,
-          reply: this.reply,
-          events: this.events,
-          t,
-        },
-        parsed.data,
+      await runWithModuleContext(command.moduleId, () =>
+        command.execute(
+          {
+            ctx,
+            ...identity,
+            moduleId: command.moduleId,
+            registry: this.registry,
+            logger: this.logger,
+            reply: this.reply,
+            events: this.events,
+            t,
+          },
+          parsed.data,
+        ),
       );
       const durationMs = Date.now() - startedAt;
       this.logger.info({ event: 'command.completed', module: command.moduleId, chatId: identity.chatId, userId: identity.userId, commandName, durationMs });
-      await this.recordCommandExecuted(identity, command, commandName, durationMs, true);
+      await this.recordCommandExecuted(identity, command, commandName, durationMs, true, auditIdempotencyKey);
     } catch (error: unknown) {
       const durationMs = Date.now() - startedAt;
-      // BLOCKER-4: the side effect ran (and the user saw its reply); only a
-      // MANDATORY audit record is still owed (command.executed from this
-      // dispatcher, or the terminal moderation/integration audit from an
-      // outbox-backed command). Do NOT record a misleading success:false
-      // event, do NOT swallow — rethrow so the durable inbox fails the
-      // update and Telegram redelivers it, which completes the audit
-      // idempotently.
+      // A nested outbox-backed command may still report that its own durable
+      // audit checkpoint could not be established. Propagate that state; a
+      // completed command's own command.audit row does not reach this branch
+      // when only its final AuditService call is temporarily unavailable.
       if (error instanceof AuditFinalizationPendingError) {
         this.cooldowns.release(cooldownKey);
         throw error;
       }
       this.logger.error({ event: 'command.failed', module: command.moduleId, chatId: identity.chatId, userId: identity.userId, commandName, error: { name: error instanceof Error ? error.name : 'UnknownError', message: error instanceof Error ? error.message : String(error) } });
-      // The failure record is best-effort: if auditing is down, the
-      // command's own error handling must still complete.
+      // The failed outcome uses the same durable audit-debt path as success.
       try {
-        await this.recordCommandExecuted(identity, command, commandName, durationMs, false);
+        await this.recordCommandExecuted(identity, command, commandName, durationMs, false, auditIdempotencyKey);
       } catch (auditError: unknown) {
         this.cooldowns.release(cooldownKey);
         if (auditError instanceof AuditFinalizationPendingError) throw auditError;
@@ -164,20 +186,18 @@ export class CommandDispatcher {
   /**
    * Records a `command.executed` audit event. Log-like: the full record
    * (before=not_applicable, after=observed with the outcome) is known
-   * upfront, so `toDownstreamMutationResult` is safe to use as-is per the
-   * ATOMICITY GAP note in `serviceAdapter.ts` — there's no real business
-   * mutation of its own to protect here, `command.execute()` already ran.
+   * upfront; there's no local business mutation of its own to protect here,
+   * because `command.execute()` already ran.
    *
    * `idempotencyKey` is keyed on the Telegram update — same pattern Maxim
    * used for `module.state.changed` — so a redelivered Update never
    * produces a second `command.executed` row for the same invocation.
    *
-   * BOTS-9 review round-2 (HIGH-8/BLOCKER-4): failures are NOT swallowed
-   * any more. A policy-disabled event is a normal no-op (nothing owed), a
-   * missing update context is logged (nothing to key on), but any
-   * *infrastructure* failure throws {@link CommandAuditPendingError} so
-   * the durable inbox retries the update until the record lands — a
-   * command must not pass without its audit.
+   * The shared outbox stores the completed command's safe outcome before
+   * audit finalization. An audit outage therefore leaves durable debt for
+   * the background worker without failing the update or replaying the
+   * command. Only a failure to establish that durable checkpoint throws
+   * {@link CommandAuditPendingError}.
    */
   private async recordCommandExecuted(
     identity: { chatId: string; userId: string },
@@ -185,55 +205,53 @@ export class CommandDispatcher {
     commandName: string,
     durationMs: number,
     success: boolean,
+    idempotencyKey: string | undefined,
   ): Promise<void> {
+    if (!idempotencyKey) return;
+    const input: CommandExecutedAuditInput = {
+      chatId: identity.chatId,
+      userId: identity.userId,
+      moduleId: command.moduleId,
+      commandName,
+      durationMs,
+      success,
+      idempotencyKey,
+    };
     try {
-      const context = getUpdateContext();
-      if (!context) {
-        this.logger.warn({ event: 'audit.command_executed.missing_update_context', module: command.moduleId, chatId: identity.chatId, userId: identity.userId, commandName });
+      if (!this.outbox) {
+        await writeCommandExecutedAudit(this.audit, this.logger, input);
         return;
       }
-      const idempotencyKey = `command.executed:telegram-update:${context.botId ?? 'unscoped-bot'}:${context.updateId}:${identity.chatId}:${identity.userId}:${commandName}`;
-      const record = this.auditProcessor.process({
-        name: 'command.executed',
-        version: 1,
-        operation: 'create',
-        chatId: identity.chatId,
-        actorId: identity.userId,
-        idempotencyKey,
-        before: notApplicable(),
-        after: observed({
+      const metadata = commandAuditRecoveryMetadata(input);
+      await this.outbox.execute(
+        {
+          kind: commandAuditOperationKind,
           chatId: identity.chatId,
-          userId: identity.userId,
-          moduleId: command.moduleId,
-          commandId: commandName,
-          // Never captured at all, per BOTS-9 ("без аргументов и текста
-          // команды") — always true, not a per-call decision.
-          argsRedacted: true,
-          durationMs,
-          success,
-        }),
-      });
-      // Round-2 (HIGH): the canonical module id is passed EXPLICITLY (not
-      // derived from snapshot field presence) so BOTS-8 module-level
-      // policies always apply to command.executed.
-      const input = { ...toDownstreamInput(record), moduleId: command.moduleId };
-      const mutationResult = toDownstreamMutationResult(record);
-      await this.audit.recordEntityChange(input, () => Promise.resolve(mutationResult));
+          idempotencyKey,
+          requestPayload: {},
+          auditEvent: { eventType: 'command.executed', eventVersion: 'v1', moduleId: command.moduleId },
+          metadata,
+          recoveryMetadata: metadata,
+        },
+        () => Promise.resolve({}),
+        this.commandAuditFinalizer,
+      );
     } catch (error: unknown) {
-      if (error instanceof AuditPolicyDisabledError) {
-        this.logger.info({ event: 'audit.command_executed.policy_skipped', module: command.moduleId, chatId: identity.chatId, userId: identity.userId, commandName });
-        return;
-      }
-      this.logger.warn({
-        event: 'audit.command_executed.failed',
-        module: command.moduleId,
-        chatId: identity.chatId,
-        userId: identity.userId,
-        commandName,
-        error: { name: error instanceof Error ? error.name : 'UnknownError', message: error instanceof Error ? error.message : String(error) },
-      });
       throw new CommandAuditPendingError(commandName, error);
     }
+  }
+
+  private commandAuditIdempotencyKey(
+    identity: { chatId: string; userId: string },
+    command: TelegramCommandDefinition,
+    commandName: string,
+  ): string | undefined {
+    const context = getUpdateContext();
+    if (!context) {
+      this.logger.warn({ event: 'audit.command_executed.missing_update_context', module: command.moduleId, chatId: identity.chatId, userId: identity.userId, commandName });
+      return undefined;
+    }
+    return `command.executed:telegram-update:${context.botId ?? 'unscoped-bot'}:${context.updateId}:${identity.chatId}:${identity.userId}:${commandName}`;
   }
 
   public async dispatchCallback(ctx: Context): Promise<void> {
@@ -248,15 +266,40 @@ export class CommandDispatcher {
       }
       await this.dispatchCommand(ctx, envelope.commandName, envelope.rawArguments);
     } finally {
-      // BOTS-9 review finding (HIGH-5) — documented exclusion:
-      // answerCallbackQuery only dismisses the client-side loading spinner
-      // on the button the user just pressed; it expires within seconds and
-      // has no lasting state. A write-ahead/retry would be pure overhead
-      // with a stale-ack as its only possible outcome.
-      void bots9WalExclusion('telegram.answerCallbackQuery');
-      await ctx.answerCallbackQuery({ text: t('common.callbackDone') }).catch((error: unknown) => {
+      await this.answerCallback(ctx, t('common.callbackDone'));
+    }
+  }
+
+  private async answerCallback(ctx: Context, text: string): Promise<void> {
+    if (!this.outbox) {
+      await ctx.answerCallbackQuery({ text }).catch((error: unknown) => {
         this.logger.error({ event: 'callback.answer_failed', ...(ctx.chat ? { chatId: String(ctx.chat.id) } : {}), ...(ctx.from ? { userId: String(ctx.from.id) } : {}), error: { name: error instanceof Error ? error.name : 'UnknownError', message: error instanceof Error ? error.message : String(error) } });
       });
+      return;
+    }
+    const context = getUpdateContext();
+    const chatId = ctx.chat ? String(ctx.chat.id) : 'platform';
+    const callbackIdDigest = createHash('sha256').update(ctx.callbackQuery?.id ?? 'missing').digest('hex');
+    const occurrence = context ? `${context.botId ?? 'unscoped-bot'}:${context.updateId}` : randomUUID();
+    const metadata = integrationOperationMetadata({ integrationId: 'telegram', action: 'answerCallbackQuery', targetType: 'callback_query', targetId: callbackIdDigest, ...(ctx.chat ? { chatId } : {}) });
+    const result = await this.outbox.execute(
+      {
+        kind: 'integration.telegram.answerCallbackQuery',
+        chatId,
+        idempotencyKey: `telegram.answerCallbackQuery:${occurrence}`,
+        requestPayload: { callbackIdDigest, textDigest: createHash('sha256').update(text).digest('hex'), sizeBytes: Buffer.byteLength(text) },
+        auditEvent: { eventType: 'integration.action', eventVersion: 'v1' },
+        metadata,
+        recoveryMetadata: metadata,
+      },
+      async () => {
+        await ctx.answerCallbackQuery({ text });
+        return { answered: true };
+      },
+    );
+    if (result.isFinal && !result.auditFinalized) throw new AuditFinalizationPendingError('Telegram answerCallbackQuery audit is still owed');
+    if (result.outcome.status !== 'succeeded') {
+      this.logger.error({ event: 'callback.answer_failed', ...(ctx.chat ? { chatId } : {}), ...(ctx.from ? { userId: String(ctx.from.id) } : {}), details: { outcome: result.outcome.status } });
     }
   }
 
