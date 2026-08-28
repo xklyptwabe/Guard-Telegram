@@ -47,6 +47,16 @@ describe('audit metrics', () => {
     expect(output).toContain('audit_outbox_pending{queue="external_operations",status="audit_pending"} 5');
     expect(output).not.toMatch(/chat|tenant|subject|correlation|idempotency/);
   });
+
+  it('tracks only recent database write failures for health', () => {
+    const metrics = new AuditMetrics({} as never);
+    metrics.recordRejection('module.state.changed', 'validation_failed', 1);
+    expect(metrics.hasRecentWriteFailure()).toBe(false);
+
+    metrics.recordRejection('module.state.changed', 'write_failed', 1);
+    expect(metrics.hasRecentWriteFailure()).toBe(true);
+    expect(metrics.hasRecentWriteFailure(Date.now() + 5 * 60 * 1_000 + 1)).toBe(false);
+  });
 });
 
 function fakeOutboxMetricsDatabase() {

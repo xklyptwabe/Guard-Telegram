@@ -1,10 +1,8 @@
 import { Counter, Gauge, Histogram, Registry } from '@prometheus-io/client';
-import { and, eq, inArray, isNotNull, isNull, or, sql } from 'drizzle-orm';
 
 import type { DrizzleDatabase } from '../../db/client.js';
-import { outbox } from '../../db/schema/audit.js';
-import { pendingOperations } from '../../db/schema/moderation.js';
 import type { AuditEventStatus } from './enums.js';
+import { readAuditOperationalState, type AuditOperationalState } from './operationalState.js';
 import { auditEventRegistry } from './registry.js';
 
 export type AuditRejectionStatus =
@@ -16,6 +14,7 @@ export type AuditRejectionStatus =
 type AuditWriteDurationStatus = AuditEventStatus | 'duplicate' | 'rejected';
 
 const writeDurationBucketsMs = [1, 2.5, 5, 10, 25, 50, 100, 250, 500, 1_000, 2_500, 5_000];
+export const RECENT_AUDIT_WRITE_FAILURE_WINDOW_MS = 5 * 60 * 1_000;
 
 export interface AuditMetricsRecorder {
   recordWrite(eventType: string, status: AuditEventStatus, duplicate: boolean, durationMs: number): void;
@@ -24,6 +23,7 @@ export interface AuditMetricsRecorder {
 
 export class AuditMetrics implements AuditMetricsRecorder {
   public readonly registry = new Registry();
+  private lastWriteFailureAt: number | undefined;
 
   private readonly eventsWritten = new Counter({
     name: 'audit_events_written_total',
@@ -71,7 +71,8 @@ export class AuditMetrics implements AuditMetricsRecorder {
       labelNames: ['queue', 'status'] as const,
       registers: [this.registry],
       async collect() {
-        await collectOutboxPending(database, this);
+        const state = await readAuditOperationalState(database);
+        collectOutboxPending(state, this);
       },
     });
   }
@@ -95,6 +96,18 @@ export class AuditMetrics implements AuditMetricsRecorder {
     const metricEventType = normalizeEventType(eventType);
     this.eventsRejected.inc({ event_type: metricEventType, status });
     this.observeWriteDuration(metricEventType, 'rejected', durationMs);
+    if (status === 'write_failed') this.lastWriteFailureAt = Date.now();
+  }
+
+  public readOperationalState(now = new Date()): Promise<AuditOperationalState> {
+    return readAuditOperationalState(this.db, now);
+  }
+
+  public hasRecentWriteFailure(
+    now = Date.now(),
+    windowMs = RECENT_AUDIT_WRITE_FAILURE_WINDOW_MS,
+  ): boolean {
+    return this.lastWriteFailureAt !== undefined && now - this.lastWriteFailureAt <= windowMs;
   }
 
   private observeWriteDuration(eventType: string, status: AuditWriteDurationStatus, durationMs: number): void {
@@ -102,50 +115,14 @@ export class AuditMetrics implements AuditMetricsRecorder {
   }
 }
 
-async function collectOutboxPending(db: DrizzleDatabase, gauge: Gauge<'queue' | 'status'>): Promise<void> {
-  const [deliveryRows, operationRows, auditDebtRows] = await Promise.all([
-    db
-      .select({ status: outbox.status, count: sql<number>`count(*)::int` })
-      .from(outbox)
-      .where(inArray(outbox.status, ['pending', 'failed']))
-      .groupBy(outbox.status),
-    db
-      .select({ status: pendingOperations.status, count: sql<number>`count(*)::int` })
-      .from(pendingOperations)
-      .where(
-        or(
-          eq(pendingOperations.status, 'pending'),
-          eq(pendingOperations.status, 'in_progress'),
-          and(eq(pendingOperations.status, 'unknown'), isNotNull(pendingOperations.nextAttemptAt)),
-        ),
-      )
-      .groupBy(pendingOperations.status),
-    db
-      .select({ count: sql<number>`count(*)::int` })
-      .from(pendingOperations)
-      .where(
-        and(
-          eq(pendingOperations.auditStatus, 'pending'),
-          or(
-            inArray(pendingOperations.status, ['succeeded', 'failed']),
-            and(eq(pendingOperations.status, 'unknown'), isNull(pendingOperations.nextAttemptAt)),
-          ),
-        ),
-      ),
-  ]);
-
+function collectOutboxPending(state: AuditOperationalState, gauge: Gauge<'queue' | 'status'>): void {
   gauge.reset();
-  for (const status of ['pending', 'failed'] as const) {
-    gauge.set({ queue: 'audit_delivery', status }, deliveryRows.find((row) => row.status === status)?.count ?? 0);
-  }
-  for (const status of ['pending', 'in_progress', 'retry_scheduled'] as const) {
-    const databaseStatus = status === 'retry_scheduled' ? 'unknown' : status;
-    gauge.set(
-      { queue: 'external_operations', status },
-      operationRows.find((row) => row.status === databaseStatus)?.count ?? 0,
-    );
-  }
-  gauge.set({ queue: 'external_operations', status: 'audit_pending' }, auditDebtRows[0]?.count ?? 0);
+  gauge.set({ queue: 'audit_delivery', status: 'pending' }, state.delivery.pending);
+  gauge.set({ queue: 'audit_delivery', status: 'failed' }, state.delivery.failed);
+  gauge.set({ queue: 'external_operations', status: 'pending' }, state.externalOperations.pending);
+  gauge.set({ queue: 'external_operations', status: 'in_progress' }, state.externalOperations.inProgress);
+  gauge.set({ queue: 'external_operations', status: 'retry_scheduled' }, state.externalOperations.retryScheduled);
+  gauge.set({ queue: 'external_operations', status: 'audit_pending' }, state.externalOperations.auditPending);
 }
 
 function normalizeEventType(eventType: string): string {

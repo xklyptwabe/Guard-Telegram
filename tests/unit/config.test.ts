@@ -59,6 +59,19 @@ describe('validateConfig', () => {
     expect(config.backendApiHost).toBe('127.0.0.1');
     expect(config.backendApiPort).toBe(8081);
     expect(config.backendApiPrincipals).toEqual([]);
+    expect(config.operationalHost).toBe('127.0.0.1');
+    expect(config.operationalPort).toBe(8082);
+  });
+
+  it('accepts an explicit operational endpoint', () => {
+    const config = validateConfig({
+      ...baseEnv,
+      OPERATIONAL_HOST: '0.0.0.0',
+      OPERATIONAL_PORT: '9090',
+    });
+
+    expect(config.operationalHost).toBe('0.0.0.0');
+    expect(config.operationalPort).toBe(9090);
   });
 
   it('requires backend API tokens when the backend API is enabled', () => {

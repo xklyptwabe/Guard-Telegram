@@ -8,6 +8,7 @@ import { purgeExpiredAuditEventsBatch } from '../../src/db/retention.js';
 import { chatModuleStates, telegramChats } from '../../src/db/schema/core.js';
 import { AuditService, ForbiddenAuditValueError } from '../../src/lib/auditService.js';
 import { AuditMetrics } from '../../src/lib/audit/metrics.js';
+import { healthSnapshot } from '../../src/lib/health.js';
 import { events, entitySnapshots, eventPolicies, outbox } from '../../src/db/schema/audit.js';
 
 const testDatabaseUrl = process.env.TEST_DATABASE_URL;
@@ -497,6 +498,33 @@ describe.skipIf(!testDatabaseUrl)('Audit transaction integration', () => {
     expect(output).toContain('audit_duplicates_total{event_type="module.state.changed",status="recorded"} 1');
     expect(output).toContain('audit_unknown_outcomes_total{event_type="module.state.changed",status="unknown"} 1');
     expect(output).toContain('audit_outbox_pending{queue="audit_delivery",status="pending"} 2');
+
+    const operationalState = await metrics!.readOperationalState();
+    expect(operationalState.delivery).toMatchObject({ pending: 2, failed: 0 });
+    expect(operationalState.externalOperations).toMatchObject({
+      pending: 0,
+      inProgress: 0,
+      retryScheduled: 0,
+      auditPending: 0,
+      terminalUnknown: 0,
+    });
+
+    const health = await healthSnapshot(
+      {
+        telegramTransport: 'long_polling',
+        redisEnabled: false,
+        s3Enabled: false,
+        rabbitMqEnabled: false,
+      },
+      { isAvailable: () => true } as never,
+      { enabled: false } as never,
+      { enabled: false } as never,
+      metrics!,
+    );
+    expect(health.status).toBe('ok');
+    expect(JSON.stringify(health)).not.toMatch(
+      /before|after|metadata|payload|telegramContext|chatId|tenantId|subjectId|correlationId|idempotency/i,
+    );
   });
 });
 
