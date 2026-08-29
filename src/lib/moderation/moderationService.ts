@@ -45,6 +45,7 @@ export interface ModerationActionInput {
   readonly targetUserId: string;
   readonly actorUserId: string;
   readonly reason?: string;
+  readonly durationSeconds?: number;
 }
 
 export interface RestrictActionInput extends ModerationActionInput {
@@ -300,7 +301,13 @@ export class ModerationService {
       eventType: 'moderation.action',
       eventVersion: 'v1',
       moduleId: MODULE_IDS.moderation,
-      metadata: { action, actorUserId: input.actorUserId, targetUserId: input.targetUserId, ...(reason !== undefined && reason.length > 0 ? { reason } : {}) },
+      metadata: {
+        action,
+        actorUserId: input.actorUserId,
+        targetUserId: input.targetUserId,
+        ...(reason !== undefined && reason.length > 0 ? { reason } : {}),
+        ...(input.durationSeconds !== undefined ? { durationSeconds: input.durationSeconds } : {}),
+      },
     });
     return this.outbox.execute(
       {
@@ -311,7 +318,12 @@ export class ModerationService {
         requestPayload,
         auditEvent: { eventType: 'moderation.action', eventVersion: 'v1', moduleId: MODULE_IDS.moderation },
         metadata,
-        recoveryMetadata: { action, actorUserId: input.actorUserId, targetUserId: input.targetUserId },
+        recoveryMetadata: {
+          action,
+          actorUserId: input.actorUserId,
+          targetUserId: input.targetUserId,
+          ...(input.durationSeconds !== undefined ? { durationSeconds: input.durationSeconds } : {}),
+        },
       },
       this.resolvers.get(kind)!,
       // HIGH-3: audit-finalization is the outbox's durable responsibility —
@@ -357,6 +369,10 @@ export class ModerationService {
     const action = typeof row.recoveryMetadata.action === 'string' ? (row.recoveryMetadata.action as ModerationAction) : undefined;
     const targetUserId = typeof row.recoveryMetadata.targetUserId === 'string' ? row.recoveryMetadata.targetUserId : undefined;
     const actorUserId = typeof row.recoveryMetadata.actorUserId === 'string' ? row.recoveryMetadata.actorUserId : undefined;
+    const durationSeconds =
+      typeof row.recoveryMetadata.durationSeconds === 'number' && Number.isFinite(row.recoveryMetadata.durationSeconds)
+        ? row.recoveryMetadata.durationSeconds
+        : undefined;
     if (!action || !targetUserId || !actorUserId) {
       // BLOCKER-1: missing audit metadata must NEVER finalize as 'written'.
       // Throw — the outbox keeps `audit_status='pending'` and the backfill
@@ -367,7 +383,18 @@ export class ModerationService {
       throw new Error(`pending_operations row ${row.id} (${row.kind}) reached terminal state without the audit metadata needed to finalize its record`);
     }
     const reason = typeof row.metadata.reason === 'string' ? row.metadata.reason : undefined;
-    return this.recordModerationAction(action, { chatId: row.chatId, targetUserId, actorUserId, ...(reason !== undefined ? { reason } : {}) }, row.idempotencyKey, outcome);
+    return this.recordModerationAction(
+      action,
+      {
+        chatId: row.chatId,
+        targetUserId,
+        actorUserId,
+        ...(reason !== undefined ? { reason } : {}),
+        ...(durationSeconds !== undefined ? { durationSeconds } : {}),
+      },
+      row.idempotencyKey,
+      outcome,
+    );
   }
 
   /** Writes the one-and-only `moderation.action` audit record for this operation. `outcome.status` maps directly onto BOTS-7's `AuditOperation`: a confirmed Telegram-side error is `'failed'`, an unresolved timeout is `'unknown'` — both first-class, not shoehorned into `'update'`. `pendingOperationIdempotencyKey` is the stable key already on the `pending_operations` row — reused (with an `:audit` suffix) rather than re-derived, so this works identically whether called from a live command or from `recoverPending()`. */
@@ -409,7 +436,14 @@ export class ModerationService {
             before: notApplicable(),
             after:
               outcome.status === 'succeeded'
-                ? observed({ chatId: input.chatId, targetUserId: input.targetUserId, actorUserId: input.actorUserId, action, ...(input.reason !== undefined ? { reason: input.reason } : {}) })
+                ? observed({
+                    chatId: input.chatId,
+                    targetUserId: input.targetUserId,
+                    actorUserId: input.actorUserId,
+                    action,
+                    ...(input.reason !== undefined ? { reason: input.reason } : {}),
+                    ...(input.durationSeconds !== undefined ? { durationSeconds: input.durationSeconds } : {}),
+                  })
                 : partialOutcome !== undefined
                   ? // HIGH-8: a confirmed-failed kick whose ban half already
                     // landed is NOT the same as "nothing happened" — surface

@@ -13,7 +13,7 @@ BOTS-7 defined the full audit event registry (`src/lib/audit/definitions.ts`) �
 | `message.deleted` | the bot's own `deleteMessage` call (`/delmsg`) | `src/lib/audit/messageAudit.ts`, called from `ModerationService.deleteMessage` |
 | `chat.settings.changed` | `/setlocale` | `src/lib/chatSettings.ts`, via the `chat-settings` module |
 
-`chat_member`, `edited_message`, `channel_post`, and `edited_channel_post` are **not** sent by Telegram unless listed in `TELEGRAM_ALLOWED_UPDATES` — the default in `src/config.ts`/`.env.example` includes all four, but a deployment that overrides that variable must keep the update types it wants to observe.
+`chat_member`, `edited_message`, `channel_post`, and `edited_channel_post` are **not** sent by Telegram unless listed in `TELEGRAM_ALLOWED_UPDATES` — the default in `src/config.ts`/`.env.example` includes all four, but a deployment that overrides that variable must keep the update types it wants to observe. Telegram retains the previous `allowed_updates` selection when a later polling or webhook request omits it, so deployments must configure this list explicitly rather than rely on Telegram-side history.
 
 ## `bot.membership.changed` is never module-gated
 
@@ -25,10 +25,18 @@ Every other event above is produced from inside a toggleable module's `updateHan
 
 When nothing has ever been recorded for a subject — a message deleted before any edit was observed, a member whose very first `chat_member` update this bot ever saw — `before` is `not_observed`, never a fabricated guess. This is deliberate and shows up in `events.before_snapshot_status`.
 
+## Telegram platform boundary
+
+This service uses the HTTP-based [Telegram Bot API](https://core.telegram.org/bots/api) through grammY, with either long polling or a webhook. Those delivery modes are mutually exclusive. The repository contains no MTProto client, TDLib integration, Telegram user session, or userbot; Telegram's separately documented [MTProto bot API](https://core.telegram.org/api/bots) is outside this service's architecture and support contract.
+
+Audit coverage starts only after Telegram delivers an update type selected by `TELEGRAM_ALLOWED_UPDATES`. The Bot API's [`allowed_updates`](https://core.telegram.org/bots/api#getupdates) filter therefore defines an observability boundary: an update excluded by a deployment cannot be reconstructed later by this service. Changing the selection does not retroactively alter updates Telegram created before the change, and webhook and polling retries may produce duplicates; the application's idempotency and ordering controls remain required.
+
+A Bot API call timing out is not proof that Telegram rejected it. If the request may have reached Telegram but no authoritative response was received, an external operation is finalized as `unknown`, not guessed to be `failed` or `succeeded`. A confirmed Bot API error is `failed`. Recovery can retry or reconcile only with the information Telegram actually exposes; it cannot invent a provider state.
+
 ## What is *not* claimed here
 
 The Telegram Bot API has:
-- **No `deleted_message` update, at all.** A user or another admin deleting a message through their own Telegram client produces nothing a bot can subscribe to, poll, or reconstruct — not even a gap that's reliably attributable to a deletion rather than, say, a message the bot was never shown in the first place. Guessing from an ID gap is not an observation, so this codebase does not do it.
+- **No general `deleted_message` update for ordinary bot-visible chats.** The current [`Update`](https://core.telegram.org/bots/api#update) contract has `deleted_business_messages` for messages of a connected business account, but this repository has no business-connection deletion producer and does not map that update to `message.deleted`. A user or another admin deleting an ordinary message through their Telegram client produces nothing this service can subscribe to, poll, or reconstruct. Guessing from an ID gap is not an observation, so this codebase does not do it.
 - **No way to fetch a message that no longer exists**, so even a deletion the bot *does* know about (because it performed it) carries only whatever was already captured before the delete — never re-fetched content.
 
 Concretely: `message.deleted` is only ever raised from `ModerationService.deleteMessage`, driven by the `/delmsg` command. There is no Telegram update handler for "message deleted" anywhere in this codebase, and there should never be one that infers deletion from message-ID gaps, missing replies, or similar heuristics — see the module doc comment at the top of `src/lib/audit/messageAudit.ts` for the same note in code.

@@ -4,6 +4,8 @@ Server-side Telegram bot for private chats, groups, supergroups, and forum topic
 
 Every state-changing operation — module/chat-settings changes, member and bot membership transitions, moderation actions, message edits, the bot's own message deletions, commands, and external integration calls — is recorded in a structured `audit` schema with per-chat, per-event-type policy control and field-level allowlisting. Message *bodies* are still never stored unless a chat's own policy explicitly opts in (`allowMessageTextLogging`); by default only metadata (who, what, when, how long) is kept. `core.processed_updates` additionally holds `(bot_id, update_id, timestamps)` for idempotency and is retained for seven days by default. See [docs/modules/0009-audit-instrumentation.md](docs/modules/0009-audit-instrumentation.md) for what is and isn't observable through the Bot API, and [docs/modules/0010-external-operation-outbox.md](docs/modules/0010-external-operation-outbox.md) for how moderation actions are made reliable.
 
+The audit subsystem is a business record, not an extension of the technical logger or the in-process EventBus. Its transaction, ordering, external-operation, and failure guarantees are recorded in [ADR 0006](docs/adr/0006-audit-architecture.md), its event and protocol versions are listed in the [audit event catalog](docs/audit/event-catalog.md), and its storage boundaries are defined by the [audit privacy contract](docs/audit/privacy-contract.md). Operational diagnosis and recovery use the existing [recovery and monitoring runbook](docs/infra/recovery-and-monitoring.md); the previous integration baseline is preserved in the [BOTS-13 acceptance report](docs/bot-13-acceptance-report.md).
+
 ## What is included
 
 - grammY, one `Bot` instance, native commands, inline callbacks, and forum-topic-aware replies;
@@ -98,7 +100,7 @@ Set `TEST_DATABASE_URL` to a separate TLS PostgreSQL database to activate the mi
 
 `docker compose up --build` starts only the bot and reads local secrets from `.env`; PostgreSQL, Redis, S3/MinIO, and RabbitMQ are deliberately external protected services. The Dockerfile runs lint, typecheck, tests, and the build before the runtime image is produced.
 
-GitLab CI follows `quality → build → deploy`. Stage and production deploy jobs are manual/protected and do not create, replace, or copy an environment file. Deployment and recovery steps are in [docs/infra/deploy.md](docs/infra/deploy.md) and [docs/infra/recovery-and-monitoring.md](docs/infra/recovery-and-monitoring.md).
+GitLab CI follows `quality → build → deploy`. A push to `test` builds and deploys the Test service; a push to `main` builds and deploys production. Repository CI does not create, replace, or copy an environment file. Branch protection and deployment approvals, if required, are GitLab project settings rather than rules declared in this repository. Deployment and recovery steps are in [docs/infra/deploy.md](docs/infra/deploy.md) and [docs/infra/recovery-and-monitoring.md](docs/infra/recovery-and-monitoring.md).
 
 ## Security and operations
 
