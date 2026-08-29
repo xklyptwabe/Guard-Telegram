@@ -190,6 +190,7 @@ export interface PendingOperationRecoveryMetadata {
   readonly action?: string;
   readonly actorUserId?: string;
   readonly targetUserId?: string;
+  readonly durationSeconds?: number;
   readonly integrationId?: string;
   readonly targetType?: string;
   readonly targetId?: string;
@@ -294,6 +295,9 @@ function sanitizeRecoveryMetadata(metadata: PendingOperationRecoveryMetadata): R
   const sanitized = stripForbidden(metadata) as Record<string, unknown>;
   return {
     ...Object.fromEntries(pendingOperationRecoveryMetadataStringFields.flatMap((field) => (typeof sanitized[field] === 'string' ? [[field, sanitized[field]]] : []))),
+    ...(typeof sanitized.durationSeconds === 'number' && Number.isFinite(sanitized.durationSeconds) && sanitized.durationSeconds >= 0
+      ? { durationSeconds: sanitized.durationSeconds }
+      : {}),
     ...(typeof sanitized.durationMs === 'number' && Number.isFinite(sanitized.durationMs) && sanitized.durationMs >= 0 ? { durationMs: sanitized.durationMs } : {}),
     ...(typeof sanitized.success === 'boolean' ? { success: sanitized.success } : {}),
   };

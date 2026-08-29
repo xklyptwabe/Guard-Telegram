@@ -298,7 +298,7 @@ describe('ModerationService', () => {
 
   it('round-3: mute stores duration_seconds (not a frozen until_date) and recomputes until_date at call time', async () => {
     const bot = fakeBot();
-    const { audit } = fakeAuditService();
+    const { audit, calls } = fakeAuditService();
     const service = new ModerationService(bot as never, audit, outbox, resolvers, logger());
     const before = Math.floor(Date.now() / 1000);
     await runWithUpdateContext({ updateId: '1', chatId: '-100111' }, () =>
@@ -312,6 +312,41 @@ describe('ModerationService', () => {
     expect(typeof called?.until_date).toBe('number');
     expect(called!.until_date as number).toBeGreaterThanOrEqual(before + 600);
     expect(called!.until_date as number).toBeLessThanOrEqual(Math.floor(Date.now() / 1000) + 600 + 2);
+    expect(calls).toHaveLength(1);
+    const auditCall = calls[0] as unknown as { result: { after?: Record<string, unknown> } };
+    expect(auditCall.result.after).toMatchObject({ action: 'mute', durationSeconds: 600 });
+  });
+
+  it('mute recovery preserves durationSeconds in the final moderation.action snapshot', async () => {
+    db.rows.push({
+      id: 'row-mute-recovery',
+      kind: 'telegram.restrictChatMember.mute',
+      chatId: '-100111',
+      requestPayload: { chat_id: -100111, user_id: 2, duration_seconds: 600 },
+      metadata: {
+        formatVersion: 1,
+        audit: { action: 'mute', actorUserId: '9', targetUserId: '2', durationSeconds: 600 },
+        recovery: { action: 'mute', actorUserId: '9', targetUserId: '2', durationSeconds: 600 },
+      },
+      idempotencyKey: 'moderation.action:telegram-update:1:-100111:2:mute',
+      status: 'pending',
+      attemptCount: 0,
+      lastAttemptAt: null,
+      nextAttemptAt: null,
+      result: null,
+      auditStatus: 'pending',
+      createdAt: new Date(),
+      updatedAt: new Date(),
+    });
+    const bot = fakeBot();
+    const { audit, calls } = fakeAuditService();
+    const service = new ModerationService(bot as never, audit, outbox, resolvers, logger());
+
+    await service.recoverPending();
+
+    expect(calls).toHaveLength(1);
+    const call = calls[0] as unknown as { result: { after?: Record<string, unknown> } };
+    expect(call.result.after).toMatchObject({ action: 'mute', durationSeconds: 600 });
   });
 
   it('round-3: without update context, deleteMessage uses a stable key (no Date.now) so a retry cannot double-fire', async () => {
